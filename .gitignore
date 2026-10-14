@@ -4,3 +4,6 @@ dist/
 .env
 *.js
 !cdk.json
+
+# python venv for scripts/xlsx-to-plans.py
+.venv/
