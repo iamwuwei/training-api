@@ -3,15 +3,17 @@
 Strava 連動的馬拉松課表追蹤後端。兩個使用者，Node.js 22 + TypeScript，infra 用 AWS CDK。
 
 ```
-Strava webhook → Lambda webhook → SQS activities → Lambda worker → Aurora（＋ Claude 單次判定）
-Strava OAuth   → Lambda oauth   → Aurora
+Strava webhook → Lambda webhook（Function URL）→ SQS activities → Lambda worker → Aurora（＋ Claude 單次判定）
+Strava OAuth   → Lambda oauth（Function URL）→ Aurora
 EventBridge Scheduler（每週日 21:00 JST）→ Lambda weekly → Claude API → Aurora
-前端 → Lambda auth（Sign in with Apple → session token）
-前端 → Lambda api（GET /plan, GET /activities, PUT /activities/{id}/review）→ Aurora
+前端 → Cognito（登入，拿 ID token）
+前端 → API Gateway HTTP API（Cognito JWT authorizer）→ Lambda api → Aurora
 ```
 
+資源命名：全部 `training-api-<thing>-<STAGE>`，stack 是 `training-api-<STAGE>`，`STAGE` 預設 `prod`。
+
 - 所有 Lambda 都不在 VPC 內（Aurora 有公開 endpoint；Lambda 要打 Strava / Claude）。
-- 對外的四個 Lambda（webhook / oauth / auth / api）用 Function URL（auth NONE），沒有 API Gateway。
+- Strava 會打的兩個 Lambda（webhook / oauth）用 Function URL（auth NONE）；給前端的 api 走 API Gateway HTTP API，JWT authorizer 驗 Cognito ID token。
 - DB 認證走 IAM：`@aws-sdk/rds-signer` 產 token 當密碼，SSL 用打包進 Lambda 的 RDS global CA bundle（`src/lib/global-bundle.pem`）。
 - Aurora Serverless v2 min 0 ACU，閒置 5 分鐘會 pause；第一次連線要等 10–15 秒。Lambda timeout 60 秒（worker 90 秒），worker 連線失敗會 throw 讓 SQS 重送（3 次後進 DLQ）。
 
@@ -34,9 +36,10 @@ cp .env.example .env
 | `ANTHROPIC_API_KEY` | 週總結用 |
 | `CLAUDE_MODEL` | 預設 `claude-haiku-4-5` |
 | `AUTO_REVIEW` | `true`（預設）：worker 每筆配對到課表的跑步都請 Claude 寫判定；`false` 關掉 |
-| `APPLE_CLIENT_ID` | Sign in with Apple 的 **Services ID**（前端 Apple JS SDK 用的 `clientId`） |
-| `SESSION_SECRET` | 隨機 32 字以上，簽 session token；換掉等於全部登出 |
-| `CORS_ORIGIN` | 逗號分隔，例如 `https://training.pages.dev,http://localhost:5173` |
+| `STAGE` | 預設 `prod`，決定所有資源名稱的後綴 |
+| `CORS_ORIGIN` | 逗號分隔，例如 `https://training.pages.dev,http://localhost:5173`；同時是 API CORS 和 Cognito 的 callback / logout URL |
+| `COGNITO_DOMAIN_PREFIX` | hosted UI 網域前綴，預設 `training-api-prod-<account id>` |
+| `APPLE_SERVICES_ID` / `APPLE_TEAM_ID` / `APPLE_KEY_ID` / `APPLE_PRIVATE_KEY` | 選填，四個都填才會在 Cognito 加 Sign in with Apple |
 | `WEBHOOK_URL` | deploy 之後再填（給 `npm run subscribe-webhook` 用） |
 
 `.env` 只在 `cdk synth` 時由 dotenv 讀進來，直接變成 Lambda 的環境變數（沒有 Secrets Manager）。本機跑 `migrate` / `seed` 也讀同一個 `.env`，DB 連線用你本機的 AWS credentials（需要對 `training` cluster 的 `rds-db:connect` 權限）。
@@ -65,7 +68,17 @@ npx cdk bootstrap    # 第一次
 npx cdk deploy
 ```
 
-Output 會有四個 Function URL：`WebhookUrl`、`OauthUrl`、`AuthUrl`、`ApiUrl`。
+Output：`WebhookUrl`、`OauthUrl`（Function URL）、`ApiUrl`（HTTP API）、`UserPoolId`、`UserPoolClientId`、`CognitoDomain`。
+
+### 舊 stack
+
+命名改成 `training-api-<thing>-prod` 之前的 stack 叫 `TrainingBackend`，資源名不衝突但要手動刪：
+
+```bash
+aws cloudformation delete-stack --stack-name TrainingBackend
+```
+
+刪掉後舊的 Function URL 失效：Strava callback domain 改成新的 `OauthUrl` host，`npm run subscribe-webhook` 會自動把指到舊 URL 的 subscription 換掉。
 
 ### 自動（GitHub Actions，`.github/workflows/deploy.yml`）
 
@@ -104,15 +117,27 @@ Output 會有四個 Function URL：`WebhookUrl`、`OauthUrl`、`AuthUrl`、`ApiU
    | `DB_CLUSTER_RESOURCE_ID` | `aws rds describe-db-clusters --db-cluster-identifier training --query 'DBClusters[0].DbClusterResourceId' --output text` |
    | `STRAVA_CLIENT_ID` / `STRAVA_CLIENT_SECRET` / `STRAVA_VERIFY_TOKEN` | 同 `.env` |
    | `ANTHROPIC_API_KEY` | 同 `.env` |
-   | `APPLE_CLIENT_ID` / `SESSION_SECRET` | 同 `.env` |
+   | `APPLE_SERVICES_ID` / `APPLE_TEAM_ID` / `APPLE_KEY_ID` / `APPLE_PRIVATE_KEY` | 選填 |
 
-   非 secret 的（`DB_HOST`、`CLAUDE_MODEL`、`AUTO_REVIEW`）寫在 workflow 的 `env`；`CORS_ORIGIN` 可以用 repository **variable**（不是 secret）覆蓋。
+   非 secret 的（`DB_HOST`、`CLAUDE_MODEL`、`AUTO_REVIEW`、`STAGE`）寫在 workflow 的 `env`；`CORS_ORIGIN` 可以用 repository **variable**（不是 secret）覆蓋。
 
-## 4. Sign in with Apple 設定
+## 4. Cognito 使用者
 
-1. developer.apple.com → Identifiers → 建一個 **App ID**（勾 Sign in with Apple）和一個 **Services ID**（這個是 `APPLE_CLIENT_ID`），Services ID 的 Web Authentication 設定裡填前端網域和 return URL。
-2. 前端用 Apple JS SDK（`appleid.auth.init({ clientId, scope: "email", usePopup: true })`），拿到 `authorization.id_token` 後 `POST <AuthUrl>/apple` body `{ "id_token": "…" }`，回 `{ token, expires_at, user }`。
-3. 之後每個 api 請求帶 `Authorization: Bearer <token>`。token 30 天有效、無狀態（HMAC），`GET <AuthUrl>/me` 可以驗。
+封閉系統，沒有自助註冊。deploy 完用 `UserPoolId` 建兩個使用者（email 要和 `seed/seed.ts` `USERS` 裡的一樣，api 第一次呼叫會靠 email 把 Cognito `sub` 連到 users 列）：
+
+```bash
+POOL=<UserPoolId>
+aws cognito-idp admin-create-user --user-pool-id $POOL --username you@example.com \
+  --user-attributes Name=email,Value=you@example.com Name=email_verified,Value=true --message-action SUPPRESS
+aws cognito-idp admin-set-user-password --user-pool-id $POOL --username you@example.com --password '<密碼>' --permanent
+```
+
+前端登入兩種方式擇一：
+
+- Hosted UI：`<CognitoDomain>/login?client_id=<UserPoolClientId>&response_type=code&scope=openid+email+profile&redirect_uri=<前端 origin>/`，拿 code 到 `<CognitoDomain>/oauth2/token` 換 token（PKCE）。
+- SDK：`amazon-cognito-identity-js` 或 Amplify Auth，SRP 直接登入。
+
+之後每個 api 請求帶 `Authorization: Bearer <ID token>`（要 **ID token**，不是 access token，因為第一次連結要 `email` claim）。API Gateway 驗簽失敗回 401；驗過但 users 表沒對到回 403。
 
 ## 5. Strava 設定
 
@@ -132,12 +157,11 @@ Output 會有四個 Function URL：`WebhookUrl`、`OauthUrl`、`AuthUrl`、`ApiU
 
 ## API
 
-型別在 `types/api.ts`。全部要帶 `Authorization: Bearer <session token>`，沒有或過期回 401。
+型別在 `types/api.ts`。全部要帶 `Authorization: Bearer <Cognito ID token>`。
 
 - `GET <ApiUrl>/plan` → `PlanResponse { plan, weeks, sessions, activities }`：active plan、每週階段/重點、未 superseded 的 sessions（含原始 `label`、`content`、`target` 原文、配速/心拍上下限、`week_no`、`phase`）、已配對的 activities（含 `review`、最高心拍、功率、卡路里、鞋、裝置、天氣、每公里分段）。
 - `GET <ApiUrl>/activities?status=unplanned` → `ActivitiesResponse`，`status` 可為 `auto | confirmed | unplanned | ignored`，省略則全部。
 - `PUT <ApiUrl>/activities/{id}/review` body `PutReviewRequest { verdict, comment?, reminders?, rpe? }` → 手動判定，會覆蓋 Claude 的。
-- `POST <AuthUrl>/apple`、`GET <AuthUrl>/me` 見上。
 
 ## 判定（reviews）
 
@@ -164,8 +188,8 @@ Output 會有四個 Function URL：`WebhookUrl`、`OauthUrl`、`AuthUrl`、`ApiU
 training-api/
 ├── infra/        CDK（bin/app.ts, lib/stack.ts）
 ├── src/
-│   ├── handlers/ webhook / worker / oauth / weekly / api / auth
-│   ├── lib/      db（IAM token + pg Pool）、strava、matcher、claude、auth
+│   ├── handlers/ webhook / worker / oauth / weekly / api
+│   ├── lib/      db（IAM token + pg Pool）、strava、matcher、claude
 │   └── types.ts  內部 row / Strava 型別
 ├── types/        api.ts — API request/response 型別（前端直接複製用）
 ├── sql/          schema.sql

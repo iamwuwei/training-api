@@ -18,6 +18,7 @@ env:
   DB_USER: postgres
   CLAUDE_MODEL: claude-haiku-4-5
   AUTO_REVIEW: "true"
+  STAGE: prod
   CORS_ORIGIN: ${{ vars.CORS_ORIGIN || 'https://iamwuwei.github.io' }}
 
 jobs:
@@ -30,8 +31,6 @@ jobs:
       STRAVA_CLIENT_SECRET: placeholder
       STRAVA_VERIFY_TOKEN: placeholder
       ANTHROPIC_API_KEY: placeholder
-      APPLE_CLIENT_ID: placeholder
-      SESSION_SECRET: placeholder
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -57,8 +56,11 @@ jobs:
       STRAVA_CLIENT_SECRET: ${{ secrets.STRAVA_CLIENT_SECRET }}
       STRAVA_VERIFY_TOKEN: ${{ secrets.STRAVA_VERIFY_TOKEN }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      APPLE_CLIENT_ID: ${{ secrets.APPLE_CLIENT_ID }}
-      SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
+      # optional Apple federation; leave the secrets unset to skip
+      APPLE_SERVICES_ID: ${{ secrets.APPLE_SERVICES_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_KEY_ID: ${{ secrets.APPLE_KEY_ID }}
+      APPLE_PRIVATE_KEY: ${{ secrets.APPLE_PRIVATE_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

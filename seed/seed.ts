@@ -15,8 +15,8 @@ import type { SessionType } from "../src/types";
 // (the second seed attaches results to the backfilled activities).
 
 // Fixed uuids so the front-end / OAuth links stay stable across re-seeds.
-// email: the Apple ID email (or private relay address) used for Sign in with Apple —
-// first login links users.apple_sub to the row whose email matches.
+// email: the Cognito user's email — first API call links users.cognito_sub to
+// the row whose email matches the ID token.
 const USERS: Record<string, { id: string; display_name: string; email: string | null }> = {
   ww: { id: "7d1c3a0e-4f7b-4d2e-9c1a-5b8e2f6a1c01", display_name: "Wei Wu", email: null },
   gf: { id: "3f9a8b2c-6d1e-4a5f-8e7c-2b4d6f8a0c02", display_name: "gf", email: null },

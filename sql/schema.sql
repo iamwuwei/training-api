@@ -9,7 +9,8 @@ create table if not exists users (
   display_name text not null,
   created_at timestamptz not null default now()
 );
-alter table users add column if not exists apple_sub text unique;  -- Sign in with Apple `sub`
+alter table users drop column if exists apple_sub;
+alter table users add column if not exists cognito_sub text unique;  -- Cognito user `sub`
 
 create table if not exists strava_connections (
   user_id uuid primary key references users(id),

@@ -22,9 +22,16 @@ async function main() {
   const existing = await fetch(`${API}?${new URLSearchParams({ client_id, client_secret })}`);
   if (!existing.ok) throw new Error(`GET push_subscriptions ${existing.status}: ${await existing.text()}`);
   const subs = (await existing.json()) as { id: number; callback_url: string }[];
-  if (subs.length > 0) {
-    console.log("existing subscription, skipping:", subs);
+  const same = subs.find((s) => s.callback_url === callback_url);
+  if (same) {
+    console.log("existing subscription with this callback_url, skipping:", same);
     return;
+  }
+  // Strava allows one subscription per app: drop stale ones (old deploy URLs) first.
+  for (const s of subs) {
+    const del = await fetch(`${API}/${s.id}?${new URLSearchParams({ client_id, client_secret })}`, { method: "DELETE" });
+    if (!del.ok && del.status !== 204) throw new Error(`DELETE push_subscriptions/${s.id} ${del.status}: ${await del.text()}`);
+    console.log(`deleted stale subscription ${s.id} (${s.callback_url})`);
   }
 
   // Strava will GET callback_url?hub.mode=subscribe&hub.verify_token=…&hub.challenge=… during this call.

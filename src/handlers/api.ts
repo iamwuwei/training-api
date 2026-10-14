@@ -1,8 +1,7 @@
 import { randomUUID } from "node:crypto";
-import type { LambdaFunctionURLHandler } from "aws-lambda";
-import { userIdFromEvent } from "../lib/auth";
+import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyResultV2 } from "aws-lambda";
 import { query, queryOne } from "../lib/db";
-import type { ActivityRow, PlanRow, PlanWeekRow, PlannedSessionRow, ReviewRow } from "../types";
+import type { ActivityRow, PlanRow, PlanWeekRow, PlannedSessionRow, ReviewRow, UserRow } from "../types";
 import type {
   ActivitiesResponse,
   ApiActivity,
@@ -14,8 +13,9 @@ import type {
   PutReviewResponse,
 } from "../../types/api";
 
-// API for the front-end. CORS is configured on the Function URL (infra/lib/stack.ts).
-// Auth: `Authorization: Bearer <session token>` issued by the auth Lambda.
+// Behind API Gateway (HTTP API) with a Cognito JWT authorizer: by the time we
+// run, the ID token is already verified and its claims are on the event.
+// CORS is handled by the HTTP API (infra/lib/stack.ts).
 //
 //   GET /plan                        active plan + weeks + sessions + matched activities (with reviews)
 //   GET /activities?status=<status>  all activities (with reviews), newest first
@@ -28,27 +28,46 @@ const VERDICTS = new Set<string>(["達成", "達成但有提醒", "未達成"]);
 const json = <T extends PlanResponse | ActivitiesResponse | PutReviewResponse | ErrorResponse>(
   statusCode: number,
   body: T,
-) => ({
+): APIGatewayProxyResultV2 => ({
   statusCode,
   headers: { "content-type": "application/json", "cache-control": "no-store" },
   body: JSON.stringify(body),
 });
 
-export const handler: LambdaFunctionURLHandler = async (event) => {
+/**
+ * Cognito `sub` -> users.id. Closed system: a row must already carry this sub,
+ * or (first login) have the same email as the ID token; otherwise 403.
+ */
+async function resolveUser(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<UserRow | undefined> {
+  const claims = event.requestContext.authorizer?.jwt?.claims ?? {};
+  const sub = typeof claims.sub === "string" ? claims.sub : undefined;
+  const email = typeof claims.email === "string" ? claims.email : undefined;
+  if (!sub) return undefined;
+
+  let user = await queryOne<UserRow>("select * from users where cognito_sub = $1", [sub]);
+  if (!user && email) {
+    user = await queryOne<UserRow>("select * from users where cognito_sub is null and lower(email) = lower($1)", [email]);
+    if (user) await query("update users set cognito_sub = $2 where id = $1", [user.id, sub]);
+  }
+  if (!user) console.log(`login rejected: sub=${sub} email=${email ?? "-"}`);
+  return user;
+}
+
+export const handler = async (event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
   const path = event.rawPath;
   const q = event.queryStringParameters ?? {};
 
-  const userId = userIdFromEvent(event);
-  if (!userId) return json(401, { error: "unauthorized" });
+  const user = await resolveUser(event);
+  if (!user) return json(403, { error: "not registered" });
 
-  if (method === "GET" && path === "/plan") return getPlan(userId);
-  if (method === "GET" && path === "/activities") return getActivities(userId, q.status);
+  if (method === "GET" && path === "/plan") return getPlan(user.id);
+  if (method === "GET" && path === "/activities") return getActivities(user.id, q.status);
 
   const review = /^\/activities\/([^/]+)\/review$/.exec(path);
   if (method === "PUT" && review) {
     const raw = event.isBase64Encoded ? Buffer.from(event.body ?? "", "base64").toString("utf8") : event.body ?? "";
-    return putReview(userId, review[1], raw);
+    return putReview(user.id, review[1], raw);
   }
 
   return json(404, { error: "not found" });

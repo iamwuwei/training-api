@@ -8,7 +8,7 @@ export interface UserRow {
   id: string;
   email: string | null;
   display_name: string;
-  apple_sub: string | null;
+  cognito_sub: string | null;
   created_at: Date;
 }
 

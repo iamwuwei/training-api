@@ -1,36 +1,13 @@
-// Wire types for the `api` and `auth` Lambdas (Function URLs). Self-contained
-// so the front-end can copy this file as-is. Dates are ISO strings on the wire.
+// Wire types for the `api` Lambda (API Gateway HTTP API). Self-contained so
+// the front-end can copy this file as-is. Dates are ISO strings on the wire.
 //
-// Auth: every api call sends `Authorization: Bearer <session token>`; the
-// token comes from POST <AuthUrl>/apple.
+// Auth: every call sends `Authorization: Bearer <Cognito ID token>`. API
+// Gateway verifies the JWT; the api maps its `sub` (first time: `email`) to a
+// users row. 401 = bad/missing token (from API Gateway), 403 = not registered.
 
 export type SessionType = "easy" | "long" | "tempo" | "interval" | "rest" | "race";
 export type MatchStatus = "auto" | "confirmed" | "unplanned" | "ignored";
 export type Verdict = "達成" | "達成但有提醒" | "未達成";
-
-// ---- auth ------------------------------------------------------------------
-
-/** POST <AuthUrl>/apple — body */
-export interface AppleLoginRequest {
-  id_token: string; // identity token from Sign in with Apple JS (`authorization.id_token`)
-}
-
-export interface ApiUser {
-  id: string;
-  display_name: string;
-}
-
-/** POST <AuthUrl>/apple — 200 */
-export interface LoginResponse {
-  token: string;      // opaque session token, send as Bearer
-  expires_at: string; // ISO
-  user: ApiUser;
-}
-
-/** GET <AuthUrl>/me — 200 */
-export interface MeResponse {
-  user: ApiUser;
-}
 
 // ---- GET <ApiUrl>/plan ---------------------------------------------------------
 

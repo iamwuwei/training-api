@@ -1,5 +1,9 @@
 import path from "node:path";
 import * as cdk from "aws-cdk-lib";
+import * as apigw from "aws-cdk-lib/aws-apigatewayv2";
+import { HttpUserPoolAuthorizer } from "aws-cdk-lib/aws-apigatewayv2-authorizers";
+import { HttpLambdaIntegration } from "aws-cdk-lib/aws-apigatewayv2-integrations";
+import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import { SqsEventSource } from "aws-cdk-lib/aws-lambda-event-sources";
@@ -18,9 +22,15 @@ function required(name: string): string {
   return v;
 }
 
-export class TrainingStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+export interface TrainingApiStackProps extends cdk.StackProps {
+  stage: string; // "prod" → every resource is named training-api-<thing>-prod
+}
+
+export class TrainingApiStack extends cdk.Stack {
+  constructor(scope: Construct, id: string, props: TrainingApiStackProps) {
     super(scope, id, props);
+    const { stage } = props;
+    const name = (thing?: string) => (thing ? `training-api-${thing}-${stage}` : `training-api-${stage}`);
 
     // ---- config (from .env via dotenv in bin/app.ts, or cdk context) --------
     const dbClusterResourceId =
@@ -35,10 +45,13 @@ export class TrainingStack extends cdk.Stack {
       STRAVA_CLIENT_ID: required("STRAVA_CLIENT_ID"),
       STRAVA_CLIENT_SECRET: required("STRAVA_CLIENT_SECRET"),
     };
-    // Comma-separated list, e.g. "https://training.pages.dev,http://localhost:5173"
+    const claudeEnv = {
+      ANTHROPIC_API_KEY: required("ANTHROPIC_API_KEY"),
+      CLAUDE_MODEL: process.env.CLAUDE_MODEL ?? "claude-haiku-4-5",
+    };
+    // Comma-separated front-end origins, e.g. "https://training.pages.dev,http://localhost:5173"
     const corsOrigins = (process.env.CORS_ORIGIN ?? "https://iamwuwei.github.io")
       .split(",").map((s) => s.trim()).filter(Boolean);
-    const sessionSecret = required("SESSION_SECRET");
 
     // IAM auth: rds-db:connect on the cluster's resource id / db user.
     const rdsConnect = new iam.PolicyStatement({
@@ -48,21 +61,21 @@ export class TrainingStack extends cdk.Stack {
 
     // ---- queue ----------------------------------------------------------------
     const dlq = new sqs.Queue(this, "ActivitiesDlq", {
-      queueName: "activities-dlq",
+      queueName: name("activities-dlq"),
       retentionPeriod: cdk.Duration.days(14),
     });
     const queue = new sqs.Queue(this, "ActivitiesQueue", {
-      queueName: "activities",
+      queueName: name("activities"),
       visibilityTimeout: cdk.Duration.seconds(90),
       retentionPeriod: cdk.Duration.days(4),
       deadLetterQueue: { queue: dlq, maxReceiveCount: 3 },
     });
 
-    // ---- lambdas (6) --------------------------------------------------------------
-    const fn = (name: string, extra: Partial<NodejsFunctionProps> = {}) =>
-      new NodejsFunction(this, `${name[0].toUpperCase()}${name.slice(1)}Fn`, {
-        functionName: `training-${name}`,
-        entry: path.join(ROOT, "src", "handlers", `${name}.ts`),
+    // ---- lambdas --------------------------------------------------------------
+    const fn = (handler: string, extra: Partial<NodejsFunctionProps> = {}) =>
+      new NodejsFunction(this, `${handler[0].toUpperCase()}${handler.slice(1)}Fn`, {
+        functionName: name(handler),
+        entry: path.join(ROOT, "src", "handlers", `${handler}.ts`),
         handler: "handler",
         projectRoot: ROOT,
         depsLockFilePath: path.join(ROOT, "package-lock.json"),
@@ -70,8 +83,8 @@ export class TrainingStack extends cdk.Stack {
         architecture: lambda.Architecture.ARM_64,
         memorySize: 512,
         timeout: cdk.Duration.seconds(60),
-        logGroup: new logs.LogGroup(this, `${name}Logs`, {
-          logGroupName: `/aws/lambda/training-${name}`,
+        logGroup: new logs.LogGroup(this, `${handler}Logs`, {
+          logGroupName: `/aws/lambda/${name(handler)}`,
           retention: logs.RetentionDays.ONE_MONTH,
           removalPolicy: cdk.RemovalPolicy.DESTROY,
         }),
@@ -91,7 +104,7 @@ export class TrainingStack extends cdk.Stack {
           },
         },
         ...extra,
-        environment: { ...dbEnv, ...(extra.environment ?? {}) },
+        environment: { STAGE: stage, ...dbEnv, ...(extra.environment ?? {}) },
       });
 
     const webhook = fn("webhook", {
@@ -104,12 +117,7 @@ export class TrainingStack extends cdk.Stack {
 
     const worker = fn("worker", {
       timeout: cdk.Duration.seconds(90),
-      environment: {
-        ...stravaEnv,
-        AUTO_REVIEW: process.env.AUTO_REVIEW ?? "true",
-        ANTHROPIC_API_KEY: required("ANTHROPIC_API_KEY"),
-        CLAUDE_MODEL: process.env.CLAUDE_MODEL ?? "claude-haiku-4-5",
-      },
+      environment: { ...stravaEnv, ...claudeEnv, AUTO_REVIEW: process.env.AUTO_REVIEW ?? "true" },
       reservedConcurrentExecutions: 2,
     });
     worker.addToRolePolicy(rdsConnect);
@@ -118,25 +126,15 @@ export class TrainingStack extends cdk.Stack {
     const oauth = fn("oauth", { environment: stravaEnv });
     oauth.addToRolePolicy(rdsConnect);
 
-    const weekly = fn("weekly", {
-      environment: {
-        ANTHROPIC_API_KEY: required("ANTHROPIC_API_KEY"),
-        CLAUDE_MODEL: process.env.CLAUDE_MODEL ?? "claude-haiku-4-5",
-      },
-    });
+    const weekly = fn("weekly", { environment: claudeEnv });
     weekly.addToRolePolicy(rdsConnect);
 
-    const api = fn("api", { environment: { SESSION_SECRET: sessionSecret } });
+    const api = fn("api");
     api.addToRolePolicy(rdsConnect);
-
-    const auth = fn("auth", {
-      environment: { SESSION_SECRET: sessionSecret, APPLE_CLIENT_ID: required("APPLE_CLIENT_ID") },
-    });
-    auth.addToRolePolicy(rdsConnect);
 
     // ---- schedule: every Sunday 21:00 Asia/Tokyo -----------------------------
     new scheduler.Schedule(this, "WeeklyReviewSchedule", {
-      scheduleName: "training-weekly-review",
+      scheduleName: name("weekly-review"),
       schedule: scheduler.ScheduleExpression.cron({
         minute: "0",
         hour: "21",
@@ -146,22 +144,85 @@ export class TrainingStack extends cdk.Stack {
       target: new LambdaInvoke(weekly, { input: scheduler.ScheduleTargetInput.fromObject({}) }),
     });
 
-    // ---- function URLs ---------------------------------------------------------
+    // ---- Strava-facing endpoints: Function URLs, no auth (Strava calls them) ----
     const webhookUrl = webhook.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.NONE });
     const oauthUrl = oauth.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.NONE });
-    const cors = {
-      allowedOrigins: corsOrigins,
-      allowedMethods: [lambda.HttpMethod.GET, lambda.HttpMethod.POST, lambda.HttpMethod.PUT],
-      allowedHeaders: ["content-type", "authorization"],
-      maxAge: cdk.Duration.hours(1),
-    };
-    const apiUrl = api.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.NONE, cors });
-    const authUrl = auth.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.NONE, cors });
+
+    // ---- Cognito: closed user pool (admin creates the two users) -------------
+    const userPool = new cognito.UserPool(this, "UserPool", {
+      userPoolName: name("users"),
+      selfSignUpEnabled: false,
+      signInAliases: { email: true },
+      autoVerify: { email: true },
+      standardAttributes: { email: { required: true, mutable: true } },
+      accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
+      passwordPolicy: { minLength: 10, requireSymbols: false, requireUppercase: false, requireDigits: false },
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
+    // Optional Sign in with Apple federation: set all four APPLE_* vars to enable.
+    const apple = process.env.APPLE_SERVICES_ID && process.env.APPLE_TEAM_ID && process.env.APPLE_KEY_ID && process.env.APPLE_PRIVATE_KEY
+      ? new cognito.UserPoolIdentityProviderApple(this, "Apple", {
+          userPool,
+          clientId: process.env.APPLE_SERVICES_ID,
+          teamId: process.env.APPLE_TEAM_ID,
+          keyId: process.env.APPLE_KEY_ID,
+          privateKey: process.env.APPLE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+          scopes: ["email", "name"],
+          attributeMapping: { email: cognito.ProviderAttribute.APPLE_EMAIL },
+        })
+      : undefined;
+
+    const webClient = userPool.addClient("WebClient", {
+      userPoolClientName: name("web"),
+      generateSecret: false, // public SPA client
+      authFlows: { userSrp: true },
+      preventUserExistenceErrors: true,
+      supportedIdentityProviders: [
+        cognito.UserPoolClientIdentityProvider.COGNITO,
+        ...(apple ? [cognito.UserPoolClientIdentityProvider.APPLE] : []),
+      ],
+      oAuth: {
+        flows: { authorizationCodeGrant: true },
+        scopes: [cognito.OAuthScope.OPENID, cognito.OAuthScope.EMAIL, cognito.OAuthScope.PROFILE],
+        callbackUrls: corsOrigins.map((o) => `${o}/`),
+        logoutUrls: corsOrigins.map((o) => `${o}/`),
+      },
+      idTokenValidity: cdk.Duration.hours(1),
+      refreshTokenValidity: cdk.Duration.days(30),
+    });
+    if (apple) webClient.node.addDependency(apple);
+
+    const domain = userPool.addDomain("Domain", {
+      cognitoDomain: { domainPrefix: process.env.COGNITO_DOMAIN_PREFIX ?? `${name()}-${this.account}` },
+    });
+
+    // ---- HTTP API in front of the api Lambda, JWT (Cognito ID token) required ----
+    const httpApi = new apigw.HttpApi(this, "HttpApi", {
+      apiName: name(),
+      corsPreflight: {
+        allowOrigins: corsOrigins,
+        allowMethods: [apigw.CorsHttpMethod.GET, apigw.CorsHttpMethod.PUT, apigw.CorsHttpMethod.OPTIONS],
+        allowHeaders: ["content-type", "authorization"],
+        maxAge: cdk.Duration.hours(1),
+      },
+    });
+    const authorizer = new HttpUserPoolAuthorizer("CognitoJwt", userPool, { userPoolClients: [webClient] });
+    const integration = new HttpLambdaIntegration("ApiIntegration", api);
+    for (const [p, methods] of [
+      ["/plan", [apigw.HttpMethod.GET]],
+      ["/activities", [apigw.HttpMethod.GET]],
+      ["/activities/{id}/review", [apigw.HttpMethod.PUT]],
+    ] as const) {
+      httpApi.addRoutes({ path: p, methods: [...methods], integration, authorizer });
+    }
 
     new cdk.CfnOutput(this, "WebhookUrl", { value: webhookUrl.url });
     new cdk.CfnOutput(this, "OauthUrl", { value: oauthUrl.url });
-    new cdk.CfnOutput(this, "ApiUrl", { value: apiUrl.url });
-    new cdk.CfnOutput(this, "AuthUrl", { value: authUrl.url });
+    new cdk.CfnOutput(this, "ApiUrl", { value: httpApi.apiEndpoint });
+    new cdk.CfnOutput(this, "UserPoolId", { value: userPool.userPoolId });
+    new cdk.CfnOutput(this, "UserPoolClientId", { value: webClient.userPoolClientId });
+    new cdk.CfnOutput(this, "CognitoDomain", { value: domain.baseUrl() });
     new cdk.CfnOutput(this, "ActivitiesQueueUrl", { value: queue.queueUrl });
   }
 }
