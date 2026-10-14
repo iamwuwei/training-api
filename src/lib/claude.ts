@@ -55,7 +55,8 @@ const REVIEW_SYSTEM = `你是一位務實的馬拉松教練，替一位業餘跑
 - verdict 三選一：達成（配速與心拍都在區間內、距離到位）／達成但有提醒（跑完了但配速或心拍明顯偏離，或距離差 >15%）／未達成（距離差 >30% 或完全跑錯類型）。
 - comment：2〜4 句繁體中文，指出最值得注意的一件事（心拍漂移、起跑偏快、後段掉速、長跑末段加速…），引用具體公里數和數字。
 - reminders：0〜3 條，每條一句，只寫下次要改的具體動作；沒有就空陣列。
-- Easy / Recovery 日「寧慢勿快」，跑太快是扣分不是加分。`;
+- Easy / Recovery 日「寧慢勿快」，跑太快是扣分不是加分。
+- 有「跑者自述」時要納入判斷：數據超標但自述輕鬆、RPE 低，可以放寬；數據正常但自述很累、RPE 高，要在 comment 提醒。`;
 
 const REVIEW_SCHEMA = {
   type: "object",
@@ -72,6 +73,9 @@ export interface ActivityReviewInput {
   session: PlannedSessionRow;
   activity: Pick<ActivityRow, "distance_m" | "moving_time_sec" | "avg_pace_sec_km" | "avg_hr" | "max_hr"> & {
     splits: StravaSplit[] | null;
+    description?: string | null; // Strava description
+    memo?: string | null;        // athlete's note in the app
+    rpe?: number | null;         // athlete's RPE 1-10
   };
 }
 
@@ -92,6 +96,10 @@ export function buildReviewPrompt({ session: s, activity: a }: ActivityReviewInp
     "## 實際",
     `${(a.distance_m / 1000).toFixed(2)} km，${Math.round(a.moving_time_sec / 60)} 分，平均 ${pace(a.avg_pace_sec_km)}，平均心拍 ${a.avg_hr ?? "-"}，最高 ${a.max_hr ?? "-"}`,
     splits ? `每公里：\n${splits}` : "",
+    a.memo || a.description || a.rpe
+      ? ["", "## 跑者自述", a.rpe ? `RPE ${a.rpe}/10` : "", a.memo ? a.memo : "", !a.memo && a.description ? a.description : ""]
+          .filter((l) => l !== "").join("\n")
+      : "",
   ]
     .filter((l) => l !== "")
     .join("\n");

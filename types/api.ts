@@ -86,11 +86,11 @@ export interface ApiSplit {
   average_heartrate?: number;
 }
 
+/** Coach side (Claude or manual): the verdict on this activity. */
 export interface ApiReview {
   verdict: Verdict | null;
-  comment: string | null;     // 心得 paragraph
+  comment: string | null;     // coach comment paragraph
   reminders: string[];        // 提醒 bullets
-  rpe: number | null;
   source: "manual" | "claude";
   model: string | null;
   created_at: string;
@@ -110,7 +110,10 @@ export interface ApiActivity {
   max_hr: number | null;
   avg_watts: number | null;
   kcal: number | null;
-  description: string | null; // Strava description
+  description: string | null; // Strava description (synced; fallback when memo is null)
+  memo: string | null;        // athlete's own note, PUT …/memo
+  rpe: number | null;         // athlete's RPE 1-10, PUT …/memo
+  memo_updated_at: string | null;
   device_name: string | null;
   gear_name: string | null;   // shoes
   weather: string | null;     // free text, may be null
@@ -164,11 +167,24 @@ export interface PutReviewRequest {
   verdict: Verdict | null;
   comment?: string | null;
   reminders?: string[];
-  rpe?: number | null;
 }
 
 export interface PutReviewResponse {
   review: ApiReview;
+}
+
+// ---- PUT <ApiUrl>/activities/{id}/memo -----------------------------------------
+// The athlete's own note after a session. If the activity's review was written
+// by Claude it is regenerated with the memo as input (arrives a few seconds
+// later); a manual review is left alone.
+
+export interface PutMemoRequest {
+  memo: string | null;  // null / "" clears
+  rpe?: number | null;  // 1-10
+}
+
+export interface PutMemoResponse {
+  activity: ApiActivity;
 }
 
 // ---- errors (any non-2xx) ----------------------------------------------------

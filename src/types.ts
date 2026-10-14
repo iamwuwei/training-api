@@ -81,6 +81,9 @@ export interface ActivityRow {
   gear_id: string | null;
   gear_name: string | null;
   weather: string | null;
+  memo: string | null;
+  rpe: number | null;
+  memo_updated_at: Date | null;
   splits: unknown;
   match_status: MatchStatus;
   raw?: unknown;

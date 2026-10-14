@@ -186,21 +186,24 @@ async function main() {
         pending.push(r.date);
         continue;
       }
+      // L 心得 is the athlete's own note -> activities.memo (never over one written in the app)
       await query(
         `update activities set
            weather = coalesce(weather, $2), gear_name = coalesce(gear_name, $3),
-           device_name = coalesce(device_name, $4)
+           device_name = coalesce(device_name, $4),
+           memo = coalesce(memo, $5), memo_updated_at = coalesce(memo_updated_at, case when $5::text is null then null else now() end)
          where id = $1`,
-        [activity.id, r.weather, r.shoes, r.device],
+        [activity.id, r.weather, r.shoes, r.device, r.memo],
       );
-      if (r.verdict || r.memo || r.reminders.length) {
+      // V 判定 / W 提醒 are the coach side -> reviews (manual wins over claude)
+      if (r.verdict || r.reminders.length) {
         await query(
           `insert into reviews (id, activity_id, verdict, comment, reminders, source, model)
-           values ($1, $2, $3, $4, $5, 'manual', null)
+           values ($1, $2, $3, null, $4, 'manual', null)
            on conflict (activity_id) do update set
-             verdict = excluded.verdict, comment = excluded.comment, reminders = excluded.reminders,
+             verdict = excluded.verdict, reminders = excluded.reminders,
              source = 'manual', model = null`,
-          [randomUUID(), activity.id, r.verdict, r.memo, JSON.stringify(r.reminders)],
+          [randomUUID(), activity.id, r.verdict, JSON.stringify(r.reminders)],
         );
         attached++;
       }

@@ -86,7 +86,7 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
   const activityId = randomUUID();
 
   // On update events keep anything a human already decided (confirmed/ignored).
-  const [row] = await query<{ id: string; session_id: string | null }>(
+  const [row] = await query<{ id: string; session_id: string | null; memo: string | null; rpe: number | null }>(
     `insert into activities
        (id, user_id, strava_activity_id, session_id, start_time, distance_m, moving_time_sec,
         avg_pace_sec_km, avg_hr, max_hr, avg_watts, kcal, description, device_name, gear_id, gear_name,
@@ -112,7 +112,7 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
                               then activities.session_id else excluded.session_id end,
        match_status    = case when activities.match_status in ('confirmed', 'ignored')
                               then activities.match_status else excluded.match_status end
-     returning id, session_id`,
+     returning id, session_id, memo, rpe`,
     [
       activityId,
       conn.user_id,
@@ -162,6 +162,9 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
               avg_hr: round(activity.average_heartrate),
               max_hr: round(activity.max_heartrate),
               splits: activity.splits_metric ?? null,
+              description: activity.description ?? null,
+              memo: row.memo,
+              rpe: row.rpe,
             },
           });
           await query(

@@ -193,7 +193,13 @@ Aurora 閒置 5 分鐘會 pause，之後第一個請求要等它醒（15〜30 �
 - `GET <ApiUrl>/plan` → `PlanResponse { plan, weeks, sessions, activities }`：active plan、每週階段/重點、未 superseded 的 sessions（含原始 `label`、`content`、`target` 原文、配速/心拍上下限、`week_no`、`phase`）、已配對的 activities（含 `review`、最高心拍、功率、卡路里、鞋、裝置、天氣、每公里分段）。
 - `GET <ApiUrl>/activities?status=unplanned` → `ActivitiesResponse`，`status` 可為 `auto | confirmed | unplanned | ignored`，省略則全部。
 - `PUT <ApiUrl>/activities/{id}/review` body `PutReviewRequest { verdict, comment?, reminders?, rpe? }` → 手動判定，會覆蓋 Claude 的。
+- `PUT <ApiUrl>/activities/{id}/memo` body `PutMemoRequest { memo, rpe? }` → 跑者自己的心得和 RPE（1〜10）。存完如果那筆的判定是 Claude 寫的，會刪掉重評，新的判定會參考這段自述；手動判定不動。
 - `PUT <ApiUrl>/activities/{id}/session` body `PutSessionRequest { session_id, status? }` → 手動指定這筆活動是哪天的課（`confirmed`）。原本 `auto` 占著那個 session 的活動會退回 `unplanned`；`confirmed` 占著回 409。指定後舊的 Claude 判定刪掉、丟回 SQS 用新課表重評。`session_id: null` 配 `status: "ignored"` 表示這筆不算。
+
+## 心得 vs 判定
+
+- **跑者這邊**：`activities.memo` / `rpe`（app 裡寫，`PUT …/memo`），`activities.description`（Strava 上寫的，自動同步）。前端顯示 `memo ?? description`。
+- **教練這邊**：`reviews`（Claude 或手動的 verdict / comment / reminders）。Claude 評的時候會讀跑者自述。
 
 ## 判定（reviews）
 

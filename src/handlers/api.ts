@@ -17,6 +17,8 @@ import type {
   PutReviewResponse,
   PutSessionRequest,
   PutSessionResponse,
+  PutMemoRequest,
+  PutMemoResponse,
 } from "../../types/api";
 
 // Lambda training-api-prod. Behind API Gateway (HTTP API) with a Cognito JWT authorizer: by the time we
@@ -29,6 +31,7 @@ import type {
 //   GET /activities?status=<status>  all activities (with reviews), newest first
 //   PUT /activities/{id}/review      set a manual verdict
 //   PUT /activities/{id}/session     assign the activity to a planned session (or ignore it)
+//   PUT /activities/{id}/memo        athlete's own note + RPE (re-triggers the Claude review)
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const STATUSES = new Set<string>(["auto", "confirmed", "unplanned", "ignored"] satisfies MatchStatus[]);
@@ -36,7 +39,7 @@ const VERDICTS = new Set<string>(["達成", "達成但有提醒", "未達成"]);
 
 const sqs = new SQSClient({});
 
-const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | PutSessionResponse | ErrorResponse>(
+const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | PutSessionResponse | PutMemoResponse | ErrorResponse>(
   statusCode: number,
   body: T,
 ): APIGatewayProxyResultV2 => ({
@@ -94,10 +97,12 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
   if (method === "GET" && path === "/plan") return getPlan(user.id);
   if (method === "GET" && path === "/activities") return getActivities(user.id, q.status);
 
-  const sub = /^\/activities\/([^/]+)\/(review|session)$/.exec(path);
+  const sub = /^\/activities\/([^/]+)\/(review|session|memo)$/.exec(path);
   if (method === "PUT" && sub) {
     const raw = event.isBase64Encoded ? Buffer.from(event.body ?? "", "base64").toString("utf8") : event.body ?? "";
-    return sub[2] === "review" ? putReview(user.id, sub[1], raw) : putSession(user.id, sub[1], raw);
+    if (sub[2] === "review") return putReview(user.id, sub[1], raw);
+    if (sub[2] === "session") return putSession(user.id, sub[1], raw);
+    return putMemo(user.id, sub[1], raw);
   }
 
   return json(404, { error: "not found" });
@@ -124,26 +129,24 @@ async function getMe(user: UserRow, event: APIGatewayProxyEventV2WithJWTAuthoriz
 const ACTIVITY_SELECT = `
   a.id, a.user_id, a.strava_activity_id, a.session_id, a.sport_type, a.start_time, a.distance_m, a.moving_time_sec,
   a.avg_pace_sec_km, a.avg_hr, a.max_hr, a.avg_watts, a.kcal, a.description, a.device_name, a.gear_id,
-  a.gear_name, a.weather, a.splits, a.match_status,
-  r.verdict as r_verdict, r.comment as r_comment, r.reminders as r_reminders, r.rpe as r_rpe,
+  a.gear_name, a.weather, a.memo, a.rpe, a.memo_updated_at, a.splits, a.match_status,
+  r.verdict as r_verdict, r.comment as r_comment, r.reminders as r_reminders,
   r.source as r_source, r.model as r_model, r.created_at as r_created_at`;
 
 type ActivityJoined = Omit<ActivityRow, "raw"> & {
   r_verdict: ReviewRow["verdict"];
   r_comment: string | null;
   r_reminders: string[] | null;
-  r_rpe: number | null;
   r_source: ReviewRow["source"] | null;
   r_model: string | null;
   r_created_at: Date | null;
 };
 
-function toApiReview(r: Pick<ReviewRow, "verdict" | "comment" | "reminders" | "rpe" | "source" | "model" | "created_at">): ApiReview {
+function toApiReview(r: Pick<ReviewRow, "verdict" | "comment" | "reminders" | "source" | "model" | "created_at">): ApiReview {
   return {
     verdict: r.verdict,
     comment: r.comment,
     reminders: r.reminders ?? [],
-    rpe: r.rpe,
     source: r.source,
     model: r.model,
     created_at: new Date(r.created_at).toISOString(),
@@ -151,14 +154,15 @@ function toApiReview(r: Pick<ReviewRow, "verdict" | "comment" | "reminders" | "r
 }
 
 function toApiActivity(a: ActivityJoined): ApiActivity {
-  const { r_verdict, r_comment, r_reminders, r_rpe, r_source, r_model, r_created_at, ...rest } = a;
+  const { r_verdict, r_comment, r_reminders, r_source, r_model, r_created_at, ...rest } = a;
   return {
     ...rest,
     start_time: new Date(a.start_time).toISOString(),
+    memo_updated_at: a.memo_updated_at ? new Date(a.memo_updated_at).toISOString() : null,
     splits: (a.splits as ApiActivity["splits"]) ?? null,
     review: r_created_at
       ? toApiReview({
-          verdict: r_verdict, comment: r_comment, reminders: r_reminders, rpe: r_rpe,
+          verdict: r_verdict, comment: r_comment, reminders: r_reminders,
           source: r_source ?? "manual", model: r_model, created_at: r_created_at,
         })
       : null,
@@ -249,21 +253,18 @@ async function putReview(userId: string, activityId: string, raw: string) {
   }
   if (body.verdict !== null && !VERDICTS.has(body.verdict)) return json(400, { error: "invalid verdict" });
   const reminders = (body.reminders ?? []).filter((r): r is string => typeof r === "string" && r.trim() !== "");
-  if (body.rpe != null && (!Number.isInteger(body.rpe) || body.rpe < 1 || body.rpe > 10)) {
-    return json(400, { error: "rpe must be 1-10" });
-  }
 
   const owned = await queryOne<{ id: string }>("select id from activities where id = $1 and user_id = $2", [activityId, userId]);
   if (!owned) return json(404, { error: "activity not found" });
 
   const [review] = await query<ReviewRow>(
-    `insert into reviews (id, activity_id, verdict, comment, reminders, rpe, source, model)
-     values ($1, $2, $3, $4, $5, $6, 'manual', null)
+    `insert into reviews (id, activity_id, verdict, comment, reminders, source, model)
+     values ($1, $2, $3, $4, $5, 'manual', null)
      on conflict (activity_id) do update set
        verdict = excluded.verdict, comment = excluded.comment, reminders = excluded.reminders,
-       rpe = excluded.rpe, source = 'manual', model = null, created_at = now()
+       source = 'manual', model = null, created_at = now()
      returning *`,
-    [randomUUID(), activityId, body.verdict, body.comment ?? null, JSON.stringify(reminders), body.rpe ?? null],
+    [randomUUID(), activityId, body.verdict, body.comment ?? null, JSON.stringify(reminders)],
   );
   return json<PutReviewResponse>(200, { review: toApiReview(review) });
 }
@@ -316,26 +317,7 @@ async function putSession(userId: string, activityId: string, raw: string) {
       [activityId],
     );
     const hasManual = await queryOne<{ id: string }>("select id from reviews where activity_id = $1", [activityId]);
-    if ((dropped.length > 0 || !hasManual) && process.env.QUEUE_URL) {
-      const conn = await queryOne<{ strava_athlete_id: string }>(
-        "select strava_athlete_id from strava_connections where user_id = $1",
-        [userId],
-      );
-      if (conn) {
-        await sqs.send(
-          new SendMessageCommand({
-            QueueUrl: process.env.QUEUE_URL,
-            MessageBody: JSON.stringify({
-              object_type: "activity",
-              aspect_type: "update",
-              object_id: Number(activity.strava_activity_id),
-              owner_id: Number(conn.strava_athlete_id),
-              updates: { reason: "session reassigned" },
-            }),
-          }),
-        );
-      }
-    }
+    if (dropped.length > 0 || !hasManual) await requeue(userId, activity.strava_activity_id, "session reassigned");
   }
 
   const [row] = await query<ActivityJoined>(
@@ -343,4 +325,64 @@ async function putSession(userId: string, activityId: string, raw: string) {
     [activityId],
   );
   return json<PutSessionResponse>(200, { activity: toApiActivity(row) });
+}
+
+/** Push the activity back through the worker so a Claude review is regenerated. */
+async function requeue(userId: string, stravaActivityId: string, reason: string): Promise<void> {
+  if (!process.env.QUEUE_URL) return;
+  const conn = await queryOne<{ strava_athlete_id: string }>(
+    "select strava_athlete_id from strava_connections where user_id = $1",
+    [userId],
+  );
+  if (!conn) return;
+  await sqs.send(
+    new SendMessageCommand({
+      QueueUrl: process.env.QUEUE_URL,
+      MessageBody: JSON.stringify({
+        object_type: "activity",
+        aspect_type: "update",
+        object_id: Number(stravaActivityId),
+        owner_id: Number(conn.strava_athlete_id),
+        updates: { reason },
+      }),
+    }),
+  );
+}
+
+async function putMemo(userId: string, activityId: string, raw: string) {
+  if (!UUID_RE.test(activityId)) return json(400, { error: "invalid activity id" });
+  let body: PutMemoRequest;
+  try {
+    body = JSON.parse(raw) as PutMemoRequest;
+  } catch {
+    return json(400, { error: "invalid json" });
+  }
+  const memo = typeof body.memo === "string" && body.memo.trim() !== "" ? body.memo.trim() : null;
+  if (memo && memo.length > 4000) return json(400, { error: "memo too long (4000 chars)" });
+  const rpe = body.rpe ?? null;
+  if (rpe !== null && (!Number.isInteger(rpe) || rpe < 1 || rpe > 10)) return json(400, { error: "rpe must be 1-10" });
+
+  const activity = await queryOne<{ id: string; strava_activity_id: string; session_id: string | null }>(
+    "select id, strava_activity_id, session_id from activities where id = $1 and user_id = $2",
+    [activityId, userId],
+  );
+  if (!activity) return json(404, { error: "activity not found" });
+
+  await query("update activities set memo = $2, rpe = $3, memo_updated_at = now() where id = $1", [activityId, memo, rpe]);
+
+  // Let Claude take the athlete's words into account: drop its review and requeue.
+  if (activity.session_id) {
+    const dropped = await query<{ id: string }>(
+      "delete from reviews where activity_id = $1 and source = 'claude' returning id",
+      [activityId],
+    );
+    const hasManual = await queryOne<{ id: string }>("select id from reviews where activity_id = $1", [activityId]);
+    if (dropped.length > 0 || !hasManual) await requeue(userId, activity.strava_activity_id, "memo updated");
+  }
+
+  const [row] = await query<ActivityJoined>(
+    `select ${ACTIVITY_SELECT} from activities a left join reviews r on r.activity_id = a.id where a.id = $1`,
+    [activityId],
+  );
+  return json<PutMemoResponse>(200, { activity: toApiActivity(row) });
 }

@@ -89,6 +89,9 @@ alter table activities add column if not exists device_name text;
 alter table activities add column if not exists gear_id text;
 alter table activities add column if not exists gear_name text;      -- shoes
 alter table activities add column if not exists weather text;        -- free text; no automatic source yet
+alter table activities add column if not exists memo text;           -- athlete's own note, written in the app
+alter table activities add column if not exists rpe int;             -- athlete's RPE 1-10
+alter table activities add column if not exists memo_updated_at timestamptz;
 
 create table if not exists reviews (
   id uuid primary key,
