@@ -1,0 +1,6 @@
+node_modules/
+cdk.out/
+dist/
+.env
+*.js
+!cdk.json

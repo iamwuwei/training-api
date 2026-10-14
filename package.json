@@ -1,0 +1,34 @@
+{
+  "name": "training-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Strava-connected marathon training plan tracker (Lambda + SQS + Aurora)",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "migrate": "tsx scripts/migrate.ts",
+    "seed": "tsx seed/seed.ts",
+    "subscribe-webhook": "tsx scripts/subscribe-webhook.ts",
+    "synth": "cdk synth",
+    "deploy": "cdk deploy",
+    "cdk": "cdk"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.133.0",
+    "@aws-sdk/client-sqs": "^3.1151.0",
+    "@aws-sdk/rds-signer": "^3.1151.0",
+    "dotenv": "^18.0.7",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.164",
+    "@types/node": "^22.20.5",
+    "@types/pg": "^8.23.1",
+    "aws-cdk": "^2.1145.0",
+    "aws-cdk-lib": "^2.273.0",
+    "constructs": "^10.8.1",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  }
+}

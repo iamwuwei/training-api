@@ -1,0 +1,487 @@
+[
+  {
+    "user": "ww",
+    "race_name": "富士山マラソン",
+    "race_date": "2026-12-14",
+    "goal_time_sec": 17100,
+    "days_per_week": 4,
+    "sessions": [
+      {
+        "date": "2026-10-08",
+        "type": "easy",
+        "distance_m": 6000,
+        "pace_sec_km": 450,
+        "note": "輕鬆跑 6 km｜新鞋/舊鞋都行，先把習慣建起來"
+      },
+      {
+        "date": "2026-10-09",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "休息"
+      },
+      {
+        "date": "2026-10-10",
+        "type": "easy",
+        "distance_m": 5000,
+        "pace_sec_km": 450,
+        "note": "輕鬆跑 5 km"
+      },
+      {
+        "date": "2026-10-11",
+        "type": "long",
+        "distance_m": 12000,
+        "pace_sec_km": 455,
+        "note": "長跑 12 km，全程聊天配速｜跑完記錄心拍，當基準"
+      },
+      {
+        "date": "2026-10-12",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "休息｜完全休息。走路 20〜30 分 + 伸展滾筒（小腿／股四頭／臀）。腿痠散掉再跑"
+      },
+      {
+        "date": "2026-10-13",
+        "type": "easy",
+        "distance_m": 6000,
+        "pace_sec_km": 450,
+        "note": "輕鬆跑 6 km"
+      },
+      {
+        "date": "2026-10-14",
+        "type": "tempo",
+        "distance_m": 7000,
+        "pace_sec_km": 402,
+        "note": "[MP] 2 km Easy + 3 km @ MP + 2 km Easy｜MP 段心拍不要超過 165"
+      },
+      {
+        "date": "2026-10-15",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "休息｜休息。本週肌力由 10/17 Hyrox 取代，不做核心"
+      },
+      {
+        "date": "2026-10-16",
+        "type": "easy",
+        "distance_m": 4000,
+        "pace_sec_km": 465,
+        "note": "[Recovery] 恢復跑 4 km｜隔天 Hyrox，只活動腿，心拍超過 145 就走"
+      },
+      {
+        "date": "2026-10-17",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "[肌力] Hyrox（已約）｜難度 6〜7，站間休夠，心拍不衝 160+。這週肌力就是這場"
+      },
+      {
+        "date": "2026-10-18",
+        "type": "long",
+        "distance_m": 14000,
+        "pace_sec_km": 450,
+        "note": "長跑 14 km｜前日 Hyrox。目標只有完成＋心拍 ≤150，配速掉到 8:00 也可。隔天腿痠 >1 天＝Hyrox 強度太高"
+      },
+      {
+        "date": "2026-10-19",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "休息"
+      },
+      {
+        "date": "2026-10-20",
+        "type": "easy",
+        "distance_m": 6000,
+        "pace_sec_km": 450,
+        "note": "輕鬆跑 6 km"
+      },
+      {
+        "date": "2026-10-21",
+        "type": "interval",
+        "distance_m": 8000,
+        "pace_sec_km": null,
+        "note": "[坡跑] 2 km Easy + 5×90 秒上坡（慢跑下坡回復）+ 2 km Easy｜模擬富士山 20〜30 km 河口湖→西湖爬坡"
+      },
+      {
+        "date": "2026-10-22",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "休息｜肌力日：Hyrox 或 15 分鐘核心＋臀腿 擇一，難度 6〜7，不要跑到心拍 160+"
+      },
+      {
+        "date": "2026-10-23",
+        "type": "easy",
+        "distance_m": 6000,
+        "pace_sec_km": 450,
+        "note": "輕鬆跑 6 km"
+      },
+      {
+        "date": "2026-10-24",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "休息"
+      },
+      {
+        "date": "2026-10-25",
+        "type": "long",
+        "distance_m": 16000,
+        "pace_sec_km": 445,
+        "note": "長跑 16 km｜找有起伏的路線（駒沢、代代木）"
+      },
+      {
+        "date": "2026-10-26",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "休息"
+      },
+      {
+        "date": "2026-10-27",
+        "type": "easy",
+        "distance_m": 7000,
+        "pace_sec_km": 450,
+        "note": "輕鬆跑 7 km"
+      },
+      {
+        "date": "2026-10-28",
+        "type": "tempo",
+        "distance_m": 9000,
+        "pace_sec_km": 405,
+        "note": "[MP] 3 km Easy + 5 km @ 6:40 + 1 km Easy"
+      },
+      {
+        "date": "2026-10-29",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "休息｜肌力日：Hyrox 或 15 分鐘核心＋臀腿 擇一，難度 6〜7，不要跑到心拍 160+"
+      },
+      {
+        "date": "2026-10-30",
+        "type": "easy",
+        "distance_m": 6000,
+        "pace_sec_km": 450,
+        "note": "輕鬆跑 6 km"
+      },
+      {
+        "date": "2026-10-31",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "休息"
+      },
+      {
+        "date": "2026-11-01",
+        "type": "long",
+        "distance_m": 18000,
+        "pace_sec_km": 445,
+        "note": "長跑 18 km，最後 4 km @ 6:45｜每 40 分 1 包能量膠＋水，測試腸胃；穿比賽衣褲"
+      },
+      {
+        "date": "2026-11-02",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "休息"
+      },
+      {
+        "date": "2026-11-03",
+        "type": "easy",
+        "distance_m": 7000,
+        "pace_sec_km": 450,
+        "note": "輕鬆跑 7 km"
+      },
+      {
+        "date": "2026-11-04",
+        "type": "interval",
+        "distance_m": 8000,
+        "pace_sec_km": null,
+        "note": "[坡跑] 2 km Easy + 6×90 秒上坡 + 2 km Easy"
+      },
+      {
+        "date": "2026-11-05",
+        "type": "easy",
+        "distance_m": 5000,
+        "pace_sec_km": null,
+        "note": "[Recovery] 恢復跑 4〜5 km（與肌力同日，兩者都輕）｜肌力日：Hyrox 或 15 分鐘核心＋臀腿 擇一，難度 6〜7，不要跑到心拍 160+"
+      },
+      {
+        "date": "2026-11-06",
+        "type": "easy",
+        "distance_m": 6000,
+        "pace_sec_km": 450,
+        "note": "輕鬆跑 6 km"
+      },
+      {
+        "date": "2026-11-07",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "休息"
+      },
+      {
+        "date": "2026-11-08",
+        "type": "long",
+        "distance_m": 22000,
+        "pace_sec_km": 445,
+        "note": "長跑 22 km，最後 5 km @ 6:45 ★關卡1：最後5km穩6:45且心拍<168才繼續下面的MP段｜補給照 11/1，加鹽錠或電解質"
+      },
+      {
+        "date": "2026-11-09",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "休息"
+      },
+      {
+        "date": "2026-11-10",
+        "type": "easy",
+        "distance_m": 6000,
+        "pace_sec_km": 465,
+        "note": "[Recovery] 恢復跑 6 km 非常慢"
+      },
+      {
+        "date": "2026-11-11",
+        "type": "tempo",
+        "distance_m": 10000,
+        "pace_sec_km": 405,
+        "note": "[MP] 2 km Easy + 7 km @ 6:40 + 1 km Easy｜第一次連續 6 km MP，看心拍能否守在 165 以下"
+      },
+      {
+        "date": "2026-11-12",
+        "type": "easy",
+        "distance_m": 5000,
+        "pace_sec_km": null,
+        "note": "[Recovery] 恢復跑 4〜5 km（與肌力同日，兩者都輕）｜肌力日：Hyrox 或 15 分鐘核心＋臀腿 擇一，難度 6〜7，不要跑到心拍 160+"
+      },
+      {
+        "date": "2026-11-13",
+        "type": "easy",
+        "distance_m": 6000,
+        "pace_sec_km": 450,
+        "note": "輕鬆跑 6 km"
+      },
+      {
+        "date": "2026-11-14",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "休息"
+      },
+      {
+        "date": "2026-11-15",
+        "type": "long",
+        "distance_m": 26000,
+        "pace_sec_km": 445,
+        "note": "長跑 26 km，最後 6 km @ 6:45｜超過 2.5 小時就停，不硬撐距離"
+      },
+      {
+        "date": "2026-11-16",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "休息"
+      },
+      {
+        "date": "2026-11-17",
+        "type": "easy",
+        "distance_m": 7000,
+        "pace_sec_km": 450,
+        "note": "輕鬆跑 7 km"
+      },
+      {
+        "date": "2026-11-18",
+        "type": "interval",
+        "distance_m": 10000,
+        "pace_sec_km": 405,
+        "note": "[坡跑+MP] 3 km Easy + 4×90 秒上坡 + 3 km @ MP｜坡後接 MP，模擬西湖爬坡後還要維持配速"
+      },
+      {
+        "date": "2026-11-19",
+        "type": "easy",
+        "distance_m": 5000,
+        "pace_sec_km": null,
+        "note": "[Recovery] 恢復跑 4〜5 km（與肌力同日，兩者都輕）｜肌力日：Hyrox 或 15 分鐘核心＋臀腿 擇一，難度 6〜7，不要跑到心拍 160+"
+      },
+      {
+        "date": "2026-11-20",
+        "type": "easy",
+        "distance_m": 6000,
+        "pace_sec_km": 450,
+        "note": "輕鬆跑 6 km"
+      },
+      {
+        "date": "2026-11-21",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "休息"
+      },
+      {
+        "date": "2026-11-22",
+        "type": "long",
+        "distance_m": 32000,
+        "pace_sec_km": 442,
+        "note": "[Peak Long] ★ 峰值長跑 32 km，最後 8 km @ 6:45（關卡1未過則維持 30 km 純 Easy）｜★關卡2：最後8km穩6:45、心拍<170、隔天無痛點 → 比賽配速6:40〜6:45；掉到7:15+ → 比賽7:00"
+      },
+      {
+        "date": "2026-11-23",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "[完全休息] 完全休息，不做肌力｜走路、伸展、睡飽"
+      },
+      {
+        "date": "2026-11-24",
+        "type": "easy",
+        "distance_m": 5000,
+        "pace_sec_km": 465,
+        "note": "[Recovery] 恢復跑 5 km 非常慢"
+      },
+      {
+        "date": "2026-11-25",
+        "type": "easy",
+        "distance_m": 7000,
+        "pace_sec_km": 450,
+        "note": "輕鬆跑 7 km"
+      },
+      {
+        "date": "2026-11-26",
+        "type": "easy",
+        "distance_m": 5000,
+        "pace_sec_km": null,
+        "note": "[Recovery] 恢復跑 4〜5 km（與肌力同日，兩者都輕）｜肌力日：Hyrox 或 15 分鐘核心＋臀腿 擇一，難度 6〜7，不要跑到心拍 160+"
+      },
+      {
+        "date": "2026-11-27",
+        "type": "easy",
+        "distance_m": 5000,
+        "pace_sec_km": 450,
+        "note": "輕鬆跑 5 km"
+      },
+      {
+        "date": "2026-11-28",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "休息"
+      },
+      {
+        "date": "2026-11-29",
+        "type": "long",
+        "distance_m": 20000,
+        "pace_sec_km": 440,
+        "note": "長跑 20 km，最後 5 km @ 6:40〜7:00｜減量週：確認 30 km 後身體已恢復"
+      },
+      {
+        "date": "2026-11-30",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "休息"
+      },
+      {
+        "date": "2026-12-01",
+        "type": "easy",
+        "distance_m": 6000,
+        "pace_sec_km": 450,
+        "note": "輕鬆跑 6 km"
+      },
+      {
+        "date": "2026-12-02",
+        "type": "tempo",
+        "distance_m": 8000,
+        "pace_sec_km": 405,
+        "note": "[MP] 3 km Easy + 4 km @ 6:40 + 2 km Easy｜維持配速感覺，不是練體能"
+      },
+      {
+        "date": "2026-12-03",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "休息"
+      },
+      {
+        "date": "2026-12-04",
+        "type": "easy",
+        "distance_m": 5000,
+        "pace_sec_km": 450,
+        "note": "輕鬆跑 5 km"
+      },
+      {
+        "date": "2026-12-05",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "休息"
+      },
+      {
+        "date": "2026-12-06",
+        "type": "long",
+        "distance_m": 14000,
+        "pace_sec_km": 445,
+        "note": "長跑 14 km｜最後一次穿比賽鞋確認"
+      },
+      {
+        "date": "2026-12-07",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "休息"
+      },
+      {
+        "date": "2026-12-08",
+        "type": "easy",
+        "distance_m": 5000,
+        "pace_sec_km": 450,
+        "note": "輕鬆跑 5 km"
+      },
+      {
+        "date": "2026-12-09",
+        "type": "tempo",
+        "distance_m": 6000,
+        "pace_sec_km": 405,
+        "note": "[MP] 4 km Easy + 2 km @ MP｜★關卡3：最後2km MP心拍<165且體感輕 → 前半可押6:38；否則維持6:45"
+      },
+      {
+        "date": "2026-12-10",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "休息"
+      },
+      {
+        "date": "2026-12-11",
+        "type": "easy",
+        "distance_m": 4000,
+        "pace_sec_km": 450,
+        "note": "[快步] 輕鬆跑 4 km + 4×20 秒快步｜保持腿的彈性"
+      },
+      {
+        "date": "2026-12-12",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "休息"
+      },
+      {
+        "date": "2026-12-13",
+        "type": "rest",
+        "distance_m": 0,
+        "pace_sec_km": null,
+        "note": "[完全休息] 完全休息｜前一天抵達河口湖、早睡、裝備排好、早餐吃習慣的"
+      },
+      {
+        "date": "2026-12-14",
+        "type": "race",
+        "distance_m": 42195,
+        "pace_sec_km": 430,
+        "note": "🏁 富士山マラソン 42.195 km｜水站走路喝水；每 40 分補膠；26 km 前絕不加速"
+      }
+    ]
+  }
+]
