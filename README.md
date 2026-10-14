@@ -75,7 +75,19 @@ Output 會有四個 Function URL：`WebhookUrl`、`OauthUrl`、`AuthUrl`、`ApiU
 
 一次性設定：
 
-1. **AWS**：IAM → Identity providers 加 `token.actions.githubusercontent.com`（audience `sts.amazonaws.com`）。IAM → Roles → Create role → Web identity，organization `iamwuwei`、repository `training-api`、branch `main`。role 的 inline policy 只要能 assume CDK bootstrap 的 role：
+1. **AWS**：IAM → Identity providers 加 `token.actions.githubusercontent.com`（audience `sts.amazonaws.com`）。IAM → Roles → Create role → Web identity，organization `iamwuwei`、repository `training-api`。建好後把 trust policy 的 `sub` 條件改成下面這樣：deploy job 綁 `environment: prod`，所以 token 的 `sub` 是 `repo:…:environment:prod`，不是 `ref:refs/heads/main`：
+
+   ```json
+   "Condition": {
+     "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
+     "StringLike": { "token.actions.githubusercontent.com:sub": [
+       "repo:iamwuwei/training-api:environment:prod",
+       "repo:iamwuwei/training-api:ref:refs/heads/main"
+     ] }
+   }
+   ```
+
+   role 的 inline policy 只要能 assume CDK bootstrap 的 role：
 
    ```json
    { "Version": "2012-10-17", "Statement": [{ "Effect": "Allow", "Action": "sts:AssumeRole", "Resource": "arn:aws:iam::*:role/cdk-hnb659fds-*" }] }
