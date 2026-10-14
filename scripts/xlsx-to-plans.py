@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Convert the 課表 workbook (in the sibling `running` repo) into seed/plans.json.
+"""Convert a 課表 workbook into seed/plans.json (one entry per user, merged in place).
 
-Usage:  python3 scripts/xlsx-to-plans.py [path/to/課表.xlsx]
-Writes  seed/plans.json
+Usage:  python3 scripts/xlsx-to-plans.py [path/to/課表.xlsx] [--user ww|gf] [--goal H:MM] [--days N]
+        python3 scripts/xlsx-to-plans.py                                   # ww from ../running
+        python3 scripts/xlsx-to-plans.py ~/Downloads/Sara課表.xlsx --user gf --goal 5:30
+Writes  seed/plans.json — replaces only the given user's entry, keeps the others.
 
 Reads
   課表   A–I  -> sessions (plan)           J–W -> results (actuals, hand-typed verdicts)
@@ -24,11 +26,15 @@ ROOT = HERE.parent
 DEFAULT_XLSX = ROOT.parent / "running" / "富士山馬拉松_2026_課表.xlsx"  # ../running checkout
 OUT = ROOT / "seed" / "plans.json"
 
-USER = "ww"
+import argparse
+
 RACE_NAME = "富士山マラソン"
 RACE_DATE = "2026-12-14"
-GOAL_TIME_SEC = 4 * 3600 + 45 * 60   # 比賽目標 4:45
-DAYS_PER_WEEK = 4
+# Per-user defaults; --goal / --days override. Keys must match USERS in seed/seed.ts.
+DEFAULTS = {
+    "ww": {"goal_time_sec": 4 * 3600 + 45 * 60, "days_per_week": 4},  # 比賽目標 4:45
+    "gf": {"goal_time_sec": None, "days_per_week": None},
+}
 
 # 類型 (column E) -> easy | long | tempo | interval | rest | race.
 # The original label is kept in `label` for the UI avatars (E / R / L / MP / 坡 / 肌).
@@ -110,7 +116,16 @@ def pace_sec(v) -> int | None:
     return sec(int(m.group(1)), int(m.group(2))) if m else None
 
 
-def main(xlsx: pathlib.Path) -> None:
+def goal_sec(v: str | None) -> int | None:
+    if not v:
+        return None
+    m = re.match(r"^(\d+):(\d{2})$", v)
+    if not m:
+        sys.exit(f"--goal must look like H:MM, got {v!r}")
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60
+
+
+def main(xlsx: pathlib.Path, user: str, goal: int | None, days: int | None) -> None:
     wb = openpyxl.load_workbook(xlsx, data_only=True)
 
     weeks = []
@@ -171,20 +186,32 @@ def main(xlsx: pathlib.Path) -> None:
         sys.exit(f"unmapped 類型 values: {sorted(unknown)} — add them to TYPE_MAP")
 
     sessions.sort(key=lambda s: s["date"])
-    plans = [{
-        "user": USER,
+    entry = {
+        "user": user,
         "race_name": RACE_NAME,
         "race_date": RACE_DATE,
-        "goal_time_sec": GOAL_TIME_SEC,
-        "days_per_week": DAYS_PER_WEEK,
+        "goal_time_sec": goal if goal is not None else DEFAULTS[user]["goal_time_sec"],
+        "days_per_week": days if days is not None else DEFAULTS[user]["days_per_week"],
         "weeks": weeks,
         "sessions": sessions,
         "results": results,
-    }]
+    }
+
+    # Merge: keep every other user's plan as it is, replace this user's.
+    plans = json.loads(OUT.read_text(encoding="utf-8")) if OUT.exists() else []
+    plans = [p for p in plans if p.get("user") != user] + [entry]
+    plans.sort(key=lambda p: list(DEFAULTS).index(p["user"]) if p["user"] in DEFAULTS else 99)
     OUT.write_text(json.dumps(plans, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"wrote {OUT.relative_to(ROOT)}: {len(weeks)} weeks, {len(sessions)} sessions "
-          f"({sessions[0]['date']} → {sessions[-1]['date']}), {len(results)} results")
+    print(f"wrote {OUT.relative_to(ROOT)} [{user}]: {len(weeks)} weeks, {len(sessions)} sessions "
+          f"({sessions[0]['date']} → {sessions[-1]['date']}), {len(results)} results; "
+          f"{len(plans)} plan(s) in file")
 
 
 if __name__ == "__main__":
-    main(pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_XLSX)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("xlsx", nargs="?", default=DEFAULT_XLSX, type=pathlib.Path)
+    ap.add_argument("--user", default="ww", choices=sorted(DEFAULTS), help="key in seed/seed.ts USERS")
+    ap.add_argument("--goal", help="race goal H:MM, e.g. 5:30")
+    ap.add_argument("--days", type=int, help="planned run days per week")
+    a = ap.parse_args()
+    main(a.xlsx, a.user, goal_sec(a.goal), a.days)

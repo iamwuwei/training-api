@@ -25,7 +25,12 @@ const USERS: Record<string, { id: string; display_name: string; email: string | 
     email: "q8wk84662z@privaterelay.appleid.com", // Sign in with Apple private relay
     cognito_sub: "f7f4fa98-1011-708e-c939-298a6407ef5b",
   },
-  gf: { id: "3f9a8b2c-6d1e-4a5f-8e7c-2b4d6f8a0c02", display_name: "gf", email: null, cognito_sub: null },
+  gf: {
+    id: "3f9a8b2c-6d1e-4a5f-8e7c-2b4d6f8a0c02",
+    display_name: "Sara",
+    email: "yhdphh7j67@privaterelay.appleid.com", // Sign in with Apple private relay
+    cognito_sub: null, // linked on her first API call by email
+  },
 };
 
 interface SeedWeek {

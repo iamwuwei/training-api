@@ -55,7 +55,10 @@ npm run backfill  # 把課表開始日起的 Strava 跑步全部拉進 activitie
 npm run seed      # 再跑一次：把 xlsx 裡手打的 判定／心得／提醒／天氣／鞋／裝置 掛到同一天的 activity 上
 ```
 
-- `seed/plans.json` 由 `python3 scripts/xlsx-to-plans.py` 從 `../running/富士山馬拉松_2026_課表.xlsx` 產生（預設假設 `running` repo 和這個 repo 並排 clone；也可以把 xlsx 路徑當參數傳入。需要 `openpyxl`）。課表改了就重跑這個再 `npm run seed`。
+- `seed/plans.json` 一個使用者一筆，由 `python3 scripts/xlsx-to-plans.py` 產生，每次只替換指定使用者的那筆、其他人保留（需要 `openpyxl`）：
+  - ww：`python3 scripts/xlsx-to-plans.py`（預設讀 `../running/富士山馬拉松_2026_課表.xlsx`）
+  - gf：`python3 scripts/xlsx-to-plans.py ~/Downloads/Sara課表.xlsx --user gf --goal 5:30 --days 4`（`--goal`、`--days` 選填）
+  課表改了就重跑這個再 `npm run seed`。
 - 兩個 user 的 uuid、`display_name`、`email` 寫死在 `seed/seed.ts` 的 `USERS`。`email` 填 Apple ID 的 email（或 private relay 位址）：第一次 Apple 登入會用 email 對到這一列並記下 `apple_sub`，之後只認 `apple_sub`。沒對到的人登入會拿到 403（封閉系統）。
 - 類型正規化表在 `scripts/xlsx-to-plans.py` 的 `TYPE_MAP`；遇到沒看過的類型會直接報錯列出來。
 
