@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import tls from "node:tls";
 import { Signer } from "@aws-sdk/rds-signer";
 import { Pool, type QueryResultRow } from "pg";
 
@@ -16,9 +17,16 @@ function env(name: string, fallback?: string): string {
   return v;
 }
 
-// Bundled next to the handler by CDK (commandHooks.afterBundling); when run
-// via tsx from the repo this resolves to src/lib/global-bundle.pem.
-const CA = fs.readFileSync(path.join(__dirname, "global-bundle.pem"));
+// Trust store for the Aurora TLS handshake: the RDS global CA bundle (bundled
+// next to the handler by CDK's commandHooks.afterBundling; src/lib/ under tsx)
+// PLUS Node's built-in public roots. The public endpoint (internet access
+// gateway) can present a chain signed by a public Amazon CA rather than the
+// RDS CA, which the RDS bundle alone rejects with
+// UNABLE_TO_GET_ISSUER_CERT_LOCALLY. Hostname verification stays on.
+const CA = [
+  fs.readFileSync(path.join(__dirname, "global-bundle.pem"), "utf8"),
+  ...tls.rootCertificates,
+];
 
 async function getPool(): Promise<Pool> {
   if (pool && Date.now() - poolCreatedAt < TOKEN_TTL_MS) return pool;
