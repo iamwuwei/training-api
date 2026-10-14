@@ -15,11 +15,17 @@ import type { SessionType } from "../src/types";
 // (the second seed attaches results to the backfilled activities).
 
 // Fixed uuids so the front-end / OAuth links stay stable across re-seeds.
-// email: the Cognito user's email — first API call links users.cognito_sub to
-// the row whose email matches the ID token.
-const USERS: Record<string, { id: string; display_name: string; email: string | null }> = {
-  ww: { id: "7d1c3a0e-4f7b-4d2e-9c1a-5b8e2f6a1c01", display_name: "Wei Wu", email: null },
-  gf: { id: "3f9a8b2c-6d1e-4a5f-8e7c-2b4d6f8a0c02", display_name: "gf", email: null },
+// cognito_sub: the Cognito user's `sub` (User pool → Users → User ID). Set it
+// here when known; otherwise the first API call links the row whose email
+// matches the ID token.
+const USERS: Record<string, { id: string; display_name: string; email: string | null; cognito_sub: string | null }> = {
+  ww: {
+    id: "7d1c3a0e-4f7b-4d2e-9c1a-5b8e2f6a1c01",
+    display_name: "Wei Wu",
+    email: "q8wk84662z@privaterelay.appleid.com", // Sign in with Apple private relay
+    cognito_sub: "f7f4fa98-1011-708e-c939-298a6407ef5b",
+  },
+  gf: { id: "3f9a8b2c-6d1e-4a5f-8e7c-2b4d6f8a0c02", display_name: "gf", email: null, cognito_sub: null },
 };
 
 interface SeedWeek {
@@ -80,9 +86,12 @@ async function main() {
 
   for (const [key, u] of Object.entries(USERS)) {
     await query(
-      `insert into users (id, email, display_name) values ($1, $2, $3)
-       on conflict (id) do update set display_name = excluded.display_name, email = excluded.email`,
-      [u.id, u.email, u.display_name],
+      `insert into users (id, email, display_name, cognito_sub) values ($1, $2, $3, $4)
+       on conflict (id) do update set
+         display_name = excluded.display_name,
+         email = excluded.email,
+         cognito_sub = coalesce(excluded.cognito_sub, users.cognito_sub)`,
+      [u.id, u.email, u.display_name, u.cognito_sub],
     );
     console.log(`user ${key}: ${u.id} (${u.display_name})`);
   }
