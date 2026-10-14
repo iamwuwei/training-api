@@ -1,14 +1,21 @@
 import type { LambdaFunctionURLHandler } from "aws-lambda";
 import { query, queryOne } from "../lib/db";
 import type { ActivityRow, PlanRow, PlannedSessionRow } from "../types";
+import type {
+  ActivitiesResponse,
+  ApiActivity,
+  ErrorResponse,
+  MatchStatus,
+  PlanResponse,
+} from "../../types/api";
 
 // Read-only API for the GitHub Pages front-end. CORS is configured on the
 // Function URL itself (see infra/lib/stack.ts). v1: no auth, user uuid as bearer.
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const STATUSES = new Set(["auto", "confirmed", "unplanned", "ignored"]);
+const STATUSES = new Set<string>(["auto", "confirmed", "unplanned", "ignored"] satisfies MatchStatus[]);
 
-const json = (statusCode: number, body: unknown) => ({
+const json = <T extends PlanResponse | ActivitiesResponse | ErrorResponse>(statusCode: number, body: T) => ({
   statusCode,
   headers: { "content-type": "application/json", "cache-control": "no-store" },
   body: JSON.stringify(body),
@@ -58,7 +65,15 @@ async function getPlan(userId: string) {
     [userId, plan.id],
   );
 
-  return json(200, { plan, sessions, activities });
+  return json<PlanResponse>(200, { plan, sessions, activities: activities.map(toApiActivity) });
+}
+
+function toApiActivity(a: Omit<ActivityRow, "raw">): ApiActivity {
+  return {
+    ...a,
+    start_time: new Date(a.start_time).toISOString(),
+    splits: (a.splits as ApiActivity["splits"]) ?? null,
+  };
 }
 
 async function getActivities(userId: string, status?: string) {
@@ -73,5 +88,5 @@ async function getActivities(userId: string, status?: string) {
       limit 200`,
     [userId, status ?? null],
   );
-  return json(200, { activities });
+  return json<ActivitiesResponse>(200, { activities: activities.map(toApiActivity) });
 }

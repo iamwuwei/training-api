@@ -12,6 +12,6 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "infra/**/*.ts", "scripts/**/*.ts", "seed/**/*.ts"],
+  "include": ["src/**/*.ts", "types/**/*.ts", "infra/**/*.ts", "scripts/**/*.ts", "seed/**/*.ts"],
   "exclude": ["node_modules", "cdk.out"]
 }

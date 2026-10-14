@@ -1,5 +1,5 @@
 {
-  "name": "training-backend",
+  "name": "training-api",
   "version": "0.1.0",
   "private": true,
   "description": "Strava-connected marathon training plan tracker (Lambda + SQS + Aurora)",

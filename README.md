@@ -1,4 +1,4 @@
-# training-backend
+# training-api
 
 Strava 連動的馬拉松課表追蹤後端。兩個使用者，Node.js 22 + TypeScript，infra 用 AWS CDK。
 
@@ -76,6 +76,8 @@ Output 會有三個 Function URL：`WebhookUrl`、`OauthUrl`、`ApiUrl`。
 
 ## API
 
+型別在 `types/api.ts`（`PlanResponse` / `ActivitiesResponse` / `ErrorResponse`）。
+
 - `GET <ApiUrl>/plan?user=<uuid>` → `{ plan, sessions, activities }`：active plan、未 superseded 的 sessions、已配對的 activities。
 - `GET <ApiUrl>/activities?user=<uuid>&status=unplanned` → `{ activities }`，`status` 可為 `auto | confirmed | unplanned | ignored`，省略則全部。
 
@@ -97,10 +99,14 @@ Output 會有三個 Function URL：`WebhookUrl`、`OauthUrl`、`ApiUrl`。
 ## 檔案
 
 ```
-infra/        CDK（bin/app.ts, lib/stack.ts）
-src/handlers/ webhook / worker / oauth / weekly / api
-src/lib/      db（IAM token + pg Pool）、strava、matcher、claude
-sql/          schema.sql
-seed/         plans.json、seed.ts
-scripts/      migrate.ts、subscribe-webhook.ts、xlsx-to-plans.py
+training-api/
+├── infra/        CDK（bin/app.ts, lib/stack.ts）
+├── src/
+│   ├── handlers/ webhook / worker / oauth / weekly / api
+│   ├── lib/      db（IAM token + pg Pool）、strava、matcher、claude
+│   └── types.ts  內部 row / Strava 型別
+├── types/        api.ts — API request/response 型別（前端直接複製用）
+├── sql/          schema.sql
+├── seed/         plans.json、seed.ts
+└── scripts/      migrate.ts、subscribe-webhook.ts、xlsx-to-plans.py
 ```

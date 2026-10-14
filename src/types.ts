@@ -1,7 +1,8 @@
-// Shared row + API types. Keep in sync with sql/schema.sql.
+// Internal row + Strava types. Keep in sync with sql/schema.sql.
+// Public API request/response types live in ../types/api.ts.
 
-export type SessionType = "easy" | "long" | "tempo" | "interval" | "rest" | "race";
-export type MatchStatus = "auto" | "confirmed" | "unplanned" | "ignored";
+import type { MatchStatus, SessionType } from "../types/api";
+export type { MatchStatus, SessionType };
 
 export interface UserRow {
   id: string;
