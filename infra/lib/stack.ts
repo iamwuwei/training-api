@@ -130,8 +130,8 @@ export class TrainingApiStack extends cdk.Stack {
     const weekly = fn("weekly", { environment: claudeEnv });
     weekly.addToRolePolicy(rdsConnect);
 
-    const api = fn("api");
-    api.addToRolePolicy(rdsConnect);
+    const http = fn("http"); // backend of the HTTP API: training-api-http-prod
+    http.addToRolePolicy(rdsConnect);
 
     // ---- schedule: every Sunday 21:00 Asia/Tokyo -----------------------------
     new scheduler.Schedule(this, "WeeklyReviewSchedule", {
@@ -198,7 +198,7 @@ export class TrainingApiStack extends cdk.Stack {
       cognitoDomain: { domainPrefix: process.env.COGNITO_DOMAIN_PREFIX ?? `${name()}-${this.account}` },
     });
 
-    // ---- HTTP API in front of the api Lambda, JWT (Cognito ID token) required ----
+    // ---- HTTP API in front of the http Lambda, JWT (Cognito ID token) required ----
     const httpApi = new apigw.HttpApi(this, "HttpApi", {
       apiName: name(),
       corsPreflight: {
@@ -209,7 +209,7 @@ export class TrainingApiStack extends cdk.Stack {
       },
     });
     const authorizer = new HttpUserPoolAuthorizer("CognitoJwt", userPool, { userPoolClients: [webClient] });
-    const integration = new HttpLambdaIntegration("ApiIntegration", api);
+    const integration = new HttpLambdaIntegration("ApiIntegration", http);
     for (const [p, methods] of [
       ["/plan", [apigw.HttpMethod.GET]],
       ["/activities", [apigw.HttpMethod.GET]],

@@ -13,7 +13,7 @@ import type {
   PutReviewResponse,
 } from "../../types/api";
 
-// Behind API Gateway (HTTP API) with a Cognito JWT authorizer: by the time we
+// training-api-http-prod. Behind API Gateway (HTTP API) with a Cognito JWT authorizer: by the time we
 // run, the ID token is already verified and its claims are on the event.
 // CORS is handled by the HTTP API (infra/lib/stack.ts).
 //
