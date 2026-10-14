@@ -20,6 +20,8 @@ env:
   CLAUDE_MODEL: claude-haiku-4-5
   AUTO_REVIEW: "true"
   STAGE: prod
+  # logs the IAM auth token parameters (never the signature) from the api Lambda
+  DB_DEBUG: ${{ vars.DB_DEBUG || 'false' }}
   CORS_ORIGIN: ${{ vars.CORS_ORIGIN || 'https://iamwuwei.github.io' }}
   # custom API domain: set both repository variables, or neither
   API_DOMAIN: ${{ vars.API_DOMAIN }}

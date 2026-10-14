@@ -134,7 +134,10 @@ export class TrainingApiStack extends cdk.Stack {
 
     // training-api-prod, same name as the HTTP API. HTTP API cuts requests at
     // 30 s, so give up on a cold Aurora at 20 s and answer 503 instead.
-    const api = fn("api", { functionName: name(), environment: { DB_CONNECT_TIMEOUT_MS: "20000" } });
+    const api = fn("api", {
+      functionName: name(),
+      environment: { DB_CONNECT_TIMEOUT_MS: "20000", DB_DEBUG: process.env.DB_DEBUG ?? "false" },
+    });
     api.addToRolePolicy(rdsConnect);
 
     // ---- schedule: every Sunday 21:00 Asia/Tokyo -----------------------------

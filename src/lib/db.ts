@@ -45,6 +45,19 @@ async function getPool(): Promise<Pool> {
   const signer = new Signer({ hostname, port, username, region });
   const token = await signer.getAuthToken();
 
+  if (process.env.DB_DEBUG === "true") {
+    // Token = "<host>:<port>/?Action=connect&DBUser=…&X-Amz-…". Log everything
+    // but the signature so a Lambda token can be compared with a local one.
+    const u = new URL(`https://${token}`);
+    const q = Object.fromEntries(u.searchParams);
+    console.log("db auth token", JSON.stringify({
+      host: u.host, DBUser: q.DBUser, region, credential: q["X-Amz-Credential"],
+      expires: q["X-Amz-Expires"], signedHeaders: q["X-Amz-SignedHeaders"],
+      hasSessionToken: Boolean(q["X-Amz-Security-Token"]),
+      keyPrefix: process.env.AWS_ACCESS_KEY_ID?.slice(0, 4), node: process.version,
+    }));
+  }
+
   pool = new Pool({
     host: hostname,
     port,
