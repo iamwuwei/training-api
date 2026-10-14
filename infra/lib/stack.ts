@@ -73,9 +73,10 @@ export class TrainingApiStack extends cdk.Stack {
     });
 
     // ---- lambdas --------------------------------------------------------------
-    const fn = (handler: string, extra: Partial<NodejsFunctionProps> = {}) =>
-      new NodejsFunction(this, `${handler[0].toUpperCase()}${handler.slice(1)}Fn`, {
-        functionName: name(handler),
+    const fn = (handler: string, extra: Partial<NodejsFunctionProps> = {}) => {
+      const functionName = extra.functionName ?? name(handler);
+      return new NodejsFunction(this, `${handler[0].toUpperCase()}${handler.slice(1)}Fn`, {
+        functionName,
         entry: path.join(ROOT, "src", "handlers", `${handler}.ts`),
         handler: "handler",
         projectRoot: ROOT,
@@ -85,7 +86,7 @@ export class TrainingApiStack extends cdk.Stack {
         memorySize: 512,
         timeout: cdk.Duration.seconds(60),
         logGroup: new logs.LogGroup(this, `${handler}Logs`, {
-          logGroupName: `/aws/lambda/${name(handler)}`,
+          logGroupName: `/aws/lambda/${functionName}`,
           retention: logs.RetentionDays.ONE_MONTH,
           removalPolicy: cdk.RemovalPolicy.DESTROY,
         }),
@@ -107,6 +108,7 @@ export class TrainingApiStack extends cdk.Stack {
         ...extra,
         environment: { STAGE: stage, ...dbEnv, ...(extra.environment ?? {}) },
       });
+    };
 
     const webhook = fn("webhook", {
       environment: {
@@ -130,8 +132,8 @@ export class TrainingApiStack extends cdk.Stack {
     const weekly = fn("weekly", { environment: claudeEnv });
     weekly.addToRolePolicy(rdsConnect);
 
-    const http = fn("http"); // backend of the HTTP API: training-api-http-prod
-    http.addToRolePolicy(rdsConnect);
+    const api = fn("api", { functionName: name() }); // training-api-prod, same as the HTTP API
+    api.addToRolePolicy(rdsConnect);
 
     // ---- schedule: every Sunday 21:00 Asia/Tokyo -----------------------------
     new scheduler.Schedule(this, "WeeklyReviewSchedule", {
@@ -198,7 +200,7 @@ export class TrainingApiStack extends cdk.Stack {
       cognitoDomain: { domainPrefix: process.env.COGNITO_DOMAIN_PREFIX ?? `${name()}-${this.account}` },
     });
 
-    // ---- HTTP API in front of the http Lambda, JWT (Cognito ID token) required ----
+    // ---- HTTP API in front of the api Lambda, JWT (Cognito ID token) required ----
     const httpApi = new apigw.HttpApi(this, "HttpApi", {
       apiName: name(),
       corsPreflight: {
@@ -209,7 +211,7 @@ export class TrainingApiStack extends cdk.Stack {
       },
     });
     const authorizer = new HttpUserPoolAuthorizer("CognitoJwt", userPool, { userPoolClients: [webClient] });
-    const integration = new HttpLambdaIntegration("ApiIntegration", http);
+    const integration = new HttpLambdaIntegration("ApiIntegration", api);
     for (const [p, methods] of [
       ["/plan", [apigw.HttpMethod.GET]],
       ["/activities", [apigw.HttpMethod.GET]],

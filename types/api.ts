@@ -1,4 +1,4 @@
-// Wire types for the `http` Lambda behind the API Gateway HTTP API. Self-contained so
+// Wire types for the `api` Lambda behind the API Gateway HTTP API. Self-contained so
 // the front-end can copy this file as-is. Dates are ISO strings on the wire.
 //
 // Auth: every call sends `Authorization: Bearer <Cognito ID token>`. API

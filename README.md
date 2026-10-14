@@ -7,13 +7,13 @@ Strava webhook → Lambda webhook（Function URL）→ SQS activities → Lambda
 Strava OAuth   → Lambda oauth（Function URL）→ Aurora
 EventBridge Scheduler（每週日 21:00 JST）→ Lambda weekly → Claude API → Aurora
 前端 → Cognito（登入，拿 ID token）
-前端 → API Gateway HTTP API（Cognito JWT authorizer）→ Lambda http → Aurora
+前端 → API Gateway HTTP API（Cognito JWT authorizer）→ Lambda api → Aurora
 ```
 
-資源命名：全部 `training-api-<thing>-<STAGE>`，stack 是 `training-api-<STAGE>`，`STAGE` 預設 `prod`。
+資源命名：全部 `training-api-<thing>-<STAGE>`；stack、HTTP API 和它後面的 api Lambda 都叫 `training-api-<STAGE>`。`STAGE` 預設 `prod`。
 
 - 所有 Lambda 都不在 VPC 內（Aurora 有公開 endpoint；Lambda 要打 Strava / Claude）。
-- Strava 會打的兩個 Lambda（webhook / oauth）用 Function URL（auth NONE）；給前端的 http Lambda 走 API Gateway HTTP API，JWT authorizer 驗 Cognito ID token。
+- Strava 會打的兩個 Lambda（webhook / oauth）用 Function URL（auth NONE）；給前端的 api Lambda 走 API Gateway HTTP API，JWT authorizer 驗 Cognito ID token。
 - DB 認證走 IAM：`@aws-sdk/rds-signer` 產 token 當密碼，SSL 用打包進 Lambda 的 RDS global CA bundle（`src/lib/global-bundle.pem`）。
 - Aurora Serverless v2 min 0 ACU，閒置 5 分鐘會 pause；第一次連線要等 10–15 秒。Lambda timeout 60 秒（worker 90 秒），worker 連線失敗會 throw 讓 SQS 重送（3 次後進 DLQ）。
 
@@ -147,7 +147,7 @@ aws cloudformation delete-stack --stack-name TrainingBackend
 
 ## 4. Cognito 使用者
 
-封閉系統，沒有自助註冊。deploy 完用 `UserPoolId` 建兩個使用者（email 要和 `seed/seed.ts` `USERS` 裡的一樣，http Lambda 第一次呼叫會靠 email 把 Cognito `sub` 連到 users 列）：
+封閉系統，沒有自助註冊。deploy 完用 `UserPoolId` 建兩個使用者（email 要和 `seed/seed.ts` `USERS` 裡的一樣，api Lambda 第一次呼叫會靠 email 把 Cognito `sub` 連到 users 列）：
 
 ```bash
 POOL=<UserPoolId>
@@ -212,7 +212,7 @@ aws cognito-idp admin-set-user-password --user-pool-id $POOL --username you@exam
 training-api/
 ├── infra/        CDK（bin/app.ts, lib/stack.ts）
 ├── src/
-│   ├── handlers/ webhook / worker / oauth / weekly / http
+│   ├── handlers/ webhook / worker / oauth / weekly / api
 │   ├── lib/      db（IAM token + pg Pool）、strava、matcher、claude
 │   └── types.ts  內部 row / Strava 型別
 ├── types/        api.ts — API request/response 型別（前端直接複製用）
