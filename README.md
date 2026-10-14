@@ -57,13 +57,42 @@ npm run seed      # 再跑一次：把 xlsx 裡手打的 判定／心得／提�
 
 ## 3. 部署
 
+### 手動
+
 ```bash
 npm run build        # tsc 型別檢查
 npx cdk bootstrap    # 第一次
 npx cdk deploy
 ```
 
-Output 會有三個 Function URL：`WebhookUrl`、`OauthUrl`、`ApiUrl`。
+Output 會有四個 Function URL：`WebhookUrl`、`OauthUrl`、`AuthUrl`、`ApiUrl`。
+
+### 自動（GitHub Actions，`.github/workflows/deploy.yml`）
+
+- pull request：`npm ci` → `npm run build` → `cdk synth`（不碰 AWS）。
+- push 到 `main`：同上，再用 OIDC 換 AWS role 跑 `cdk deploy --require-approval never`，最後印出 Function URL。
+- `migrate` / `seed` / `backfill` 不在 CI 裡，schema 改動在本機跑。
+
+一次性設定：
+
+1. **AWS**：IAM → Identity providers 加 `token.actions.githubusercontent.com`（audience `sts.amazonaws.com`）。IAM → Roles → Create role → Web identity，organization `iamwuwei`、repository `training-api`、branch `main`。role 的 inline policy 只要能 assume CDK bootstrap 的 role：
+
+   ```json
+   { "Version": "2012-10-17", "Statement": [{ "Effect": "Allow", "Action": "sts:AssumeRole", "Resource": "arn:aws:iam::*:role/cdk-hnb659fds-*" }] }
+   ```
+
+   `cdk bootstrap` 仍然要在本機先跑過一次。
+2. **GitHub** → Settings → Secrets and variables → Actions：
+
+   | Secret | 來源 |
+   |---|---|
+   | `AWS_ROLE_ARN` | 上面那個 role 的 ARN |
+   | `DB_CLUSTER_RESOURCE_ID` | `aws rds describe-db-clusters --db-cluster-identifier training --query 'DBClusters[0].DbClusterResourceId' --output text` |
+   | `STRAVA_CLIENT_ID` / `STRAVA_CLIENT_SECRET` / `STRAVA_VERIFY_TOKEN` | 同 `.env` |
+   | `ANTHROPIC_API_KEY` | 同 `.env` |
+   | `APPLE_CLIENT_ID` / `SESSION_SECRET` | 同 `.env` |
+
+   非 secret 的（`DB_HOST`、`CLAUDE_MODEL`、`AUTO_REVIEW`）寫在 workflow 的 `env`；`CORS_ORIGIN` 可以用 repository **variable**（不是 secret）覆蓋。
 
 ## 4. Sign in with Apple 設定
 

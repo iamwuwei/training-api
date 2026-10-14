@@ -1,0 +1,77 @@
+name: deploy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write   # OIDC → AWS role
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-northeast-1
+  # non-secret config; secrets come from repository secrets below
+  DB_HOST: training.cluster-cvigvl3wbuuw.ap-northeast-1.rds.amazonaws.com
+  DB_PORT: "5432"
+  DB_NAME: postgres
+  DB_USER: postgres
+  CLAUDE_MODEL: claude-haiku-4-5
+  AUTO_REVIEW: "true"
+  CORS_ORIGIN: ${{ vars.CORS_ORIGIN || 'https://iamwuwei.github.io' }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run build
+
+      # Synth needs every value the stack reads. On pull requests (no secrets
+      # for forks) placeholders are enough to prove the stack synthesizes.
+      - name: Synth
+        run: npx cdk synth --quiet
+        env:
+          DB_CLUSTER_RESOURCE_ID: ${{ secrets.DB_CLUSTER_RESOURCE_ID || 'cluster-placeholder' }}
+          STRAVA_CLIENT_ID: ${{ secrets.STRAVA_CLIENT_ID || 'placeholder' }}
+          STRAVA_CLIENT_SECRET: ${{ secrets.STRAVA_CLIENT_SECRET || 'placeholder' }}
+          STRAVA_VERIFY_TOKEN: ${{ secrets.STRAVA_VERIFY_TOKEN || 'placeholder' }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY || 'placeholder' }}
+          APPLE_CLIENT_ID: ${{ secrets.APPLE_CLIENT_ID || 'placeholder' }}
+          SESSION_SECRET: ${{ secrets.SESSION_SECRET || 'placeholder' }}
+
+      - name: Configure AWS credentials (OIDC)
+        if: github.event_name == 'push'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy
+        if: github.event_name == 'push'
+        run: npx cdk deploy --require-approval never --outputs-file cdk-outputs.json
+        env:
+          DB_CLUSTER_RESOURCE_ID: ${{ secrets.DB_CLUSTER_RESOURCE_ID }}
+          STRAVA_CLIENT_ID: ${{ secrets.STRAVA_CLIENT_ID }}
+          STRAVA_CLIENT_SECRET: ${{ secrets.STRAVA_CLIENT_SECRET }}
+          STRAVA_VERIFY_TOKEN: ${{ secrets.STRAVA_VERIFY_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          APPLE_CLIENT_ID: ${{ secrets.APPLE_CLIENT_ID }}
+          SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
+
+      - name: Function URLs
+        if: github.event_name == 'push'
+        run: cat cdk-outputs.json
