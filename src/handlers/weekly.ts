@@ -44,14 +44,14 @@ export const handler = async (event: { week_start?: string } = {}) => {
       `select *, to_char(scheduled_date, 'YYYY-MM-DD') as scheduled_date
          from planned_sessions
         where plan_id = $1 and superseded = false and scheduled_date between $2 and $3
-        order by scheduled_date`,
+        order by planned_sessions.scheduled_date`,
       [plan.id, weekStart, weekEnd],
     );
     const upcoming = await query<PlannedSessionRow>(
       `select *, to_char(scheduled_date, 'YYYY-MM-DD') as scheduled_date
          from planned_sessions
         where plan_id = $1 and superseded = false and scheduled_date between $2 and $3
-        order by scheduled_date`,
+        order by planned_sessions.scheduled_date`,
       [plan.id, addDays(weekEnd, 1), upcomingEnd],
     );
     const activities = await query<ActivityRow>(

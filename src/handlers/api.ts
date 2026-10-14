@@ -140,7 +140,7 @@ async function getPlan(userId: string) {
   const plan = await queryOne<PlanRow>(
     `select *, to_char(race_date, 'YYYY-MM-DD') as race_date
        from plans where user_id = $1 and status = 'active'
-      order by race_date limit 1`,
+      order by plans.race_date limit 1`,
     [userId],
   );
   if (!plan) return json(404, { error: "no active plan" });
@@ -156,7 +156,7 @@ async function getPlan(userId: string) {
     `select *, to_char(scheduled_date, 'YYYY-MM-DD') as scheduled_date
        from planned_sessions
       where plan_id = $1 and superseded = false
-      order by scheduled_date`,
+      order by planned_sessions.scheduled_date`,
     [plan.id],
   );
 
