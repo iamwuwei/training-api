@@ -5,6 +5,7 @@ import type { ActivityRow, PlanRow, PlanWeekRow, PlannedSessionRow, ReviewRow, S
 import type {
   ActivitiesResponse,
   ApiActivity,
+  DeleteStravaResponse,
   ApiReview,
   ErrorResponse,
   MatchStatus,
@@ -19,6 +20,7 @@ import type {
 // CORS is handled by the HTTP API (infra/lib/stack.ts).
 //
 //   GET /me                          who am I + Strava link status + the link URL
+//   DELETE /me/strava                unlink Strava (revoke + drop strava_connections row)
 //   GET /plan                        active plan + weeks + sessions + matched activities (with reviews)
 //   GET /activities?status=<status>  all activities (with reviews), newest first
 //   PUT /activities/{id}/review      set a manual verdict
@@ -27,7 +29,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const STATUSES = new Set<string>(["auto", "confirmed", "unplanned", "ignored"] satisfies MatchStatus[]);
 const VERDICTS = new Set<string>(["達成", "達成但有提醒", "未達成"]);
 
-const json = <T extends MeResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | ErrorResponse>(
+const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | ErrorResponse>(
   statusCode: number,
   body: T,
 ): APIGatewayProxyResultV2 => ({
@@ -81,6 +83,7 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
   if (!user) return json(403, { error: "not registered" });
 
   if (method === "GET" && path === "/me") return getMe(user, event);
+  if (method === "DELETE" && path === "/me/strava") return deleteStrava(user);
   if (method === "GET" && path === "/plan") return getPlan(user.id);
   if (method === "GET" && path === "/activities") return getActivities(user.id, q.status);
 
@@ -153,6 +156,23 @@ function toApiActivity(a: ActivityJoined): ApiActivity {
         })
       : null,
   };
+}
+
+async function deleteStrava(user: UserRow) {
+  const conn = await queryOne<Pick<StravaConnectionRow, "access_token">>(
+    "select access_token from strava_connections where user_id = $1",
+    [user.id],
+  );
+  if (conn) {
+    try {
+      await deauthorize(conn.access_token);
+    } catch (err) {
+      // Strava may already have revoked it; we still drop our side.
+      console.warn(`strava deauthorize failed for user ${user.id}`, err);
+    }
+    await query("delete from strava_connections where user_id = $1", [user.id]);
+  }
+  return json<DeleteStravaResponse>(200, { ok: true });
 }
 
 async function getPlan(userId: string) {

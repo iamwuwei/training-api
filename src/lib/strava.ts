@@ -36,6 +36,15 @@ export function refreshToken(refresh_token: string): Promise<StravaTokenResponse
   return tokenRequest({ refresh_token, grant_type: "refresh_token" });
 }
 
+/** Revoke our access on Strava's side. Best effort: a 401 (token already dead) is fine. */
+export async function deauthorize(accessToken: string): Promise<void> {
+  const res = await fetch("https://www.strava.com/oauth/deauthorize", {
+    method: "POST",
+    headers: { authorization: `Bearer ${accessToken}` },
+  });
+  if (!res.ok && res.status !== 401) throw new StravaError(res.status, await res.text());
+}
+
 export function authorizeUrl(opts: { redirectUri: string; state: string }): string {
   const { client_id } = clientCreds();
   const q = new URLSearchParams({

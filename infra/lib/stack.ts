@@ -206,7 +206,7 @@ export class TrainingApiStack extends cdk.Stack {
       apiName: name(),
       corsPreflight: {
         allowOrigins: corsOrigins,
-        allowMethods: [apigw.CorsHttpMethod.GET, apigw.CorsHttpMethod.PUT, apigw.CorsHttpMethod.OPTIONS],
+        allowMethods: [apigw.CorsHttpMethod.GET, apigw.CorsHttpMethod.PUT, apigw.CorsHttpMethod.DELETE, apigw.CorsHttpMethod.OPTIONS],
         allowHeaders: ["content-type", "authorization"],
         maxAge: cdk.Duration.hours(1),
       },
@@ -215,6 +215,7 @@ export class TrainingApiStack extends cdk.Stack {
     const integration = new HttpLambdaIntegration("ApiIntegration", api);
     for (const [p, methods] of [
       ["/me", [apigw.HttpMethod.GET]],
+      ["/me/strava", [apigw.HttpMethod.DELETE]],
       ["/plan", [apigw.HttpMethod.GET]],
       ["/activities", [apigw.HttpMethod.GET]],
       ["/activities/{id}/review", [apigw.HttpMethod.PUT]],

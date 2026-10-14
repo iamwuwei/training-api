@@ -186,6 +186,7 @@ Aurora 閒置 5 分鐘會 pause，之後第一個請求要等它醒（15〜30 �
 型別在 `types/api.ts`。全部要帶 `Authorization: Bearer <Cognito ID token>`。
 
 - `GET <ApiUrl>/me` → `MeResponse { user, strava, strava_connect_url }`：目前使用者（`users.id`、名字、email）、Strava 連結狀態（`null` 表示還沒連）、以及連結 Strava 要開的網址。前端的設定頁用這支。
+- `DELETE <ApiUrl>/me/strava` → `{ ok: true }`：解除 Strava 連結。會先向 Strava 撤銷授權（失敗也照刪），再刪掉 `strava_connections` 那列；已匯入的 activities 保留。
 - `GET <ApiUrl>/plan` → `PlanResponse { plan, weeks, sessions, activities }`：active plan、每週階段/重點、未 superseded 的 sessions（含原始 `label`、`content`、`target` 原文、配速/心拍上下限、`week_no`、`phase`）、已配對的 activities（含 `review`、最高心拍、功率、卡路里、鞋、裝置、天氣、每公里分段）。
 - `GET <ApiUrl>/activities?status=unplanned` → `ActivitiesResponse`，`status` 可為 `auto | confirmed | unplanned | ignored`，省略則全部。
 - `PUT <ApiUrl>/activities/{id}/review` body `PutReviewRequest { verdict, comment?, reminders?, rpe? }` → 手動判定，會覆蓋 Claude 的。

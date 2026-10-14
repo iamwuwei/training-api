@@ -30,6 +30,11 @@ export interface MeResponse {
   strava_connect_url: string;
 }
 
+/** DELETE <ApiUrl>/me/strava — unlink (revokes on Strava too); activities already imported stay. */
+export interface DeleteStravaResponse {
+  ok: true;
+}
+
 // ---- GET <ApiUrl>/plan ---------------------------------------------------------
 
 export interface ApiPlan {
