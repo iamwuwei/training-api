@@ -75,17 +75,19 @@ Output 會有四個 Function URL：`WebhookUrl`、`OauthUrl`、`AuthUrl`、`ApiU
 
 一次性設定：
 
-1. **AWS**：IAM → Identity providers 加 `token.actions.githubusercontent.com`（audience `sts.amazonaws.com`）。IAM → Roles → Create role → Web identity，organization `iamwuwei`、repository `training-api`。建好後把 trust policy 的 `sub` 條件改成下面這樣：deploy job 綁 `environment: prod`，所以 token 的 `sub` 是 `repo:…:environment:prod`，不是 `ref:refs/heads/main`：
+1. **AWS**：IAM → Identity providers 加 `token.actions.githubusercontent.com`（audience `sts.amazonaws.com`）。IAM → Roles → Create role → Web identity，organization `iamwuwei`、repository `training-api`。建好後把 trust policy 的 `sub` 條件改成下面這樣。兩個理由：deploy job 綁 `environment: prod`，所以 token 的 `sub` 是 `…:environment:prod` 而不是 `ref:refs/heads/main`；而且 GitHub 現在的 `sub` 長這樣 `repo:iamwuwei@17942614/training-api@1418352990:environment:prod`（owner / repo 後面帶 `@id`），console 產生的精確比對不會符合，要用 `StringLike` + `*`：
 
    ```json
    "Condition": {
      "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
      "StringLike": { "token.actions.githubusercontent.com:sub": [
-       "repo:iamwuwei/training-api:environment:prod",
-       "repo:iamwuwei/training-api:ref:refs/heads/main"
+       "repo:iamwuwei*/training-api*:environment:prod",
+       "repo:iamwuwei*/training-api*:ref:refs/heads/main"
      ] }
    }
    ```
+
+   deploy job 的「Show OIDC claims」步驟會印出實際的 `sub`，assume role 失敗時先對這個。
 
    role 的 inline policy 只要能 assume CDK bootstrap 的 role：
 
