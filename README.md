@@ -193,6 +193,7 @@ Aurora 閒置 5 分鐘會 pause，之後第一個請求要等它醒（15〜30 �
 - `GET <ApiUrl>/plan` → `PlanResponse { plan, weeks, sessions, activities }`：active plan、每週階段/重點、未 superseded 的 sessions（含原始 `label`、`content`、`target` 原文、配速/心拍上下限、`week_no`、`phase`）、已配對的 activities（含 `review`、最高心拍、功率、卡路里、鞋、裝置、天氣、每公里分段）。
 - `GET <ApiUrl>/activities?status=unplanned` → `ActivitiesResponse`，`status` 可為 `auto | confirmed | unplanned | ignored`，省略則全部。
 - `PUT <ApiUrl>/activities/{id}/review` body `PutReviewRequest { verdict, comment?, reminders?, rpe? }` → 手動判定，會覆蓋 Claude 的。
+- `PUT <ApiUrl>/activities/{id}/session` body `PutSessionRequest { session_id, status? }` → 手動指定這筆活動是哪天的課（`confirmed`）。原本 `auto` 占著那個 session 的活動會退回 `unplanned`；`confirmed` 占著回 409。指定後舊的 Claude 判定刪掉、丟回 SQS 用新課表重評。`session_id: null` 配 `status: "ignored"` 表示這筆不算。
 
 ## 判定（reviews）
 
@@ -201,6 +202,8 @@ Aurora 閒置 5 分鐘會 pause，之後第一個請求要等它醒（15〜30 �
 - 天氣沒有自動來源：`activities.weather` 只在 seed 帶歷史值，之後為 null，前端沒值就不顯示。
 
 ## 配對規則（`src/lib/matcher.ts`）
+
+所有運動都會存進 `activities`（`sport_type` 區分），但只有跑步（Strava `type = Run`）會自動配對和請 Claude 評；Hyrox、騎車之類存成 `unplanned`，要算進課表就用 `PUT …/session` 手動指給那天（例如 `肌力`）。
 
 候選：該 user 的 active plan、活動日期 ±2 天、未 superseded、未被其他活動配走的 session（rest 不配）。
 1. 同一天 → 選距離最接近的。

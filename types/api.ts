@@ -101,6 +101,7 @@ export interface ApiActivity {
   user_id: string;
   strava_activity_id: string; // bigint → string
   session_id: string | null;
+  sport_type: string | null; // Strava sport_type: "Run" | "TrailRun" | "Ride" | "WeightTraining" | … ; only runs are auto-matched
   start_time: string; // ISO 8601, UTC
   distance_m: number;
   moving_time_sec: number;
@@ -126,6 +127,8 @@ export interface PlanResponse {
 }
 
 // ---- GET <ApiUrl>/activities?status=<MatchStatus> --------------------------------
+// Every activity Strava sent, runs and non-runs alike. `unplanned` ones are the
+// candidates for manual assignment; pick a target from PlanResponse.sessions.
 
 export interface ActivitiesQuery {
   status?: MatchStatus; // omit for all
@@ -133,6 +136,25 @@ export interface ActivitiesQuery {
 
 export interface ActivitiesResponse {
   activities: ApiActivity[]; // newest first, max 200
+}
+
+// ---- PUT <ApiUrl>/activities/{id}/session --------------------------------------
+// Tell the system which planned session this activity fulfils.
+//   { session_id: "<uuid>" }               -> match_status "confirmed"; an `auto` holder of
+//                                              that session is bumped back to "unplanned";
+//                                              a "confirmed" holder makes this a 409.
+//                                              A Claude review is dropped and regenerated
+//                                              for the new session (arrives a few seconds later).
+//   { session_id: null, status: "ignored" } -> not a training run (keep it out of /plan)
+//   { session_id: null }                    -> back to "unplanned"
+
+export interface PutSessionRequest {
+  session_id: string | null;
+  status?: "unplanned" | "ignored"; // only when session_id is null; default "unplanned"
+}
+
+export interface PutSessionResponse {
+  activity: ApiActivity;
 }
 
 // ---- PUT <ApiUrl>/activities/{id}/review ---------------------------------------

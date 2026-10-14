@@ -54,20 +54,18 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
     throw err;
   }
 
-  if (activity.type !== "Run") {
-    console.log(`activity ${activity.id} is ${activity.type}/${activity.sport_type}, skipping`);
-    return;
-  }
-
-  const distance_m = Math.round(activity.distance);
-  const moving_time_sec = Math.round(activity.moving_time);
-  const avg_pace_sec_km = distance_m > 0 ? Math.round(moving_time_sec / (distance_m / 1000)) : null;
+  // Every sport is stored (so a Hyrox or a ride can be assigned to a 肌力 day
+  // by hand); only runs are auto-matched and reviewed.
+  const isRun = activity.type === "Run";
+  const distance_m = Math.round(activity.distance ?? 0);
+  const moving_time_sec = Math.round(activity.moving_time ?? 0);
+  const avg_pace_sec_km = isRun && distance_m > 0 ? Math.round(moving_time_sec / (distance_m / 1000)) : null;
   const round = (v: number | undefined | null) => (v != null ? Math.round(v) : null);
   const localDate = activity.start_date_local.slice(0, 10);
 
   // Eligible sessions: this user's active plan(s), ±2 days, not superseded,
   // not already claimed by a *different* activity.
-  const candidates = await query<MatchCandidate>(
+  const candidates = !isRun ? [] : await query<MatchCandidate>(
     `select ps.id, to_char(ps.scheduled_date, 'YYYY-MM-DD') as scheduled_date,
             ps.type, ps.target_distance_m
        from planned_sessions ps
@@ -92,9 +90,10 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
     `insert into activities
        (id, user_id, strava_activity_id, session_id, start_time, distance_m, moving_time_sec,
         avg_pace_sec_km, avg_hr, max_hr, avg_watts, kcal, description, device_name, gear_id, gear_name,
-        splits, match_status, raw)
-     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+        splits, match_status, raw, sport_type)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
      on conflict (strava_activity_id) do update set
+       sport_type      = excluded.sport_type,
        start_time      = excluded.start_time,
        distance_m      = excluded.distance_m,
        moving_time_sec = excluded.moving_time_sec,
@@ -134,17 +133,18 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
       JSON.stringify(activity.splits_metric ?? null),
       matched ? "auto" : "unplanned",
       JSON.stringify(activity),
+      activity.sport_type ?? activity.type,
     ],
   );
 
   console.log(
-    `activity ${activity.id} (${localDate}, ${(distance_m / 1000).toFixed(2)} km) -> ` +
-      (matched ? `session ${matched.id} (${matched.scheduled_date} ${matched.type})` : "unplanned"),
+    `activity ${activity.id} (${localDate}, ${activity.sport_type}, ${(distance_m / 1000).toFixed(2)} km) -> ` +
+      (row.session_id ? `session ${row.session_id}` : "unplanned"),
   );
 
-  // Automatic verdict (AUTO_REVIEW=true): only once per activity, never over a
-  // manual review. A Claude failure must not requeue the activity, so it is logged.
-  if (process.env.AUTO_REVIEW === "true" && row.session_id) {
+  // Automatic verdict (AUTO_REVIEW=true): runs only, once per activity, never
+  // over a manual review. A Claude failure must not requeue the activity.
+  if (process.env.AUTO_REVIEW === "true" && isRun && row.session_id) {
     const existing = await queryOne<{ id: string }>("select id from reviews where activity_id = $1", [row.id]);
     if (!existing) {
       const session = await queryOne<PlannedSessionRow>(

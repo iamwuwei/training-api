@@ -80,6 +80,7 @@ create table if not exists activities (
   match_status text not null default 'auto',   -- auto | confirmed | unplanned | ignored
   raw jsonb
 );
+alter table activities add column if not exists sport_type text;    -- Strava sport_type: Run / TrailRun / Ride / WeightTraining …
 alter table activities add column if not exists description text;   -- Strava description (memo)
 alter table activities add column if not exists max_hr int;
 alter table activities add column if not exists avg_watts int;

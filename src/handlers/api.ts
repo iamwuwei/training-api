@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyResultV2 } from "aws-lambda";
 import { isDbWaking, query, queryOne } from "../lib/db";
 import { deauthorize } from "../lib/strava";
@@ -14,6 +15,8 @@ import type {
   PlanResponse,
   PutReviewRequest,
   PutReviewResponse,
+  PutSessionRequest,
+  PutSessionResponse,
 } from "../../types/api";
 
 // Lambda training-api-prod. Behind API Gateway (HTTP API) with a Cognito JWT authorizer: by the time we
@@ -25,12 +28,15 @@ import type {
 //   GET /plan                        active plan + weeks + sessions + matched activities (with reviews)
 //   GET /activities?status=<status>  all activities (with reviews), newest first
 //   PUT /activities/{id}/review      set a manual verdict
+//   PUT /activities/{id}/session     assign the activity to a planned session (or ignore it)
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const STATUSES = new Set<string>(["auto", "confirmed", "unplanned", "ignored"] satisfies MatchStatus[]);
 const VERDICTS = new Set<string>(["達成", "達成但有提醒", "未達成"]);
 
-const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | ErrorResponse>(
+const sqs = new SQSClient({});
+
+const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | PutSessionResponse | ErrorResponse>(
   statusCode: number,
   body: T,
 ): APIGatewayProxyResultV2 => ({
@@ -88,10 +94,10 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
   if (method === "GET" && path === "/plan") return getPlan(user.id);
   if (method === "GET" && path === "/activities") return getActivities(user.id, q.status);
 
-  const review = /^\/activities\/([^/]+)\/review$/.exec(path);
-  if (method === "PUT" && review) {
+  const sub = /^\/activities\/([^/]+)\/(review|session)$/.exec(path);
+  if (method === "PUT" && sub) {
     const raw = event.isBase64Encoded ? Buffer.from(event.body ?? "", "base64").toString("utf8") : event.body ?? "";
-    return putReview(user.id, review[1], raw);
+    return sub[2] === "review" ? putReview(user.id, sub[1], raw) : putSession(user.id, sub[1], raw);
   }
 
   return json(404, { error: "not found" });
@@ -116,7 +122,7 @@ async function getMe(user: UserRow, event: APIGatewayProxyEventV2WithJWTAuthoriz
 }
 
 const ACTIVITY_SELECT = `
-  a.id, a.user_id, a.strava_activity_id, a.session_id, a.start_time, a.distance_m, a.moving_time_sec,
+  a.id, a.user_id, a.strava_activity_id, a.session_id, a.sport_type, a.start_time, a.distance_m, a.moving_time_sec,
   a.avg_pace_sec_km, a.avg_hr, a.max_hr, a.avg_watts, a.kcal, a.description, a.device_name, a.gear_id,
   a.gear_name, a.weather, a.splits, a.match_status,
   r.verdict as r_verdict, r.comment as r_comment, r.reminders as r_reminders, r.rpe as r_rpe,
@@ -260,4 +266,81 @@ async function putReview(userId: string, activityId: string, raw: string) {
     [randomUUID(), activityId, body.verdict, body.comment ?? null, JSON.stringify(reminders), body.rpe ?? null],
   );
   return json<PutReviewResponse>(200, { review: toApiReview(review) });
+}
+
+async function putSession(userId: string, activityId: string, raw: string) {
+  if (!UUID_RE.test(activityId)) return json(400, { error: "invalid activity id" });
+  let body: PutSessionRequest;
+  try {
+    body = JSON.parse(raw) as PutSessionRequest;
+  } catch {
+    return json(400, { error: "invalid json" });
+  }
+
+  const activity = await queryOne<{ id: string; strava_activity_id: string; match_status: MatchStatus }>(
+    "select id, strava_activity_id, match_status from activities where id = $1 and user_id = $2",
+    [activityId, userId],
+  );
+  if (!activity) return json(404, { error: "activity not found" });
+
+  if (body.session_id === null || body.session_id === undefined) {
+    const status = body.status ?? "unplanned";
+    if (status !== "unplanned" && status !== "ignored") return json(400, { error: "status must be unplanned or ignored" });
+    await query("update activities set session_id = null, match_status = $2 where id = $1", [activityId, status]);
+    await query("delete from reviews where activity_id = $1 and source = 'claude'", [activityId]);
+  } else {
+    if (!UUID_RE.test(body.session_id)) return json(400, { error: "invalid session id" });
+    const session = await queryOne<{ id: string }>(
+      `select ps.id from planned_sessions ps join plans p on p.id = ps.plan_id
+        where ps.id = $1 and p.user_id = $2 and ps.superseded = false`,
+      [body.session_id, userId],
+    );
+    if (!session) return json(404, { error: "session not found" });
+
+    // One activity per session: bump an automatic holder, refuse a confirmed one.
+    const holder = await queryOne<{ id: string; match_status: MatchStatus }>(
+      "select id, match_status from activities where session_id = $1 and id <> $2",
+      [session.id, activityId],
+    );
+    if (holder?.match_status === "confirmed") return json(409, { error: "session already confirmed for another activity" });
+    if (holder) {
+      await query("update activities set session_id = null, match_status = 'unplanned' where id = $1", [holder.id]);
+      await query("delete from reviews where activity_id = $1 and source = 'claude'", [holder.id]);
+    }
+
+    await query("update activities set session_id = $2, match_status = 'confirmed' where id = $1", [activityId, session.id]);
+    // The Claude verdict was about the old session: drop it and let the worker
+    // regenerate one against the new session (manual reviews are kept).
+    const dropped = await query<{ id: string }>(
+      "delete from reviews where activity_id = $1 and source = 'claude' returning id",
+      [activityId],
+    );
+    const hasManual = await queryOne<{ id: string }>("select id from reviews where activity_id = $1", [activityId]);
+    if ((dropped.length > 0 || !hasManual) && process.env.QUEUE_URL) {
+      const conn = await queryOne<{ strava_athlete_id: string }>(
+        "select strava_athlete_id from strava_connections where user_id = $1",
+        [userId],
+      );
+      if (conn) {
+        await sqs.send(
+          new SendMessageCommand({
+            QueueUrl: process.env.QUEUE_URL,
+            MessageBody: JSON.stringify({
+              object_type: "activity",
+              aspect_type: "update",
+              object_id: Number(activity.strava_activity_id),
+              owner_id: Number(conn.strava_athlete_id),
+              updates: { reason: "session reassigned" },
+            }),
+          }),
+        );
+      }
+    }
+  }
+
+  const [row] = await query<ActivityJoined>(
+    `select ${ACTIVITY_SELECT} from activities a left join reviews r on r.activity_id = a.id where a.id = $1`,
+    [activityId],
+  );
+  return json<PutSessionResponse>(200, { activity: toApiActivity(row) });
 }

@@ -55,12 +55,13 @@ export const handler = async (event: { week_start?: string } = {}) => {
       [plan.id, addDays(weekEnd, 1), upcomingEnd],
     );
     const activities = await query<ActivityRow>(
-      `select id, user_id, strava_activity_id, session_id, start_time, distance_m, moving_time_sec,
+      `select id, user_id, strava_activity_id, session_id, sport_type, start_time, distance_m, moving_time_sec,
               avg_pace_sec_km, avg_hr, max_hr, avg_watts, kcal, description, device_name, gear_id,
               gear_name, weather, splits, match_status
          from activities
         where user_id = $1
           and match_status <> 'ignored'
+          and (sport_type is null or sport_type in ('Run', 'TrailRun', 'VirtualRun'))
           and (start_time at time zone 'Asia/Tokyo')::date between $2 and $3
         order by start_time`,
       [plan.user_id, weekStart, weekEnd],

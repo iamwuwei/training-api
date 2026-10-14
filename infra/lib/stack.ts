@@ -136,9 +136,10 @@ export class TrainingApiStack extends cdk.Stack {
     // 30 s, so give up on a cold Aurora at 20 s and answer 503 instead.
     const api = fn("api", {
       functionName: name(),
-      environment: { DB_CONNECT_TIMEOUT_MS: "20000", DB_DEBUG: process.env.DB_DEBUG ?? "false" },
+      environment: { DB_CONNECT_TIMEOUT_MS: "20000", DB_DEBUG: process.env.DB_DEBUG ?? "false", QUEUE_URL: queue.queueUrl },
     });
     api.addToRolePolicy(rdsConnect);
+    queue.grantSendMessages(api); // re-review after a manual session assignment
 
     // ---- schedule: every Sunday 21:00 Asia/Tokyo -----------------------------
     new scheduler.Schedule(this, "WeeklyReviewSchedule", {
@@ -219,6 +220,7 @@ export class TrainingApiStack extends cdk.Stack {
       ["/plan", [apigw.HttpMethod.GET]],
       ["/activities", [apigw.HttpMethod.GET]],
       ["/activities/{id}/review", [apigw.HttpMethod.PUT]],
+      ["/activities/{id}/session", [apigw.HttpMethod.PUT]],
     ] as const) {
       httpApi.addRoutes({ path: p, methods: [...methods], integration, authorizer });
     }

@@ -67,6 +67,7 @@ export interface ActivityRow {
   user_id: string;
   strava_activity_id: string;
   session_id: string | null;
+  sport_type: string | null;
   start_time: Date;
   distance_m: number;
   moving_time_sec: number;
