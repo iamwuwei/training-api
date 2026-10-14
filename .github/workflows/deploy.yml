@@ -66,6 +66,21 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # Prints the OIDC claims AWS will see (sub / aud / iss). Compare `sub`
+      # with the role's trust policy when AssumeRoleWithWebIdentity fails.
+      - name: Show OIDC claims
+        run: |
+          TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
+          python3 - "$TOKEN" <<'PY'
+          import sys, json, base64
+          seg = sys.argv[1].split(".")[1]; seg += "=" * (-len(seg) % 4)
+          c = json.loads(base64.urlsafe_b64decode(seg))
+          print(json.dumps({k: c.get(k) for k in ("iss", "aud", "sub", "repository", "ref", "environment")}, indent=2))
+          PY
+          echo "role arn length: ${#AWS_ROLE_ARN} (expected 59 for arn:aws:iam::016312762943:role/github-training-api-deploy)"
+        env:
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
