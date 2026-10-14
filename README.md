@@ -44,7 +44,7 @@ npm run migrate   # 執行 sql/schema.sql（可重跑）
 npm run seed      # 讀 seed/plans.json → users / plans / planned_sessions（可重跑，不會重複）
 ```
 
-- `seed/plans.json` 由 `python3 scripts/xlsx-to-plans.py` 從 `../富士山馬拉松_2026_課表.xlsx` 產生（需要 `openpyxl`）。課表改了就重跑這個再 `npm run seed`。
+- `seed/plans.json` 由 `python3 scripts/xlsx-to-plans.py` 從 `../running/富士山馬拉松_2026_課表.xlsx` 產生（預設假設 `running` repo 和這個 repo 並排 clone；也可以把 xlsx 路徑當參數傳入。需要 `openpyxl`）。課表改了就重跑這個再 `npm run seed`。
 - 兩個 user 的 uuid 和 `display_name` 寫死在 `seed/seed.ts` 的 `USERS`，要改名字就改那裡再重跑 seed。seed 完會印出每個 user 的 uuid，前端和 OAuth 連結都用這個 uuid。
 - 類型正規化表在 `scripts/xlsx-to-plans.py` 的 `TYPE_MAP`；遇到沒看過的類型會直接報錯列出來。
 

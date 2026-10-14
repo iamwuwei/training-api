@@ -19,7 +19,7 @@ import openpyxl
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
-DEFAULT_XLSX = ROOT.parent / "富士山馬拉松_2026_課表.xlsx"
+DEFAULT_XLSX = ROOT.parent / "running" / "富士山馬拉松_2026_課表.xlsx"  # ../running checkout
 OUT = ROOT / "seed" / "plans.json"
 
 USER = "ww"
