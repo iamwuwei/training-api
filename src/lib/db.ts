@@ -53,8 +53,10 @@ async function getPool(): Promise<Pool> {
     password: token,
     ssl: { ca: CA, rejectUnauthorized: true },
     max: 2,
-    // Aurora Serverless v2 at 0 ACU takes ~10-15 s to wake up.
-    connectionTimeoutMillis: 30_000,
+    // Aurora Serverless v2 at 0 ACU can take 15-30 s to wake up. API Gateway
+    // (HTTP API) cuts the request at 30 s, so the api Lambda gives up earlier
+    // and answers 503 (see isDbWaking); SQS/scheduler callers get the full 30 s.
+    connectionTimeoutMillis: Number(process.env.DB_CONNECT_TIMEOUT_MS ?? 30_000),
     idleTimeoutMillis: 60_000,
   });
   pool.on("error", (err) => console.error("pg pool error", err));
@@ -87,4 +89,10 @@ export async function end(): Promise<void> {
     pool = undefined;
     await p.end();
   }
+}
+
+/** True for the connection-timeout error pg throws while Aurora is resuming from 0 ACU. */
+export function isDbWaking(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /connection timeout|timeout expired|ECONNREFUSED|ECONNRESET/i.test(msg);
 }

@@ -163,6 +163,8 @@ aws cognito-idp admin-set-user-password --user-pool-id $POOL --username you@exam
 
 之後每個 api 請求帶 `Authorization: Bearer <ID token>`（要 **ID token**，不是 access token，因為第一次連結要 `email` claim）。API Gateway 驗簽失敗回 401；驗過但 users 表沒對到回 403。
 
+Aurora 閒置 5 分鐘會 pause，之後第一個請求要等它醒（15〜30 秒），HTTP API 的上限是 30 秒，所以 api 在 20 秒放棄並回 **503 + `Retry-After: 8`**；前端收到 503 等幾秒重試一次即可。不想有這個等待就把 cluster 的 min ACU 調到 0.5（約每月 $43）。
+
 ## 5. Strava 設定
 
 1. 到 https://www.strava.com/settings/api，把 **Authorization Callback Domain** 填 `ApiUrl` 的 host：自訂網域就是 `make-it-api.life4like.com`，還沒設的話是 `xxxx.execute-api.ap-northeast-1.amazonaws.com`。

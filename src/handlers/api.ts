@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyResultV2 } from "aws-lambda";
-import { query, queryOne } from "../lib/db";
+import { isDbWaking, query, queryOne } from "../lib/db";
 import type { ActivityRow, PlanRow, PlanWeekRow, PlannedSessionRow, ReviewRow, UserRow } from "../types";
 import type {
   ActivitiesResponse,
@@ -54,6 +54,23 @@ async function resolveUser(event: APIGatewayProxyEventV2WithJWTAuthorizer): Prom
 }
 
 export const handler = async (event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<APIGatewayProxyResultV2> => {
+  try {
+    return await route(event);
+  } catch (err) {
+    if (isDbWaking(err)) {
+      // Aurora is resuming from 0 ACU: tell the client to retry in a few seconds.
+      console.warn("database waking up:", err instanceof Error ? err.message : err);
+      return {
+        statusCode: 503,
+        headers: { "content-type": "application/json", "cache-control": "no-store", "retry-after": "8" },
+        body: JSON.stringify({ error: "database starting, retry shortly" } satisfies ErrorResponse),
+      };
+    }
+    throw err;
+  }
+};
+
+async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<APIGatewayProxyResultV2> {
   const method = event.requestContext.http.method;
   const path = event.rawPath;
   const q = event.queryStringParameters ?? {};
@@ -71,7 +88,7 @@ export const handler = async (event: APIGatewayProxyEventV2WithJWTAuthorizer): P
   }
 
   return json(404, { error: "not found" });
-};
+}
 
 // ---- queries ----------------------------------------------------------------
 

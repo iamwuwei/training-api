@@ -125,6 +125,12 @@ export interface PutReviewResponse {
 
 // ---- errors (any non-2xx) ----------------------------------------------------
 
+/**
+ * 401  bad/missing token (from API Gateway, body is API Gateway's)
+ * 403  token valid but no users row for it
+ * 503  Aurora is resuming from 0 ACU (first request after ~5 min idle);
+ *      `Retry-After` header is set — wait and retry once or twice.
+ */
 export interface ErrorResponse {
   error: string;
 }
