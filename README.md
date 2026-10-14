@@ -39,6 +39,7 @@ cp .env.example .env
 | `STAGE` | 預設 `prod`，決定所有資源名稱的後綴 |
 | `CORS_ORIGIN` | 逗號分隔，例如 `https://training.pages.dev,http://localhost:5173`；同時是 API CORS 和 Cognito 的 callback / logout URL |
 | `COGNITO_DOMAIN_PREFIX` | hosted UI 網域前綴，預設 `training-api-prod-<account id>` |
+| `API_DOMAIN` / `API_CERT_ARN` | 選填，兩個一起：API 自訂網域和它的 ACM 憑證（見 §3） |
 | `APPLE_SERVICES_ID` / `APPLE_TEAM_ID` / `APPLE_KEY_ID` / `APPLE_PRIVATE_KEY` | 選填，四個都填才會在 Cognito 加 Sign in with Apple |
 | `WEBHOOK_URL` | deploy 之後再填（給 `npm run subscribe-webhook` 用） |
 
@@ -68,7 +69,30 @@ npx cdk bootstrap    # 第一次
 npx cdk deploy
 ```
 
-Output：`WebhookUrl`、`OauthUrl`（Function URL）、`ApiUrl`（HTTP API）、`UserPoolId`、`UserPoolClientId`、`CognitoDomain`。
+Output：`WebhookUrl`、`OauthUrl`（Function URL）、`ApiUrl`（自訂網域，沒設就是 execute-api）、`ApiExecuteUrl`、`UserPoolId`、`UserPoolClientId`、`CognitoDomain`、`ApiDomainTarget`（有自訂網域時）。
+
+### API 自訂網域（`make-it-api.life4like.com`）
+
+憑證只做一次，之後 CDK 用 ARN 引用，deploy 不會卡在 DNS 驗證上：
+
+```bash
+# 1. 申請憑證（一定要 ap-northeast-1，HTTP API 是 regional）
+aws acm request-certificate --region ap-northeast-1 --validation-method DNS \
+  --domain-name make-it-api.life4like.com --query CertificateArn --output text
+# 2. 拿驗證用的 CNAME，去 Cloudflare DNS 加（Proxy 關掉，DNS only）
+aws acm describe-certificate --region ap-northeast-1 --certificate-arn <ARN> \
+  --query 'Certificate.DomainValidationOptions[0].ResourceRecord'
+# 3. 等 Status 變 ISSUED（通常幾分鐘）
+aws acm describe-certificate --region ap-northeast-1 --certificate-arn <ARN> --query Certificate.Status
+```
+
+然後 `.env` 填 `API_DOMAIN` / `API_CERT_ARN`（GitHub 用 repository **variables** `API_DOMAIN`、`API_CERT_ARN`），deploy 後 output 會有 `ApiDomainTarget`，在 Cloudflare 加：
+
+```
+CNAME  make-it-api  →  <ApiDomainTarget>   （d-xxxx.execute-api.ap-northeast-1.amazonaws.com）
+```
+
+Proxy 開關都可以：DNS only 最單純；要開 Cloudflare proxy 的話 SSL/TLS 模式設 Full (strict)。
 
 ### 舊 stack
 
@@ -119,7 +143,7 @@ aws cloudformation delete-stack --stack-name TrainingBackend
    | `ANTHROPIC_API_KEY` | 同 `.env` |
    | `APPLE_SERVICES_ID` / `APPLE_TEAM_ID` / `APPLE_KEY_ID` / `APPLE_PRIVATE_KEY` | 選填 |
 
-   非 secret 的（`DB_HOST`、`CLAUDE_MODEL`、`AUTO_REVIEW`、`STAGE`）寫在 workflow 的 `env`；`CORS_ORIGIN` 可以用 repository **variable**（不是 secret）覆蓋。
+   非 secret 的（`DB_HOST`、`CLAUDE_MODEL`、`AUTO_REVIEW`、`STAGE`）寫在 workflow 的 `env`；`CORS_ORIGIN`、`API_DOMAIN`、`API_CERT_ARN` 用 repository **variables**（不是 secret）。
 
 ## 4. Cognito 使用者
 

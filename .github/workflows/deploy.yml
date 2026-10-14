@@ -20,6 +20,9 @@ env:
   AUTO_REVIEW: "true"
   STAGE: prod
   CORS_ORIGIN: ${{ vars.CORS_ORIGIN || 'https://iamwuwei.github.io' }}
+  # custom API domain: set both repository variables, or neither
+  API_DOMAIN: ${{ vars.API_DOMAIN }}
+  API_CERT_ARN: ${{ vars.API_CERT_ARN }}
 
 jobs:
   # Typecheck + synth with placeholders. No AWS, no secrets: runs on every PR.

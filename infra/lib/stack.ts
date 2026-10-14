@@ -1,5 +1,6 @@
 import path from "node:path";
 import * as cdk from "aws-cdk-lib";
+import * as acm from "aws-cdk-lib/aws-certificatemanager";
 import * as apigw from "aws-cdk-lib/aws-apigatewayv2";
 import { HttpUserPoolAuthorizer } from "aws-cdk-lib/aws-apigatewayv2-authorizers";
 import { HttpLambdaIntegration } from "aws-cdk-lib/aws-apigatewayv2-integrations";
@@ -217,9 +218,29 @@ export class TrainingApiStack extends cdk.Stack {
       httpApi.addRoutes({ path: p, methods: [...methods], integration, authorizer });
     }
 
+    // ---- custom domain (optional): API_DOMAIN + API_CERT_ARN -------------------
+    // The ACM cert (ap-northeast-1, DNS-validated) is created once by hand so a
+    // deploy never blocks on DNS validation; see README. DNS lives outside AWS:
+    // CNAME API_DOMAIN -> the ApiDomainTarget output.
+    const apiDomain = process.env.API_DOMAIN;
+    let customApiUrl: string | undefined;
+    if (apiDomain) {
+      const domainName = new apigw.DomainName(this, "ApiDomain", {
+        domainName: apiDomain,
+        certificate: acm.Certificate.fromCertificateArn(this, "ApiCert", required("API_CERT_ARN")),
+      });
+      new apigw.ApiMapping(this, "ApiMapping", { api: httpApi, domainName });
+      customApiUrl = `https://${apiDomain}`;
+      new cdk.CfnOutput(this, "ApiDomainTarget", {
+        value: domainName.regionalDomainName,
+        description: `CNAME target for ${apiDomain}`,
+      });
+    }
+
     new cdk.CfnOutput(this, "WebhookUrl", { value: webhookUrl.url });
     new cdk.CfnOutput(this, "OauthUrl", { value: oauthUrl.url });
-    new cdk.CfnOutput(this, "ApiUrl", { value: httpApi.apiEndpoint });
+    new cdk.CfnOutput(this, "ApiUrl", { value: customApiUrl ?? httpApi.apiEndpoint });
+    new cdk.CfnOutput(this, "ApiExecuteUrl", { value: httpApi.apiEndpoint });
     new cdk.CfnOutput(this, "UserPoolId", { value: userPool.userPoolId });
     new cdk.CfnOutput(this, "UserPoolClientId", { value: webClient.userPoolClientId });
     new cdk.CfnOutput(this, "CognitoDomain", { value: domain.baseUrl() });
