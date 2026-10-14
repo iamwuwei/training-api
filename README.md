@@ -82,7 +82,7 @@ Output 會有四個 Function URL：`WebhookUrl`、`OauthUrl`、`AuthUrl`、`ApiU
    ```
 
    `cdk bootstrap` 仍然要在本機先跑過一次。
-2. **GitHub** → Settings → Secrets and variables → Actions：
+2. **GitHub** → Settings → Environments → 建 `prod` → 在裡面加 environment secrets（deploy job 綁 `environment: prod`；repository secrets 也可以）：
 
    | Secret | 來源 |
    |---|---|
