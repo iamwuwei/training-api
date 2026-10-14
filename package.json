@@ -8,6 +8,7 @@
     "build": "tsc --noEmit",
     "migrate": "tsx scripts/migrate.ts",
     "seed": "tsx seed/seed.ts",
+    "backfill": "tsx scripts/backfill.ts",
     "subscribe-webhook": "tsx scripts/subscribe-webhook.ts",
     "synth": "cdk synth",
     "deploy": "cdk deploy",

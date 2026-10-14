@@ -35,7 +35,10 @@ export class TrainingStack extends cdk.Stack {
       STRAVA_CLIENT_ID: required("STRAVA_CLIENT_ID"),
       STRAVA_CLIENT_SECRET: required("STRAVA_CLIENT_SECRET"),
     };
-    const corsOrigin = process.env.CORS_ORIGIN ?? "https://iamwuwei.github.io";
+    // Comma-separated list, e.g. "https://training.pages.dev,http://localhost:5173"
+    const corsOrigins = (process.env.CORS_ORIGIN ?? "https://iamwuwei.github.io")
+      .split(",").map((s) => s.trim()).filter(Boolean);
+    const sessionSecret = required("SESSION_SECRET");
 
     // IAM auth: rds-db:connect on the cluster's resource id / db user.
     const rdsConnect = new iam.PolicyStatement({
@@ -55,7 +58,7 @@ export class TrainingStack extends cdk.Stack {
       deadLetterQueue: { queue: dlq, maxReceiveCount: 3 },
     });
 
-    // ---- lambdas --------------------------------------------------------------
+    // ---- lambdas (6) --------------------------------------------------------------
     const fn = (name: string, extra: Partial<NodejsFunctionProps> = {}) =>
       new NodejsFunction(this, `${name[0].toUpperCase()}${name.slice(1)}Fn`, {
         functionName: `training-${name}`,
@@ -101,7 +104,12 @@ export class TrainingStack extends cdk.Stack {
 
     const worker = fn("worker", {
       timeout: cdk.Duration.seconds(90),
-      environment: stravaEnv,
+      environment: {
+        ...stravaEnv,
+        AUTO_REVIEW: process.env.AUTO_REVIEW ?? "true",
+        ANTHROPIC_API_KEY: required("ANTHROPIC_API_KEY"),
+        CLAUDE_MODEL: process.env.CLAUDE_MODEL ?? "claude-haiku-4-5",
+      },
       reservedConcurrentExecutions: 2,
     });
     worker.addToRolePolicy(rdsConnect);
@@ -118,8 +126,13 @@ export class TrainingStack extends cdk.Stack {
     });
     weekly.addToRolePolicy(rdsConnect);
 
-    const api = fn("api");
+    const api = fn("api", { environment: { SESSION_SECRET: sessionSecret } });
     api.addToRolePolicy(rdsConnect);
+
+    const auth = fn("auth", {
+      environment: { SESSION_SECRET: sessionSecret, APPLE_CLIENT_ID: required("APPLE_CLIENT_ID") },
+    });
+    auth.addToRolePolicy(rdsConnect);
 
     // ---- schedule: every Sunday 21:00 Asia/Tokyo -----------------------------
     new scheduler.Schedule(this, "WeeklyReviewSchedule", {
@@ -136,19 +149,19 @@ export class TrainingStack extends cdk.Stack {
     // ---- function URLs ---------------------------------------------------------
     const webhookUrl = webhook.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.NONE });
     const oauthUrl = oauth.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.NONE });
-    const apiUrl = api.addFunctionUrl({
-      authType: lambda.FunctionUrlAuthType.NONE,
-      cors: {
-        allowedOrigins: [corsOrigin],
-        allowedMethods: [lambda.HttpMethod.GET],
-        allowedHeaders: ["content-type"],
-        maxAge: cdk.Duration.hours(1),
-      },
-    });
+    const cors = {
+      allowedOrigins: corsOrigins,
+      allowedMethods: [lambda.HttpMethod.GET, lambda.HttpMethod.POST, lambda.HttpMethod.PUT],
+      allowedHeaders: ["content-type", "authorization"],
+      maxAge: cdk.Duration.hours(1),
+    };
+    const apiUrl = api.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.NONE, cors });
+    const authUrl = auth.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.NONE, cors });
 
     new cdk.CfnOutput(this, "WebhookUrl", { value: webhookUrl.url });
     new cdk.CfnOutput(this, "OauthUrl", { value: oauthUrl.url });
     new cdk.CfnOutput(this, "ApiUrl", { value: apiUrl.url });
+    new cdk.CfnOutput(this, "AuthUrl", { value: authUrl.url });
     new cdk.CfnOutput(this, "ActivitiesQueueUrl", { value: queue.queueUrl });
   }
 }

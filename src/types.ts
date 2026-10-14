@@ -1,13 +1,14 @@
 // Internal row + Strava types. Keep in sync with sql/schema.sql.
 // Public API request/response types live in ../types/api.ts.
 
-import type { MatchStatus, SessionType } from "../types/api";
-export type { MatchStatus, SessionType };
+import type { MatchStatus, SessionType, Verdict } from "../types/api";
+export type { MatchStatus, SessionType, Verdict };
 
 export interface UserRow {
   id: string;
   email: string | null;
   display_name: string;
+  apple_sub: string | null;
   created_at: Date;
 }
 
@@ -30,14 +31,33 @@ export interface PlanRow {
   status: string;
 }
 
+export interface PlanWeekRow {
+  id: string;
+  plan_id: string;
+  week_no: number;
+  week_start: string;
+  week_end: string;
+  phase: string | null;
+  focus: string | null;
+}
+
 export interface PlannedSessionRow {
   id: string;
   plan_id: string;
   scheduled_date: string; // 'YYYY-MM-DD'
+  week_no: number | null;
+  phase: string | null;
+  label: string | null;
   type: SessionType;
+  content: string | null;
+  note: string | null;
+  target: string | null;
   target_distance_m: number | null;
   target_pace_sec_km: number | null;
-  note: string | null;
+  target_pace_min_sec_km: number | null;
+  target_pace_max_sec_km: number | null;
+  target_hr_min: number | null;
+  target_hr_max: number | null;
   version: number;
   superseded: boolean;
 }
@@ -52,9 +72,29 @@ export interface ActivityRow {
   moving_time_sec: number;
   avg_pace_sec_km: number | null;
   avg_hr: number | null;
+  max_hr: number | null;
+  avg_watts: number | null;
+  kcal: number | null;
+  description: string | null;
+  device_name: string | null;
+  gear_id: string | null;
+  gear_name: string | null;
+  weather: string | null;
   splits: unknown;
   match_status: MatchStatus;
   raw?: unknown;
+}
+
+export interface ReviewRow {
+  id: string;
+  activity_id: string;
+  verdict: Verdict | null;
+  comment: string | null;
+  reminders: string[] | null;
+  rpe: number | null;
+  source: "manual" | "claude";
+  model: string | null;
+  created_at: Date;
 }
 
 export interface WeeklyReviewRow {
@@ -103,6 +143,7 @@ export interface StravaSplit {
 export interface StravaActivity {
   id: number;
   name: string;
+  description?: string | null;
   type: string;       // legacy: "Run"
   sport_type: string; // "Run" | "TrailRun" | "VirtualRun" | ...
   start_date: string;       // UTC ISO
@@ -114,11 +155,22 @@ export interface StravaActivity {
   average_speed: number;    // m/s
   average_heartrate?: number;
   max_heartrate?: number;
+  average_watts?: number;
+  calories?: number;
+  device_name?: string;
+  gear_id?: string | null;
+  gear?: { id: string; name: string; primary?: boolean; distance?: number } | null;
   splits_metric?: StravaSplit[];
   [key: string]: unknown;
 }
 
-// ---- weekly review --------------------------------------------------------
+// ---- Claude outputs -------------------------------------------------------
+
+export interface ActivityReviewResult {
+  verdict: Verdict;
+  comment: string;
+  reminders: string[];
+}
 
 export interface WeeklyAdjustment {
   session_id: string;

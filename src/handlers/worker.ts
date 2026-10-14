@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { SQSHandler } from "aws-lambda";
+import { reviewActivity } from "../lib/claude";
 import { query, queryOne } from "../lib/db";
 import { matchSession, type MatchCandidate } from "../lib/matcher";
 import { getActivity, refreshToken, StravaError } from "../lib/strava";
-import type { StravaConnectionRow, StravaWebhookEvent } from "../types";
+import type { PlannedSessionRow, StravaConnectionRow, StravaWebhookEvent } from "../types";
 
 // Any thrown error => SQS redelivers (visibility 90 s, 3 tries, then DLQ).
 // That covers Aurora waking up from 0 ACU.
@@ -35,7 +36,7 @@ async function getFreshConnection(athleteId: number): Promise<StravaConnectionRo
   return { ...conn, access_token: t.access_token, refresh_token: t.refresh_token, expires_at: new Date(t.expires_at * 1000) };
 }
 
-export async function processEvent(ev: StravaWebhookEvent): Promise<void> {
+export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "owner_id">): Promise<void> {
   const conn = await getFreshConnection(ev.owner_id);
   if (!conn) {
     console.log(`no strava_connection for athlete ${ev.owner_id}, skipping activity ${ev.object_id}`);
@@ -61,7 +62,7 @@ export async function processEvent(ev: StravaWebhookEvent): Promise<void> {
   const distance_m = Math.round(activity.distance);
   const moving_time_sec = Math.round(activity.moving_time);
   const avg_pace_sec_km = distance_m > 0 ? Math.round(moving_time_sec / (distance_m / 1000)) : null;
-  const avg_hr = activity.average_heartrate != null ? Math.round(activity.average_heartrate) : null;
+  const round = (v: number | undefined | null) => (v != null ? Math.round(v) : null);
   const localDate = activity.start_date_local.slice(0, 10);
 
   // Eligible sessions: this user's active plan(s), ±2 days, not superseded,
@@ -84,27 +85,37 @@ export async function processEvent(ev: StravaWebhookEvent): Promise<void> {
   );
 
   const matched = matchSession({ localDate, distance_m }, candidates);
+  const activityId = randomUUID();
 
   // On update events keep anything a human already decided (confirmed/ignored).
-  await query(
+  const [row] = await query<{ id: string; session_id: string | null }>(
     `insert into activities
        (id, user_id, strava_activity_id, session_id, start_time, distance_m, moving_time_sec,
-        avg_pace_sec_km, avg_hr, splits, match_status, raw)
-     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        avg_pace_sec_km, avg_hr, max_hr, avg_watts, kcal, description, device_name, gear_id, gear_name,
+        splits, match_status, raw)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
      on conflict (strava_activity_id) do update set
        start_time      = excluded.start_time,
        distance_m      = excluded.distance_m,
        moving_time_sec = excluded.moving_time_sec,
        avg_pace_sec_km = excluded.avg_pace_sec_km,
        avg_hr          = excluded.avg_hr,
+       max_hr          = excluded.max_hr,
+       avg_watts       = excluded.avg_watts,
+       kcal            = excluded.kcal,
+       description     = excluded.description,
+       device_name     = coalesce(excluded.device_name, activities.device_name),
+       gear_id         = excluded.gear_id,
+       gear_name       = coalesce(excluded.gear_name, activities.gear_name),
        splits          = excluded.splits,
        raw             = excluded.raw,
        session_id      = case when activities.match_status in ('confirmed', 'ignored')
                               then activities.session_id else excluded.session_id end,
        match_status    = case when activities.match_status in ('confirmed', 'ignored')
-                              then activities.match_status else excluded.match_status end`,
+                              then activities.match_status else excluded.match_status end
+     returning id, session_id`,
     [
-      randomUUID(),
+      activityId,
       conn.user_id,
       activity.id,
       matched?.id ?? null,
@@ -112,7 +123,14 @@ export async function processEvent(ev: StravaWebhookEvent): Promise<void> {
       distance_m,
       moving_time_sec,
       avg_pace_sec_km,
-      avg_hr,
+      round(activity.average_heartrate),
+      round(activity.max_heartrate),
+      round(activity.average_watts),
+      round(activity.calories),
+      activity.description || null,
+      activity.device_name ?? null,
+      activity.gear_id ?? activity.gear?.id ?? null,
+      activity.gear?.name ?? null,
       JSON.stringify(activity.splits_metric ?? null),
       matched ? "auto" : "unplanned",
       JSON.stringify(activity),
@@ -123,4 +141,40 @@ export async function processEvent(ev: StravaWebhookEvent): Promise<void> {
     `activity ${activity.id} (${localDate}, ${(distance_m / 1000).toFixed(2)} km) -> ` +
       (matched ? `session ${matched.id} (${matched.scheduled_date} ${matched.type})` : "unplanned"),
   );
+
+  // Automatic verdict (AUTO_REVIEW=true): only once per activity, never over a
+  // manual review. A Claude failure must not requeue the activity, so it is logged.
+  if (process.env.AUTO_REVIEW === "true" && row.session_id) {
+    const existing = await queryOne<{ id: string }>("select id from reviews where activity_id = $1", [row.id]);
+    if (!existing) {
+      const session = await queryOne<PlannedSessionRow>(
+        "select *, to_char(scheduled_date, 'YYYY-MM-DD') as scheduled_date from planned_sessions where id = $1",
+        [row.session_id],
+      );
+      if (session) {
+        try {
+          const r = await reviewActivity({
+            session,
+            activity: {
+              distance_m,
+              moving_time_sec,
+              avg_pace_sec_km,
+              avg_hr: round(activity.average_heartrate),
+              max_hr: round(activity.max_heartrate),
+              splits: activity.splits_metric ?? null,
+            },
+          });
+          await query(
+            `insert into reviews (id, activity_id, verdict, comment, reminders, source, model)
+             values ($1, $2, $3, $4, $5, 'claude', $6)
+             on conflict (activity_id) do nothing`,
+            [randomUUID(), row.id, r.verdict, r.comment, JSON.stringify(r.reminders), r.model],
+          );
+          console.log(`review for activity ${activity.id}: ${r.verdict} (${r.reminders.length} reminders)`);
+        } catch (err) {
+          console.error(`auto review failed for activity ${activity.id}`, err);
+        }
+      }
+    }
+  }
 }

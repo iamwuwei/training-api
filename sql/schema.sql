@@ -1,5 +1,7 @@
--- training-backend schema (PostgreSQL 17 / Aurora Serverless v2)
+-- training-api schema (PostgreSQL 17 / Aurora Serverless v2)
 -- Idempotent: safe to run repeatedly via `npm run migrate`.
+-- New columns are added with `alter table … add column if not exists` so an
+-- existing database upgrades in place.
 
 create table if not exists users (
   id uuid primary key,
@@ -7,6 +9,7 @@ create table if not exists users (
   display_name text not null,
   created_at timestamptz not null default now()
 );
+alter table users add column if not exists apple_sub text unique;  -- Sign in with Apple `sub`
 
 create table if not exists strava_connections (
   user_id uuid primary key references users(id),
@@ -27,17 +30,38 @@ create table if not exists plans (
   status text not null default 'active'
 );
 
+-- One row per training week (from the 週總覽 sheet): phase + weekly focus.
+create table if not exists plan_weeks (
+  id uuid primary key,
+  plan_id uuid not null references plans(id),
+  week_no int not null,
+  week_start date not null,
+  week_end date not null,
+  phase text,
+  focus text,
+  unique (plan_id, week_no)
+);
+
 create table if not exists planned_sessions (
   id uuid primary key,
   plan_id uuid not null references plans(id),
   scheduled_date date not null,
   type text not null,            -- easy | long | tempo | interval | rest | race
   target_distance_m int,
-  target_pace_sec_km int,
-  note text,
+  target_pace_sec_km int,        -- midpoint of the pace range (matcher / Claude)
+  note text,                     -- 備註 (column I)
   version int not null default 1,
   superseded boolean not null default false
 );
+alter table planned_sessions add column if not exists week_no int;
+alter table planned_sessions add column if not exists phase text;                  -- 第一階段｜重建跑量
+alter table planned_sessions add column if not exists label text;                  -- original 類型: Easy / Recovery / MP / 坡跑 / 肌力 …
+alter table planned_sessions add column if not exists content text;                -- 內容 (column H): "2 km Easy + 3 km @ MP + 2 km Easy"
+alter table planned_sessions add column if not exists target text;                 -- 配速/心拍 verbatim (column G)
+alter table planned_sessions add column if not exists target_pace_min_sec_km int;  -- fastest allowed
+alter table planned_sessions add column if not exists target_pace_max_sec_km int;  -- slowest allowed
+alter table planned_sessions add column if not exists target_hr_min int;
+alter table planned_sessions add column if not exists target_hr_max int;
 create index if not exists planned_sessions_plan_id_scheduled_date_idx
   on planned_sessions (plan_id, scheduled_date);
 
@@ -55,16 +79,26 @@ create table if not exists activities (
   match_status text not null default 'auto',   -- auto | confirmed | unplanned | ignored
   raw jsonb
 );
+alter table activities add column if not exists description text;   -- Strava description (memo)
+alter table activities add column if not exists max_hr int;
+alter table activities add column if not exists avg_watts int;
+alter table activities add column if not exists kcal int;
+alter table activities add column if not exists device_name text;
+alter table activities add column if not exists gear_id text;
+alter table activities add column if not exists gear_name text;      -- shoes
+alter table activities add column if not exists weather text;        -- free text; no automatic source yet
 
 create table if not exists reviews (
   id uuid primary key,
   activity_id uuid unique not null references activities(id),
-  verdict text,
-  comment text,
+  verdict text,                  -- 達成 | 達成但有提醒 | 未達成
+  comment text,                  -- 心得 paragraph
   rpe int,
   model text,
   created_at timestamptz not null default now()
 );
+alter table reviews add column if not exists reminders jsonb;                        -- string[]
+alter table reviews add column if not exists source text not null default 'manual'; -- manual | claude
 
 create table if not exists weekly_reviews (
   id uuid primary key,

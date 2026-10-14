@@ -56,7 +56,8 @@ export const handler = async (event: { week_start?: string } = {}) => {
     );
     const activities = await query<ActivityRow>(
       `select id, user_id, strava_activity_id, session_id, start_time, distance_m, moving_time_sec,
-              avg_pace_sec_km, avg_hr, match_status
+              avg_pace_sec_km, avg_hr, max_hr, avg_watts, kcal, description, device_name, gear_id,
+              gear_name, weather, splits, match_status
          from activities
         where user_id = $1
           and match_status <> 'ignored'
