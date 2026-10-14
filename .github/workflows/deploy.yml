@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:   # re-deploy by hand, e.g. after changing environment secrets
 
 permissions:
   id-token: write   # OIDC → AWS role
@@ -46,7 +47,7 @@ jobs:
 
   # Real deploy on push to main, using the `prod` environment's secrets.
   deploy:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: check
     runs-on: ubuntu-latest
     environment: prod
