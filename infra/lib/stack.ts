@@ -214,6 +214,7 @@ export class TrainingApiStack extends cdk.Stack {
     const authorizer = new HttpUserPoolAuthorizer("CognitoJwt", userPool, { userPoolClients: [webClient] });
     const integration = new HttpLambdaIntegration("ApiIntegration", api);
     for (const [p, methods] of [
+      ["/me", [apigw.HttpMethod.GET]],
       ["/plan", [apigw.HttpMethod.GET]],
       ["/activities", [apigw.HttpMethod.GET]],
       ["/activities/{id}/review", [apigw.HttpMethod.PUT]],

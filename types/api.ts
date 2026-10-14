@@ -9,6 +9,27 @@ export type SessionType = "easy" | "long" | "tempo" | "interval" | "rest" | "rac
 export type MatchStatus = "auto" | "confirmed" | "unplanned" | "ignored";
 export type Verdict = "達成" | "達成但有提醒" | "未達成";
 
+// ---- GET <ApiUrl>/me -----------------------------------------------------------
+
+export interface ApiUser {
+  id: string;           // users.id (the uuid used by seed / Strava links)
+  display_name: string;
+  email: string | null;
+}
+
+export interface ApiStravaConnection {
+  athlete_id: string;   // bigint → string
+  scope: string;
+  expires_at: string;   // ISO; tokens refresh automatically, informational only
+}
+
+export interface MeResponse {
+  user: ApiUser;
+  strava: ApiStravaConnection | null; // null = not linked yet
+  /** Open in a browser to (re)link Strava: <ApiUrl>/strava/oauth/start?user=<id> */
+  strava_connect_url: string;
+}
+
 // ---- GET <ApiUrl>/plan ---------------------------------------------------------
 
 export interface ApiPlan {

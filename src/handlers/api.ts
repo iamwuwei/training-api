@@ -1,13 +1,14 @@
 import { randomUUID } from "node:crypto";
 import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyResultV2 } from "aws-lambda";
 import { isDbWaking, query, queryOne } from "../lib/db";
-import type { ActivityRow, PlanRow, PlanWeekRow, PlannedSessionRow, ReviewRow, UserRow } from "../types";
+import type { ActivityRow, PlanRow, PlanWeekRow, PlannedSessionRow, ReviewRow, StravaConnectionRow, UserRow } from "../types";
 import type {
   ActivitiesResponse,
   ApiActivity,
   ApiReview,
   ErrorResponse,
   MatchStatus,
+  MeResponse,
   PlanResponse,
   PutReviewRequest,
   PutReviewResponse,
@@ -17,6 +18,7 @@ import type {
 // run, the ID token is already verified and its claims are on the event.
 // CORS is handled by the HTTP API (infra/lib/stack.ts).
 //
+//   GET /me                          who am I + Strava link status + the link URL
 //   GET /plan                        active plan + weeks + sessions + matched activities (with reviews)
 //   GET /activities?status=<status>  all activities (with reviews), newest first
 //   PUT /activities/{id}/review      set a manual verdict
@@ -25,7 +27,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const STATUSES = new Set<string>(["auto", "confirmed", "unplanned", "ignored"] satisfies MatchStatus[]);
 const VERDICTS = new Set<string>(["達成", "達成但有提醒", "未達成"]);
 
-const json = <T extends PlanResponse | ActivitiesResponse | PutReviewResponse | ErrorResponse>(
+const json = <T extends MeResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | ErrorResponse>(
   statusCode: number,
   body: T,
 ): APIGatewayProxyResultV2 => ({
@@ -78,6 +80,7 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
   const user = await resolveUser(event);
   if (!user) return json(403, { error: "not registered" });
 
+  if (method === "GET" && path === "/me") return getMe(user, event);
   if (method === "GET" && path === "/plan") return getPlan(user.id);
   if (method === "GET" && path === "/activities") return getActivities(user.id, q.status);
 
@@ -91,6 +94,22 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
 }
 
 // ---- queries ----------------------------------------------------------------
+
+async function getMe(user: UserRow, event: APIGatewayProxyEventV2WithJWTAuthorizer) {
+  const conn = await queryOne<Pick<StravaConnectionRow, "strava_athlete_id" | "scope" | "expires_at">>(
+    "select strava_athlete_id, scope, expires_at from strava_connections where user_id = $1",
+    [user.id],
+  );
+  // Same host the request came in on, so a custom API domain carries through.
+  const base = `https://${event.requestContext.domainName}`;
+  return json<MeResponse>(200, {
+    user: { id: user.id, display_name: user.display_name, email: user.email },
+    strava: conn
+      ? { athlete_id: conn.strava_athlete_id, scope: conn.scope, expires_at: new Date(conn.expires_at).toISOString() }
+      : null,
+    strava_connect_url: `${base}/strava/oauth/start?user=${user.id}`,
+  });
+}
 
 const ACTIVITY_SELECT = `
   a.id, a.user_id, a.strava_activity_id, a.session_id, a.start_time, a.distance_m, a.moving_time_sec,
