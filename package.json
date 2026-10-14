@@ -9,6 +9,7 @@
     "migrate": "tsx scripts/migrate.ts",
     "seed": "tsx seed/seed.ts",
     "backfill": "tsx scripts/backfill.ts",
+    "sql": "tsx scripts/sql.ts",
     "subscribe-webhook": "tsx scripts/subscribe-webhook.ts",
     "synth": "cdk synth",
     "deploy": "cdk deploy",

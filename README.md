@@ -220,5 +220,5 @@ training-api/
 ├── types/        api.ts — API request/response 型別（前端直接複製用）
 ├── sql/          schema.sql
 ├── seed/         plans.json、seed.ts
-└── scripts/      migrate.ts、backfill.ts、subscribe-webhook.ts、xlsx-to-plans.py
+└── scripts/      migrate.ts、backfill.ts、sql.ts（npm run sql -- "select …"）、subscribe-webhook.ts、xlsx-to-plans.py
 ```
