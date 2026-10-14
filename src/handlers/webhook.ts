@@ -1,7 +1,8 @@
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
-import type { LambdaFunctionURLHandler } from "aws-lambda";
+import type { APIGatewayProxyHandlerV2 } from "aws-lambda";
 import type { StravaWebhookEvent } from "../types";
 
+// Route /strava/webhook on the HTTP API (no authorizer; Strava calls it).
 // Strava requires a 2xx within 2 seconds: no DB, no Strava calls here.
 // Everything goes to SQS and the worker does the work.
 
@@ -13,7 +14,7 @@ const json = (statusCode: number, body: unknown) => ({
   body: JSON.stringify(body),
 });
 
-export const handler: LambdaFunctionURLHandler = async (event) => {
+export const handler: APIGatewayProxyHandlerV2 = async (event) => {
   const method = event.requestContext.http.method;
 
   if (method === "GET") {

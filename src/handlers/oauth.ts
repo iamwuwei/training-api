@@ -1,4 +1,4 @@
-import type { LambdaFunctionURLHandler } from "aws-lambda";
+import type { APIGatewayProxyHandlerV2 } from "aws-lambda";
 import { query, queryOne } from "../lib/db";
 import { authorizeUrl, exchangeCode } from "../lib/strava";
 
@@ -11,22 +11,25 @@ const html = (statusCode: number, body: string) => ({
 <body style="font-family:system-ui;padding:2rem;text-align:center;font-size:1.25rem">${body}</body>`,
 });
 
-export const handler: LambdaFunctionURLHandler = async (event) => {
+// Routes /strava/oauth/start and /strava/oauth/callback on the HTTP API (no
+// authorizer). The redirect_uri is derived from the request so it follows the
+// API's domain (custom domain or execute-api) without configuration.
+export const handler: APIGatewayProxyHandlerV2 = async (event) => {
   const path = event.rawPath;
   const q = event.queryStringParameters ?? {};
-  const origin = `https://${event.requestContext.domainName}`;
 
-  if (path === "/start") {
+  if (path.endsWith("/start")) {
     const user = q.user ?? "";
     if (!UUID_RE.test(user)) return html(400, "缺少或無效的 user 參數");
+    const redirectUri = `https://${event.requestContext.domainName}${path.replace(/\/start$/, "/callback")}`;
     return {
       statusCode: 302,
-      headers: { location: authorizeUrl({ redirectUri: `${origin}/callback`, state: user }) },
+      headers: { location: authorizeUrl({ redirectUri, state: user }) },
       body: "",
     };
   }
 
-  if (path === "/callback") {
+  if (path.endsWith("/callback")) {
     if (q.error) return html(400, `Strava 授權失敗：${q.error}`);
     const userId = q.state ?? "";
     if (!UUID_RE.test(userId) || !q.code) return html(400, "callback 參數不完整");

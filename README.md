@@ -3,8 +3,8 @@
 Strava 連動的馬拉松課表追蹤後端。兩個使用者，Node.js 22 + TypeScript，infra 用 AWS CDK。
 
 ```
-Strava webhook → Lambda webhook（Function URL）→ SQS activities → Lambda worker → Aurora（＋ Claude 單次判定）
-Strava OAuth   → Lambda oauth（Function URL）→ Aurora
+Strava webhook → API Gateway /strava/webhook → Lambda webhook → SQS activities → Lambda worker → Aurora（＋ Claude 單次判定）
+Strava OAuth   → API Gateway /strava/oauth/* → Lambda oauth → Aurora
 EventBridge Scheduler（每週日 21:00 JST）→ Lambda weekly → Claude API → Aurora
 前端 → Cognito（登入，拿 ID token）
 前端 → API Gateway HTTP API（Cognito JWT authorizer）→ Lambda api → Aurora
@@ -13,7 +13,7 @@ EventBridge Scheduler（每週日 21:00 JST）→ Lambda weekly → Claude API �
 資源命名：全部 `training-api-<thing>-<STAGE>`；stack、HTTP API 和它後面的 api Lambda 都叫 `training-api-<STAGE>`。`STAGE` 預設 `prod`。
 
 - 所有 Lambda 都不在 VPC 內（Aurora 有公開 endpoint；Lambda 要打 Strava / Claude）。
-- Strava 會打的兩個 Lambda（webhook / oauth）用 Function URL（auth NONE）；給前端的 api Lambda 走 API Gateway HTTP API，JWT authorizer 驗 Cognito ID token。
+- 全部走同一個 API Gateway HTTP API（`make-it-api.life4like.com`）：`/plan`、`/activities*` 掛 Cognito JWT authorizer；`/strava/webhook`、`/strava/oauth/*` 不掛（Strava 來打的）。沒有 Function URL，所以 Lambda 重建 URL 也不變。
 - DB 認證走 IAM：`@aws-sdk/rds-signer` 產 token 當密碼，SSL 用打包進 Lambda 的 RDS global CA bundle（`src/lib/global-bundle.pem`）。
 - Aurora Serverless v2 min 0 ACU，閒置 5 分鐘會 pause；第一次連線要等 10–15 秒。Lambda timeout 60 秒（worker 90 秒），worker 連線失敗會 throw 讓 SQS 重送（3 次後進 DLQ）。
 
@@ -69,7 +69,7 @@ npx cdk bootstrap    # 第一次
 npx cdk deploy
 ```
 
-Output：`WebhookUrl`、`OauthUrl`（Function URL）、`ApiUrl`（自訂網域，沒設就是 execute-api）、`ApiExecuteUrl`、`UserPoolId`、`UserPoolClientId`、`CognitoDomain`、`ApiDomainTarget`（有自訂網域時）。
+Output：`ApiUrl`（自訂網域，沒設就是 execute-api）、`WebhookUrl` = `<ApiUrl>/strava/webhook`、`OauthStartUrl` = `<ApiUrl>/strava/oauth/start?user=<uuid>`、`ApiExecuteUrl`、`UserPoolId`、`UserPoolClientId`、`CognitoDomain`、`ApiDomainTarget`（有自訂網域時）。
 
 ### API 自訂網域（`make-it-api.life4like.com`）
 
@@ -102,12 +102,12 @@ Proxy 開關都可以：DNS only 最單純；要開 Cloudflare proxy 的話 SSL/
 aws cloudformation delete-stack --stack-name TrainingBackend
 ```
 
-刪掉後舊的 Function URL 失效：Strava callback domain 改成新的 `OauthUrl` host，`npm run subscribe-webhook` 會自動把指到舊 URL 的 subscription 換掉。
+刪掉後舊的 Function URL 失效：Strava callback domain 改成 `ApiUrl` 的 host，`npm run subscribe-webhook` 會自動把指到舊 URL 的 subscription 換掉。
 
 ### 自動（GitHub Actions，`.github/workflows/deploy.yml`）
 
 - pull request：`npm ci` → `npm run build` → `cdk synth`（不碰 AWS）。
-- push 到 `main`：同上，再用 OIDC 換 AWS role 跑 `cdk deploy --require-approval never`，最後印出 Function URL。
+- push 到 `main`：同上，再用 OIDC 換 AWS role 跑 `cdk deploy --require-approval never`，最後印出 API / webhook / oauth 的 URL。
 - `migrate` / `seed` / `backfill` 不在 CI 裡，schema 改動在本機跑。
 
 一次性設定：
@@ -165,19 +165,19 @@ aws cognito-idp admin-set-user-password --user-pool-id $POOL --username you@exam
 
 ## 5. Strava 設定
 
-1. 到 https://www.strava.com/settings/api，把 **Authorization Callback Domain** 改成 `OauthUrl` 的 domain（只要 host，例如 `xxxx.lambda-url.ap-northeast-1.on.aws`）。
+1. 到 https://www.strava.com/settings/api，把 **Authorization Callback Domain** 填 `ApiUrl` 的 host：自訂網域就是 `make-it-api.life4like.com`，還沒設的話是 `xxxx.execute-api.ap-northeast-1.amazonaws.com`。
 2. 把 `WebhookUrl` 填進 `.env` 的 `WEBHOOK_URL`，然後：
 
    ```bash
    npm run subscribe-webhook
-   # 或 npm run subscribe-webhook -- https://xxxx.lambda-url.ap-northeast-1.on.aws/
+   # 或 npm run subscribe-webhook -- https://make-it-api.life4like.com/strava/webhook
    ```
 
    會先 GET 檢查有沒有既有 subscription，有就跳過；沒有才 POST。Strava 會在這時打 `WebhookUrl` 做 `hub.challenge` 驗證。
 
 ## 6. 授權流程
 
-把 `<OauthUrl>/start?user=<uuid>` 傳給使用者點（uuid 從 `npm run seed` 的輸出拿）。流程：302 到 Strava → 同意 `activity:read_all` → `/callback` 用 code 換 token 寫進 `strava_connections` → 顯示「設定完成 ✓」。之後每次新活動 Strava 會推 webhook，worker 抓細節、配對課表、寫進 `activities`。
+把 `OauthStartUrl`（`<ApiUrl>/strava/oauth/start?user=<uuid>`）傳給使用者點（uuid 從 `npm run seed` 的輸出拿）。流程：302 到 Strava → 同意 `activity:read_all` → `/callback` 用 code 換 token 寫進 `strava_connections` → 顯示「設定完成 ✓」。之後每次新活動 Strava 會推 webhook，worker 抓細節、配對課表、寫進 `activities`。
 
 ## API
 

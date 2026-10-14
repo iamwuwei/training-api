@@ -147,10 +147,6 @@ export class TrainingApiStack extends cdk.Stack {
       target: new LambdaInvoke(weekly, { input: scheduler.ScheduleTargetInput.fromObject({}) }),
     });
 
-    // ---- Strava-facing endpoints: Function URLs, no auth (Strava calls them) ----
-    const webhookUrl = webhook.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.NONE });
-    const oauthUrl = oauth.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.NONE });
-
     // ---- Cognito: closed user pool (admin creates the two users) -------------
     const userPool = new cognito.UserPool(this, "UserPool", {
       userPoolName: name("users"),
@@ -220,6 +216,19 @@ export class TrainingApiStack extends cdk.Stack {
       httpApi.addRoutes({ path: p, methods: [...methods], integration, authorizer });
     }
 
+    // Strava-facing routes on the same API, no authorizer (Strava calls them):
+    // the URL then follows the API / custom domain, not the Lambda.
+    httpApi.addRoutes({
+      path: "/strava/webhook",
+      methods: [apigw.HttpMethod.GET, apigw.HttpMethod.POST],
+      integration: new HttpLambdaIntegration("WebhookIntegration", webhook),
+    });
+    httpApi.addRoutes({
+      path: "/strava/oauth/{proxy+}",
+      methods: [apigw.HttpMethod.GET],
+      integration: new HttpLambdaIntegration("OauthIntegration", oauth),
+    });
+
     // ---- custom domain (optional): API_DOMAIN + API_CERT_ARN -------------------
     // The ACM cert (ap-northeast-1, DNS-validated) is created once by hand so a
     // deploy never blocks on DNS validation; see README. DNS lives outside AWS:
@@ -239,9 +248,10 @@ export class TrainingApiStack extends cdk.Stack {
       });
     }
 
-    new cdk.CfnOutput(this, "WebhookUrl", { value: webhookUrl.url });
-    new cdk.CfnOutput(this, "OauthUrl", { value: oauthUrl.url });
-    new cdk.CfnOutput(this, "ApiUrl", { value: customApiUrl ?? httpApi.apiEndpoint });
+    const baseUrl = customApiUrl ?? httpApi.apiEndpoint;
+    new cdk.CfnOutput(this, "ApiUrl", { value: baseUrl });
+    new cdk.CfnOutput(this, "WebhookUrl", { value: `${baseUrl}/strava/webhook` });
+    new cdk.CfnOutput(this, "OauthStartUrl", { value: `${baseUrl}/strava/oauth/start?user=<uuid>` });
     new cdk.CfnOutput(this, "ApiExecuteUrl", { value: httpApi.apiEndpoint });
     new cdk.CfnOutput(this, "UserPoolId", { value: userPool.userPoolId });
     new cdk.CfnOutput(this, "UserPoolClientId", { value: webClient.userPoolClientId });
