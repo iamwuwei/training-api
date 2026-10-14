@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyResultV2 } from "aws-lambda";
 import { isDbWaking, query, queryOne } from "../lib/db";
+import { deauthorize } from "../lib/strava";
 import type { ActivityRow, PlanRow, PlanWeekRow, PlannedSessionRow, ReviewRow, StravaConnectionRow, UserRow } from "../types";
 import type {
   ActivitiesResponse,
