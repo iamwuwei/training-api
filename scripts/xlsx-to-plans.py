@@ -47,6 +47,10 @@ TYPE_MAP = {
     "MP": "tempo",           # marathon-pace segments
     "坡跑": "interval",      # hill repeats
     "坡跑+MP": "interval",
+    "走跑Easy": "easy",      # run/walk intervals (Sara)
+    "走跑Long": "long",
+    "走跑Recovery": "easy",
+    "走跑": "easy",
     "休息": "rest",
     "完全休息": "rest",
     "肌力": "rest",          # strength / Hyrox day, no running
@@ -125,63 +129,128 @@ def goal_sec(v: str | None) -> int | None:
     return int(m.group(1)) * 3600 + int(m.group(2)) * 60
 
 
+def norm(h) -> str:
+    """'計畫 km' -> '計畫km', '備註（補給・肌力・提醒）' -> '備註', '天氣 / 氣溫 / 濕度' -> '天氣/氣溫/濕度'."""
+    return re.split(r"[（(]", re.sub(r"\s+", "", text(h)))[0]
+
+
+def header_index(ws) -> dict[str, int]:
+    """Normalised column name -> 0-based index from the first row, so sheets may differ in layout."""
+    return {norm(h): i for i, h in enumerate(next(ws.iter_rows(min_row=1, max_row=1, values_only=True))) if text(h)}
+
+
+def find_col(col: dict[str, int], name: str) -> int | None:
+    """Exact normalised match first, then a header that starts with the name ('天氣' matches '天氣/氣溫/濕度')."""
+    if name in col:
+        return col[name]
+    for h, i in col.items():
+        if h.startswith(name):
+            return i
+    return None
+
+
 def main(xlsx: pathlib.Path, user: str, goal: int | None, days: int | None) -> None:
     wb = openpyxl.load_workbook(xlsx, data_only=True)
 
-    weeks = []
-    for r in wb["週總覽"].iter_rows(min_row=2, values_only=True):
-        if not isinstance(r[0], (int, float)) or not isinstance(r[1], dt.datetime):
-            continue
-        weeks.append({
-            "week_no": int(r[0]),
-            "start": r[1].date().isoformat(),
-            "end": r[2].date().isoformat(),
-            "phase": text(r[3]) or None,
-            "focus": text(r[8]) or None,
-        })
+    # ---- 課表 -----------------------------------------------------------------
+    ws = wb["課表"]
+    col = header_index(ws)
+    need = ["週", "日期", "階段", "類型", "計畫km", "配速/心拍", "內容", "備註"]
+    missing = [c for c in need if find_col(col, c) is None]
+    if missing:
+        sys.exit(f"課表 is missing columns {missing}; found {list(col)}")
+
+    def cell(r, name):
+        i = find_col(col, name)
+        return r[i] if i is not None and i < len(r) else None
 
     sessions, results, unknown = [], [], set()
-    for r in wb["課表"].iter_rows(min_row=2, values_only=True):
-        if not isinstance(r[1], dt.datetime):
+    phase_by_week: dict[int, str] = {}
+    for r in ws.iter_rows(min_row=2, values_only=True):
+        if not isinstance(cell(r, "日期"), dt.datetime):
             continue
-        date = r[1].date().isoformat()
-        label = text(r[4])
+        date = cell(r, "日期").date().isoformat()
+        label = text(cell(r, "類型"))
         kind = TYPE_MAP.get(label)
         if kind is None:
             unknown.add(label)
             continue
-        target = text(r[6])
+        wk = cell(r, "週")
+        week_no = int(wk) if isinstance(wk, (int, float)) else None
+        phase = text(cell(r, "階段")) or None
+        if week_no is not None and phase and week_no not in phase_by_week:
+            phase_by_week[week_no] = phase
+        target = text(cell(r, "配速/心拍"))
         sessions.append({
             "date": date,
-            "week_no": int(r[0]) if isinstance(r[0], (int, float)) else None,
-            "phase": text(r[3]) or None,
+            "week_no": week_no,
+            "phase": phase,
             "label": label,
             "type": kind,
-            "distance_m": int(round(float(r[5] or 0) * 1000)),
-            "content": text(r[7]) or None,
-            "note": text(r[8]) or None,
+            "distance_m": int(round(float(cell(r, "計畫km") or 0) * 1000)),
+            "content": text(cell(r, "內容")) or None,
+            "note": text(cell(r, "備註")) or None,
             "target": target or None,
             **parse_target(target),
         })
-        # actuals (J–W), hand-typed; only rows with a verdict or a distance
-        if num(r[9]) is not None or text(r[21]):
-            reminders = [s.strip() for s in text(r[22]).split("｜") if s.strip()]
+        # actuals, hand-typed; only rows with a verdict or a distance. 判定/提醒 columns are optional.
+        if num(cell(r, "實際km")) is not None or text(cell(r, "判定")):
+            reminders = [x.strip() for x in text(cell(r, "提醒")).split("｜") if x.strip()]
             results.append({
                 "date": date,
-                "distance_m": int(round((num(r[9]) or 0) * 1000)),
-                "memo": text(r[11]) or None,
-                "moving_time_sec": time_sec(r[12]),
-                "pace_sec_km": pace_sec(r[13]),
-                "avg_hr": int(num(r[14])) if num(r[14]) is not None else None,
-                "max_hr": int(num(r[15])) if num(r[15]) is not None else None,
-                "avg_watts": int(num(r[16])) if num(r[16]) is not None else None,
-                "kcal": int(num(r[17])) if num(r[17]) is not None else None,
-                "weather": text(r[18]) or None,
-                "shoes": text(r[19]) or None,
-                "device": text(r[20]) or None,
-                "verdict": text(r[21]) or None,
+                "distance_m": int(round((num(cell(r, "實際km")) or 0) * 1000)),
+                "memo": text(cell(r, "心得")) or None,
+                "moving_time_sec": time_sec(cell(r, "時間")),
+                "pace_sec_km": pace_sec(cell(r, "平均配速")),
+                "avg_hr": int(num(cell(r, "平均心拍"))) if num(cell(r, "平均心拍")) is not None else None,
+                "max_hr": int(num(cell(r, "最大心拍"))) if num(cell(r, "最大心拍")) is not None else None,
+                "avg_watts": int(num(cell(r, "平均功率W"))) if num(cell(r, "平均功率W")) is not None else None,
+                "kcal": int(num(cell(r, "卡路里"))) if num(cell(r, "卡路里")) is not None else None,
+                "weather": text(cell(r, "天氣")) or None,
+                "shoes": text(cell(r, "鞋")) or None,
+                "device": text(cell(r, "裝置")) or None,
+                "verdict": text(cell(r, "判定")) or None,
                 "reminders": reminders,
             })
+
+    # ---- 週總覽 --------------------------------------------------------------
+    # Two layouts seen: (週, 起始日, 結束日, 階段, …, 重點) and (週, 起始日, 計畫總km, …, 備註).
+    # Missing end = start + 6 days; missing phase = the week's first session phase; focus = 重點 or 備註.
+    wsw = wb["週總覽"]
+    wcol = header_index(wsw)
+    weeks = []
+    for r in wsw.iter_rows(min_row=2, values_only=True):
+        def wcell(*names):
+            for name in names:
+                i = find_col(wcol, name)
+                if i is not None and i < len(r):
+                    return r[i]
+            return None
+
+        wk, start = wcell("週"), wcell("起始日", "起始", "起", "開始")
+        if not isinstance(wk, (int, float)) or not isinstance(start, dt.datetime):
+            continue
+        end_v = wcell("結束日", "結束", "迄")
+        end = end_v.date() if isinstance(end_v, dt.datetime) else start.date() + dt.timedelta(days=6)
+        focus = None
+        for name in ("重點", "備註"):
+            if find_col(wcol, name) is not None:
+                focus = text(wcell(name)) or None
+                break
+        phase = text(wcell("階段"))
+        weeks.append({
+            "week_no": int(wk),
+            "start": start.date().isoformat(),
+            "end": end.isoformat(),
+            "phase": phase or phase_by_week.get(int(wk)),
+            "focus": focus,
+        })
+    # A derived end must not run into the next week.
+    weeks.sort(key=lambda w: w["week_no"])
+    for a, b in zip(weeks, weeks[1:]):
+        if a["end"] >= b["start"]:
+            a["end"] = (dt.date.fromisoformat(b["start"]) - dt.timedelta(days=1)).isoformat()
+
     if unknown:
         sys.exit(f"unmapped 類型 values: {sorted(unknown)} — add them to TYPE_MAP")
 
