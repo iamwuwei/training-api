@@ -21,7 +21,7 @@ env:
   AUTO_REVIEW: "true"
   STAGE: prod
   # logs the IAM auth token parameters (never the signature) from the api Lambda
-  DB_DEBUG: ${{ vars.DB_DEBUG || 'false' }}
+  DB_DEBUG: ${{ vars.DB_DEBUG || 'true' }}   # TODO flip to 'false' once the PAM issue is solved
   CORS_ORIGIN: ${{ vars.CORS_ORIGIN || 'https://iamwuwei.github.io' }}
   # custom API domain: set both repository variables, or neither
   API_DOMAIN: ${{ vars.API_DOMAIN }}
