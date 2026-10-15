@@ -116,9 +116,10 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
   );
 
   // Claude verdict (AUTO_REVIEW=true): only once the athlete has assigned the
-  // activity to a session (the api requeues it then), runs only, once per
-  // activity, never over a manual review. A Claude failure must not requeue.
-  if (process.env.AUTO_REVIEW === "true" && isRun && row.session_id) {
+  // activity to a session (the api requeues it then), once per activity, never over
+  // a manual review. Any sport counts (e.g. Hyrox on a 肌力 day). A Claude
+  // failure must not requeue.
+  if (process.env.AUTO_REVIEW === "true" && row.session_id) {
     const existing = await queryOne<{ id: string }>("select id from reviews where activity_id = $1", [row.id]);
     if (!existing) {
       const session = await queryOne<PlannedSessionRow>(
@@ -130,6 +131,7 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
           const r = await reviewActivity({
             session,
             activity: {
+              sport_type: activity.sport_type ?? activity.type,
               distance_m,
               moving_time_sec,
               avg_pace_sec_km,

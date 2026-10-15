@@ -199,7 +199,7 @@ Aurora 閒置 5 分鐘會 pause，之後第一個請求要等它醒（15〜30 �
 ## 心得 vs 判定
 
 - **跑者這邊**：`activities.memo` / `rpe`（app 裡寫，`PUT …/memo`），`activities.description`（Strava 上寫的，自動同步）。前端顯示 `memo ?? description`。
-- **教練這邊**：`reviews`（Claude 或手動的 verdict / comment / reminders）。Claude 評的時候會讀跑者自述。
+- **教練這邊**：`reviews`（Claude 或手動的 verdict / comment / reminders）。每筆活動的判定會把跑者自己寫的 RPE 和心得連同數據一起給 Claude，並要求評語直接回應自述；每週總結也會帶入該週每筆活動的自述。非跑步活動（重訓、Hyrox）對應到課表後也會被評，只是不看配速與距離。
 
 ## 判定（reviews）
 

@@ -61,7 +61,7 @@ export const handler = async (event: { week_start?: string } = {}) => {
          from activities
         where user_id = $1
           and match_status <> 'ignored'
-          and (sport_type is null or sport_type in ('Run', 'TrailRun', 'VirtualRun'))
+          and (session_id is not null or sport_type is null or sport_type in ('Run', 'TrailRun', 'VirtualRun'))
           and (start_time at time zone 'Asia/Tokyo')::date between $2 and $3
         order by start_time`,
       [plan.user_id, weekStart, weekEnd],

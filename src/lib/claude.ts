@@ -51,12 +51,13 @@ async function ask<T>(system: string, user: string, schema: Record<string, unkno
 // ---- per-activity review (worker) ------------------------------------------
 
 const REVIEW_SYSTEM = `你是一位務實的馬拉松教練，替一位業餘跑者評一次練習。
-只看「課表要求 vs 實際數據」。原則：
+看「課表要求 vs 實際數據」，再對照跑者自己寫的感受（RPE 與心得）。原則：
 - verdict 三選一：達成（配速與心拍都在區間內、距離到位）／達成但有提醒（跑完了但配速或心拍明顯偏離，或距離差 >15%）／未達成（距離差 >30% 或完全跑錯類型）。
 - comment：2〜4 句繁體中文，指出最值得注意的一件事（心拍漂移、起跑偏快、後段掉速、長跑末段加速…），引用具體公里數和數字。
 - reminders：0〜3 條，每條一句，只寫下次要改的具體動作；沒有就空陣列。
 - Easy / Recovery 日「寧慢勿快」，跑太快是扣分不是加分。
-- 有「跑者自述」時要納入判斷：數據超標但自述輕鬆、RPE 低，可以放寬；數據正常但自述很累、RPE 高，要在 comment 提醒。`;
+- 有「跑者自述」時它和數據同等重要：數據超標但自述輕鬆、RPE 低，可以放寬；數據正常但自述很累、RPE 高，要在 comment 提醒。comment 要直接回應跑者說的話（同意、補充或指出數據看到的不同），reminders 要涵蓋他自己提到的問題（例如「第一公里又衝太快」就給對應的具體做法）。不要只複述數據而忽略自述。
+- 非跑步的活動（重訓、騎車、Hyrox 等）沒有配速與距離可比：依課表內容、時間、心拍和自述判斷，不要用配速或距離扣分。`;
 
 const REVIEW_SCHEMA = {
   type: "object",
@@ -69,9 +70,13 @@ const REVIEW_SCHEMA = {
   additionalProperties: false,
 } as const;
 
+const RUN_SPORTS = new Set(["Run", "TrailRun", "VirtualRun"]);
+const isRunSport = (sport: string | null | undefined) => !sport || RUN_SPORTS.has(sport);
+
 export interface ActivityReviewInput {
   session: PlannedSessionRow;
   activity: Pick<ActivityRow, "distance_m" | "moving_time_sec" | "avg_pace_sec_km" | "avg_hr" | "max_hr"> & {
+    sport_type?: string | null;  // Strava sport_type; anything but a run is judged without pace/distance
     splits: StravaSplit[] | null;
     description?: string | null; // Strava description
     memo?: string | null;        // athlete's note in the app
@@ -94,7 +99,9 @@ export function buildReviewPrompt({ session: s, activity: a }: ActivityReviewInp
     s.note ? `備註：${s.note}` : "",
     "",
     "## 實際",
-    `${(a.distance_m / 1000).toFixed(2)} km，${Math.round(a.moving_time_sec / 60)} 分，平均 ${pace(a.avg_pace_sec_km)}，平均心拍 ${a.avg_hr ?? "-"}，最高 ${a.max_hr ?? "-"}`,
+    isRunSport(a.sport_type)
+      ? `${(a.distance_m / 1000).toFixed(2)} km，${Math.round(a.moving_time_sec / 60)} 分，平均 ${pace(a.avg_pace_sec_km)}，平均心拍 ${a.avg_hr ?? "-"}，最高 ${a.max_hr ?? "-"}`
+      : `${a.sport_type}，${Math.round(a.moving_time_sec / 60)} 分，平均心拍 ${a.avg_hr ?? "-"}，最高 ${a.max_hr ?? "-"}`,
     splits ? `每公里：\n${splits}` : "",
     a.memo || a.description || a.rpe
       ? ["", "## 跑者自述", a.rpe ? `RPE ${a.rpe}/10` : "", a.memo ? a.memo : "", !a.memo && a.description ? a.description : ""]
@@ -131,6 +138,7 @@ const WEEKLY_SYSTEM = `你是一位務實的馬拉松教練，替一位業餘跑
 原則：
 - 用繁體中文，口吻直接、具體，不要客套。
 - 評估「計畫 vs 實際」：完成率、配速是否守住區間、心率是否過高、長跑是否達標、是否有連續缺席。
+- 跑者自述（RPE、心得）要一併納入：反覆出現的問題（例如連續幾次起跑太快、腿一直很累）要在總結點出；自述很累或有疼痛時，調整建議優先降量而不是加量。
 - 只有在有明確理由（受傷風險、連續未達成、明顯超前）時才提出調整，而且只調整「下兩週」的課表；不要重排整份計畫。
 - adjustments 中 session_id 必須來自「接下來的課表」清單；field 只能是 type / target_distance_m / target_pace_sec_km / scheduled_date / note。
 - 沒有需要調整就回空陣列。`;
@@ -167,8 +175,10 @@ function sessionLine(s: PlannedSessionRow): string {
 function activityLine(a: ActivityRow): string {
   const d = new Date(a.start_time).toISOString().slice(0, 10);
   const km = (a.distance_m / 1000).toFixed(2);
-  const matched = a.session_id ? `配對 session=${a.session_id}` : `未配對(${a.match_status})`;
-  return `- ${d} ${km} km, ${Math.round(a.moving_time_sec / 60)} min, ${pace(a.avg_pace_sec_km)}, HR ${a.avg_hr ?? "-"}; ${matched}`;
+  const matched = a.session_id ? `對應 session=${a.session_id}` : `未對應(${a.match_status})`;
+  const what = isRunSport(a.sport_type) ? `${km} km, ${Math.round(a.moving_time_sec / 60)} min, ${pace(a.avg_pace_sec_km)}` : `${a.sport_type}, ${Math.round(a.moving_time_sec / 60)} min`;
+  const own = a.rpe || a.memo ? ` | 自述：${a.rpe ? `RPE ${a.rpe}/10 ` : ""}${a.memo ?? ""}`.replace(/\s+/g, " ") : "";
+  return `- ${d} ${what}, HR ${a.avg_hr ?? "-"}; ${matched}${own}`;
 }
 
 export function buildWeeklyPrompt(input: WeeklyReviewInput): string {
@@ -184,8 +194,8 @@ export function buildWeeklyPrompt(input: WeeklyReviewInput): string {
     "## 本週課表",
     input.sessions.length ? input.sessions.map(sessionLine).join("\n") : "（無）",
     "",
-    "## 本週實際跑步（Strava）",
-    input.activities.length ? input.activities.map(activityLine).join("\n") : "（本週沒有任何跑步紀錄）",
+    "## 本週實際活動（Strava；「自述」是跑者自己寫的 RPE 與心得）",
+    input.activities.length ? input.activities.map(activityLine).join("\n") : "（本週沒有任何活動紀錄）",
     "",
     "## 接下來的課表（可調整的對象）",
     input.upcoming.length ? input.upcoming.map(sessionLine).join("\n") : "（無）",
