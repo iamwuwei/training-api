@@ -30,7 +30,7 @@ import type {
 //   GET /plan                        active plan + weeks + sessions + matched activities (with reviews)
 //   GET /activities?status=<status>  all activities (with reviews), newest first
 //   PUT /activities/{id}/review      set a manual verdict
-//   PUT /activities/{id}/session     assign the activity to a planned session (or ignore it)
+//   PUT /activities/{id}/session     the athlete's pick: which planned session this activity was (+ memo/RPE), or ignore it
 //   PUT /activities/{id}/memo        athlete's own note + RPE (re-triggers the Claude review)
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -220,11 +220,23 @@ async function getPlan(userId: string) {
     [userId, plan.id],
   );
 
+  // Waiting for the athlete to say which session they were (any sport).
+  const unassigned = await query<ActivityJoined>(
+    `select ${ACTIVITY_SELECT}
+       from activities a
+       left join reviews r on r.activity_id = a.id
+      where a.user_id = $1 and a.session_id is null and a.match_status = 'unplanned'
+        and a.start_time > now() - interval '45 days'
+      order by a.start_time desc`,
+    [userId],
+  );
+
   return json<PlanResponse>(200, {
     plan,
     weeks: weeks.map(({ week_no, week_start, week_end, phase, focus }) => ({ week_no, week_start, week_end, phase, focus })),
     sessions,
     activities: activities.map(toApiActivity),
+    unassigned: unassigned.map(toApiActivity),
   });
 }
 
@@ -269,6 +281,17 @@ async function putReview(userId: string, activityId: string, raw: string) {
   return json<PutReviewResponse>(200, { review: toApiReview(review) });
 }
 
+type MemoFields = { memo: string | null; rpe: number | null };
+
+/** Shared by PUT …/memo and PUT …/session: a string error, or the cleaned values. */
+function parseMemo(body: { memo?: unknown; rpe?: unknown }): MemoFields | string {
+  const memo = typeof body.memo === "string" && body.memo.trim() !== "" ? body.memo.trim() : null;
+  if (memo && memo.length > 4000) return "memo too long (4000 chars)";
+  const rpe = body.rpe ?? null;
+  if (rpe !== null && (typeof rpe !== "number" || !Number.isInteger(rpe) || rpe < 1 || rpe > 10)) return "rpe must be 1-10";
+  return { memo, rpe };
+}
+
 async function putSession(userId: string, activityId: string, raw: string) {
   if (!UUID_RE.test(activityId)) return json(400, { error: "invalid activity id" });
   let body: PutSessionRequest;
@@ -284,6 +307,10 @@ async function putSession(userId: string, activityId: string, raw: string) {
   );
   if (!activity) return json(404, { error: "activity not found" });
 
+  const withMemo = body.memo !== undefined || body.rpe !== undefined;
+  const memoFields = withMemo ? parseMemo(body) : null;
+  if (typeof memoFields === "string") return json(400, { error: memoFields });
+
   if (body.session_id === null || body.session_id === undefined) {
     const status = body.status ?? "unplanned";
     if (status !== "unplanned" && status !== "ignored") return json(400, { error: "status must be unplanned or ignored" });
@@ -298,18 +325,23 @@ async function putSession(userId: string, activityId: string, raw: string) {
     );
     if (!session) return json(404, { error: "session not found" });
 
-    // One activity per session: bump an automatic holder, refuse a confirmed one.
+    // One activity per session: bump an automatic holder; a confirmed one only with `replace`.
     const holder = await queryOne<{ id: string; match_status: MatchStatus }>(
       "select id, match_status from activities where session_id = $1 and id <> $2",
       [session.id, activityId],
     );
-    if (holder?.match_status === "confirmed") return json(409, { error: "session already confirmed for another activity" });
+    if (holder?.match_status === "confirmed" && !body.replace) {
+      return json(409, { error: "session already confirmed for another activity" });
+    }
     if (holder) {
       await query("update activities set session_id = null, match_status = 'unplanned' where id = $1", [holder.id]);
       await query("delete from reviews where activity_id = $1 and source = 'claude'", [holder.id]);
     }
 
     await query("update activities set session_id = $2, match_status = 'confirmed' where id = $1", [activityId, session.id]);
+    if (memoFields) {
+      await query("update activities set memo = $2, rpe = $3, memo_updated_at = now() where id = $1", [activityId, memoFields.memo, memoFields.rpe]);
+    }
     // The Claude verdict was about the old session: drop it and let the worker
     // regenerate one against the new session (manual reviews are kept).
     const dropped = await query<{ id: string }>(
@@ -357,10 +389,9 @@ async function putMemo(userId: string, activityId: string, raw: string) {
   } catch {
     return json(400, { error: "invalid json" });
   }
-  const memo = typeof body.memo === "string" && body.memo.trim() !== "" ? body.memo.trim() : null;
-  if (memo && memo.length > 4000) return json(400, { error: "memo too long (4000 chars)" });
-  const rpe = body.rpe ?? null;
-  if (rpe !== null && (!Number.isInteger(rpe) || rpe < 1 || rpe > 10)) return json(400, { error: "rpe must be 1-10" });
+  const parsed = parseMemo(body);
+  if (typeof parsed === "string") return json(400, { error: parsed });
+  const { memo, rpe } = parsed;
 
   const activity = await queryOne<{ id: string; strava_activity_id: string; session_id: string | null }>(
     "select id, strava_activity_id, session_id from activities where id = $1 and user_id = $2",

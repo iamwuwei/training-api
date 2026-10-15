@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import type { SQSHandler } from "aws-lambda";
 import { reviewActivity } from "../lib/claude";
 import { query, queryOne } from "../lib/db";
-import { matchSession, type MatchCandidate } from "../lib/matcher";
 import { getActivity, refreshToken, StravaError } from "../lib/strava";
 import type { PlannedSessionRow, StravaConnectionRow, StravaWebhookEvent } from "../types";
 
@@ -54,8 +53,8 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
     throw err;
   }
 
-  // Every sport is stored (so a Hyrox or a ride can be assigned to a 肌力 day
-  // by hand); only runs are auto-matched and reviewed.
+  // Every sport is stored as-is. Nothing is matched to a planned session here:
+  // the athlete picks which activity fulfils a session (PUT /activities/{id}/session).
   const isRun = activity.type === "Run";
   const distance_m = Math.round(activity.distance ?? 0);
   const moving_time_sec = Math.round(activity.moving_time ?? 0);
@@ -63,35 +62,15 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
   const round = (v: number | undefined | null) => (v != null ? Math.round(v) : null);
   const localDate = activity.start_date_local.slice(0, 10);
 
-  // Eligible sessions: this user's active plan(s), ±2 days, not superseded,
-  // not already claimed by a *different* activity.
-  const candidates = !isRun ? [] : await query<MatchCandidate>(
-    `select ps.id, to_char(ps.scheduled_date, 'YYYY-MM-DD') as scheduled_date,
-            ps.type, ps.target_distance_m
-       from planned_sessions ps
-       join plans p on p.id = ps.plan_id
-      where p.user_id = $1
-        and p.status = 'active'
-        and ps.superseded = false
-        and ps.scheduled_date between ($2::date - 2) and ($2::date + 2)
-        and not exists (
-          select 1 from activities a
-           where a.session_id = ps.id
-             and a.strava_activity_id <> $3
-             and a.match_status <> 'ignored')`,
-    [conn.user_id, localDate, activity.id],
-  );
-
-  const matched = matchSession({ localDate, distance_m }, candidates);
   const activityId = randomUUID();
 
-  // On update events keep anything a human already decided (confirmed/ignored).
+  // On update events the athlete's choice (session_id / match_status) is never touched.
   const [row] = await query<{ id: string; session_id: string | null; memo: string | null; rpe: number | null }>(
     `insert into activities
        (id, user_id, strava_activity_id, session_id, start_time, distance_m, moving_time_sec,
         avg_pace_sec_km, avg_hr, max_hr, avg_watts, kcal, description, device_name, gear_id, gear_name,
         splits, match_status, raw, sport_type)
-     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+     values ($1, $2, $3, null, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'unplanned', $17, $18)
      on conflict (strava_activity_id) do update set
        sport_type      = excluded.sport_type,
        start_time      = excluded.start_time,
@@ -107,17 +86,12 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
        gear_id         = excluded.gear_id,
        gear_name       = coalesce(excluded.gear_name, activities.gear_name),
        splits          = excluded.splits,
-       raw             = excluded.raw,
-       session_id      = case when activities.match_status in ('confirmed', 'ignored')
-                              then activities.session_id else excluded.session_id end,
-       match_status    = case when activities.match_status in ('confirmed', 'ignored')
-                              then activities.match_status else excluded.match_status end
+       raw             = excluded.raw
      returning id, session_id, memo, rpe`,
     [
       activityId,
       conn.user_id,
       activity.id,
-      matched?.id ?? null,
       new Date(activity.start_date),
       distance_m,
       moving_time_sec,
@@ -131,7 +105,6 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
       activity.gear_id ?? activity.gear?.id ?? null,
       activity.gear?.name ?? null,
       JSON.stringify(activity.splits_metric ?? null),
-      matched ? "auto" : "unplanned",
       JSON.stringify(activity),
       activity.sport_type ?? activity.type,
     ],
@@ -139,11 +112,12 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
 
   console.log(
     `activity ${activity.id} (${localDate}, ${activity.sport_type}, ${(distance_m / 1000).toFixed(2)} km) -> ` +
-      (row.session_id ? `session ${row.session_id}` : "unplanned"),
+      (row.session_id ? `session ${row.session_id}` : "waiting for the athlete to pick a session"),
   );
 
-  // Automatic verdict (AUTO_REVIEW=true): runs only, once per activity, never
-  // over a manual review. A Claude failure must not requeue the activity.
+  // Claude verdict (AUTO_REVIEW=true): only once the athlete has assigned the
+  // activity to a session (the api requeues it then), runs only, once per
+  // activity, never over a manual review. A Claude failure must not requeue.
   if (process.env.AUTO_REVIEW === "true" && isRun && row.session_id) {
     const existing = await queryOne<{ id: string }>("select id from reviews where activity_id = $1", [row.id]);
     if (!existing) {

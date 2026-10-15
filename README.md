@@ -35,7 +35,7 @@ cp .env.example .env
 | `STRAVA_VERIFY_TOKEN` | 自己亂打一串，註冊 webhook 時 Strava 會拿它來驗證 |
 | `ANTHROPIC_API_KEY` | 週總結用 |
 | `CLAUDE_MODEL` | 預設 `claude-haiku-4-5` |
-| `AUTO_REVIEW` | `true`（預設）：worker 每筆配對到課表的跑步都請 Claude 寫判定；`false` 關掉 |
+| `AUTO_REVIEW` | `true`（預設）：使用者把活動對應到課表後，worker 請 Claude 寫判定；`false` 關掉 |
 | `STAGE` | 預設 `prod`，決定所有資源名稱的後綴 |
 | `CORS_ORIGIN` | 逗號分隔，例如 `https://training.pages.dev,http://localhost:5173`；同時是 API CORS 和 Cognito 的 callback / logout URL |
 | `COGNITO_DOMAIN_PREFIX` | hosted UI 網域前綴，預設 `training-api-prod-<account id>` |
@@ -190,11 +190,11 @@ Aurora 閒置 5 分鐘會 pause，之後第一個請求要等它醒（15〜30 �
 
 - `GET <ApiUrl>/me` → `MeResponse { user, strava, strava_connect_url }`：目前使用者（`users.id`、名字、email）、Strava 連結狀態（`null` 表示還沒連）、以及連結 Strava 要開的網址。前端的設定頁用這支。
 - `DELETE <ApiUrl>/me/strava` → `{ ok: true }`：解除 Strava 連結。會先向 Strava 撤銷授權（失敗也照刪），再刪掉 `strava_connections` 那列；已匯入的 activities 保留。
-- `GET <ApiUrl>/plan` → `PlanResponse { plan, weeks, sessions, activities }`：active plan、每週階段/重點、未 superseded 的 sessions（含原始 `label`、`content`、`target` 原文、配速/心拍上下限、`week_no`、`phase`）、已配對的 activities（含 `review`、最高心拍、功率、卡路里、鞋、裝置、天氣、每公里分段）。
-- `GET <ApiUrl>/activities?status=unplanned` → `ActivitiesResponse`，`status` 可為 `auto | confirmed | unplanned | ignored`，省略則全部。
+- `GET <ApiUrl>/plan` → `PlanResponse { plan, weeks, sessions, activities, unassigned }`：active plan、每週階段/重點、未 superseded 的 sessions（含原始 `label`、`content`、`target` 原文、配速/心拍上下限、`week_no`、`phase`）、已對應的 activities、`unassigned`（最近 45 天還沒對應的活動，任何運動）（含 `review`、最高心拍、功率、卡路里、鞋、裝置、天氣、每公里分段）。
+- `GET <ApiUrl>/activities?status=unplanned` → `ActivitiesResponse`（所有運動；不會自動配對，`unplanned` 是等使用者選的），`status` 可為 `auto | confirmed | unplanned | ignored`，省略則全部。
 - `PUT <ApiUrl>/activities/{id}/review` body `PutReviewRequest { verdict, comment?, reminders?, rpe? }` → 手動判定，會覆蓋 Claude 的。
 - `PUT <ApiUrl>/activities/{id}/memo` body `PutMemoRequest { memo, rpe? }` → 跑者自己的心得和 RPE（1〜10）。存完如果那筆的判定是 Claude 寫的，會刪掉重評，新的判定會參考這段自述；手動判定不動。
-- `PUT <ApiUrl>/activities/{id}/session` body `PutSessionRequest { session_id, status? }` → 手動指定這筆活動是哪天的課（`confirmed`）。原本 `auto` 占著那個 session 的活動會退回 `unplanned`；`confirmed` 占著回 409。指定後舊的 Claude 判定刪掉、丟回 SQS 用新課表重評。`session_id: null` 配 `status: "ignored"` 表示這筆不算。
+- `PUT <ApiUrl>/activities/{id}/session` body `PutSessionRequest { session_id, memo?, rpe?, replace?, status? }` → 使用者指定這筆活動是哪堂課（`confirmed`），可同時帶心得與 RPE。原本 `auto` 占著那個 session 的活動會退回 `unplanned`；`confirmed` 占著回 409（帶 `replace: true` 才換）。指定後舊的 Claude 判定刪掉、丟回 SQS 重評一次。`session_id: null` 配 `status: "ignored"` 表示這筆不算。
 
 ## 心得 vs 判定
 
@@ -203,20 +203,19 @@ Aurora 閒置 5 分鐘會 pause，之後第一個請求要等它醒（15〜30 �
 
 ## 判定（reviews）
 
-- 來源兩種：`source = 'claude'`（worker 在 `AUTO_REVIEW=true` 時自動寫，每筆 activity 只寫一次，不覆蓋既有）、`source = 'manual'`（`PUT …/review`，或 seed 從 xlsx V/L/W 欄帶入）。手動永遠贏。
+- 來源兩種：`source = 'claude'`（worker 在 `AUTO_REVIEW=true` 且活動已被使用者對應到課表時寫，每筆 activity 只寫一次，不覆蓋既有）、`source = 'manual'`（`PUT …/review`，或 seed 從 xlsx V/L/W 欄帶入）。手動永遠贏。
 - `verdict` 只有 `達成 / 達成但有提醒 / 未達成`；「跳過」是課表層級的狀態，前端用「過去的 session 沒有配對 activity」自己判斷。
 - 天氣沒有自動來源：`activities.weather` 只在 seed 帶歷史值，之後為 null，前端沒值就不顯示。
 
-## 配對規則（`src/lib/matcher.ts`）
+## 配對（使用者自己選）
 
-所有運動都會存進 `activities`（`sport_type` 區分），但只有跑步（Strava `type = Run`）會自動配對和請 Claude 評；Hyrox、騎車之類存成 `unplanned`，要算進課表就用 `PUT …/session` 手動指給那天（例如 `肌力`）。
+Strava 同步進來的活動（所有運動）一律存成 `unplanned`、`session_id = null`，**不會自動配對，也不會自動請 Claude 評**。
 
-候選：該 user 的 active plan、活動日期 ±2 天、未 superseded、未被其他活動配走的 session（rest 不配）。
-1. 同一天 → 選距離最接近的。
-2. 沒有同一天 → 距離差 < 30% 的視為提前/延後，先看日期近的再看距離。
-3. 都沒有 → `match_status = 'unplanned'`、`session_id = null`。
+流程：前端今天頁列出 `/plan` 回的 `unassigned`（最近 45 天未對應的活動）→ 使用者點課表 → 選哪個活動是這堂課（一天多個活動也不會配錯）→ 填 RPE 與心得 → `PUT /activities/{id}/session`（`session_id` + `memo` + `rpe`）。這個請求把活動標成 `confirmed`、存心得、清掉舊的 Claude 判定並丟回 SQS，worker 只會請 Claude 評一次。
 
-配到的標 `auto`，不會自動變 `confirmed`。update 事件重跑時，已經是 `confirmed` / `ignored` 的不會被覆蓋。
+- 同一個 session 只能有一個活動。已 `confirmed` 的持有者要換掉得帶 `replace: true`，否則 409。
+- `{ session_id: null, status: "ignored" }` 把活動排除在清單外；`{ session_id: null }` 退回 `unplanned`。
+- 重跑 Strava update 事件不會動使用者的選擇。
 
 ## 週總結（`src/handlers/weekly.ts`）
 
@@ -229,7 +228,7 @@ training-api/
 ├── infra/        CDK（bin/app.ts, lib/stack.ts）
 ├── src/
 │   ├── handlers/ webhook / worker / oauth / weekly / api
-│   ├── lib/      db（IAM token + pg Pool）、strava、matcher、claude
+│   ├── lib/      db（IAM token + pg Pool）、strava、claude
 │   └── types.ts  內部 row / Strava 型別
 ├── types/        api.ts — API request/response 型別（前端直接複製用）
 ├── sql/          schema.sql

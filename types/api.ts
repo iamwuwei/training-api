@@ -126,12 +126,18 @@ export interface PlanResponse {
   plan: ApiPlan;
   weeks: ApiWeek[];
   sessions: ApiSession[];    // not superseded, ordered by date
-  activities: ApiActivity[]; // matched to one of `sessions`, ordered by start_time
+  activities: ApiActivity[]; // assigned to one of `sessions`, ordered by start_time
+  /**
+   * Strava activities (any sport) of the last 45 days that are not assigned to a
+   * session yet, newest first. Today's activities and the candidates for the
+   * "which activity was this session?" picker come from here.
+   */
+  unassigned: ApiActivity[];
 }
 
 // ---- GET <ApiUrl>/activities?status=<MatchStatus> --------------------------------
-// Every activity Strava sent, runs and non-runs alike. `unplanned` ones are the
-// candidates for manual assignment; pick a target from PlanResponse.sessions.
+// Every activity Strava sent, runs and non-runs alike. Nothing is matched
+// automatically: `unplanned` ones wait for the athlete to pick a session.
 
 export interface ActivitiesQuery {
   status?: MatchStatus; // omit for all
@@ -142,18 +148,22 @@ export interface ActivitiesResponse {
 }
 
 // ---- PUT <ApiUrl>/activities/{id}/session --------------------------------------
-// Tell the system which planned session this activity fulfils.
-//   { session_id: "<uuid>" }               -> match_status "confirmed"; an `auto` holder of
-//                                              that session is bumped back to "unplanned";
-//                                              a "confirmed" holder makes this a 409.
-//                                              A Claude review is dropped and regenerated
-//                                              for the new session (arrives a few seconds later).
-//   { session_id: null, status: "ignored" } -> not a training run (keep it out of /plan)
+// The athlete says which planned session this activity fulfils, optionally with
+// their memo/RPE in the same call (one Claude review afterwards, not two).
+//   { session_id: "<uuid>", memo?, rpe?, replace? }
+//        -> match_status "confirmed". If another activity already holds the
+//           session: an `auto` one is bumped back to "unplanned"; a "confirmed"
+//           one is a 409 unless `replace: true`. The Claude review of this
+//           activity is regenerated (arrives a few seconds later; poll /plan).
+//   { session_id: null, status: "ignored" } -> not a training activity (kept out of lists)
 //   { session_id: null }                    -> back to "unplanned"
 
 export interface PutSessionRequest {
   session_id: string | null;
   status?: "unplanned" | "ignored"; // only when session_id is null; default "unplanned"
+  memo?: string | null;  // only with a session_id; omitted = leave the stored memo alone
+  rpe?: number | null;   // 1-10, same rule as memo
+  replace?: boolean;     // take the session over from a "confirmed" holder
 }
 
 export interface PutSessionResponse {
