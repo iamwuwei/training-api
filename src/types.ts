@@ -98,6 +98,7 @@ export interface ReviewRow {
   rpe: number | null;
   source: "manual" | "claude";
   model: string | null;
+  adjust_hint: string | null;
   created_at: Date;
 }
 
@@ -174,6 +175,8 @@ export interface ActivityReviewResult {
   verdict: Verdict;
   comment: string;
   reminders: string[];
+  /** One-line plan-adjustment suggestion for the weekly review, or null. */
+  adjust_hint: string | null;
 }
 
 export interface WeeklyAdjustment {
@@ -187,4 +190,16 @@ export interface WeeklyAdjustment {
 export interface WeeklyReviewResult {
   summary: string;
   adjustments: WeeklyAdjustment[];
+}
+
+/** What weekly_reviews.adjustments holds: the proposals plus what the athlete did with each. */
+export interface StoredAdjustment extends WeeklyAdjustment {
+  status: "pending" | "applied" | "dismissed";
+  decided_at?: string;         // ISO
+  applied_session_id?: string; // the new planned_sessions row after apply
+}
+export interface StoredAdjustments {
+  model: string;
+  hints?: string[];
+  items: StoredAdjustment[];
 }

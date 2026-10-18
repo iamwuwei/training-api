@@ -1,17 +1,28 @@
 import { randomUUID } from "node:crypto";
 import type { SQSHandler } from "aws-lambda";
 import { reviewActivity } from "../lib/claude";
-import { query, queryOne } from "../lib/db";
+import { loadReviewContext } from "../lib/context";
+import { isDbWaking, query, queryOne } from "../lib/db";
 import { getActivity, refreshToken, StravaError } from "../lib/strava";
 import type { PlannedSessionRow, StravaConnectionRow, StravaWebhookEvent } from "../types";
 
 // Any thrown error => SQS redelivers (visibility 90 s, 3 tries, then DLQ).
-// That covers Aurora waking up from 0 ACU.
+// Aurora resuming from 0 ACU is the usual first failure: wait inside this run
+// and try once more (the Lambda has 90 s) before leaving it to SQS.
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export const handler: SQSHandler = async (event) => {
   for (const record of event.Records) {
     const body = JSON.parse(record.body) as StravaWebhookEvent;
-    await processEvent(body);
+    try {
+      await processEvent(body);
+    } catch (err) {
+      if (!isDbWaking(err)) throw err;
+      console.warn("database waking up, retrying in 8 s:", err instanceof Error ? err.message : err);
+      await sleep(8_000);
+      await processEvent(body);
+    }
   }
 };
 
@@ -120,7 +131,10 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
   // a manual review. Any sport counts (e.g. Hyrox on a 肌力 day). A Claude
   // failure must not requeue.
   if (process.env.AUTO_REVIEW === "true" && row.session_id) {
-    const existing = await queryOne<{ id: string }>("select id from reviews where activity_id = $1", [row.id]);
+    const existing = await queryOne<{ id: string }>(
+      "select id from reviews where activity_id = $1 and not (source = 'claude' and verdict is null)",
+      [row.id],
+    );
     if (!existing) {
       const session = await queryOne<PlannedSessionRow>(
         "select *, to_char(scheduled_date, 'YYYY-MM-DD') as scheduled_date from planned_sessions where id = $1",
@@ -128,10 +142,12 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
       );
       if (session) {
         try {
+          const context = await loadReviewContext(conn.user_id, session, localDate, row.id);
           const r = await reviewActivity({
             session,
             activity: {
               sport_type: activity.sport_type ?? activity.type,
+              start_date: localDate,
               distance_m,
               moving_time_sec,
               avg_pace_sec_km,
@@ -142,16 +158,30 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
               memo: row.memo,
               rpe: row.rpe,
             },
+            context,
           });
+          // A failed attempt (verdict null) from an earlier delivery is replaced; a real review is kept.
+          await query(
+            `insert into reviews (id, activity_id, verdict, comment, reminders, source, model, adjust_hint)
+             values ($1, $2, $3, $4, $5, 'claude', $6, $7)
+             on conflict (activity_id) do update set
+               verdict = excluded.verdict, comment = excluded.comment, reminders = excluded.reminders,
+               model = excluded.model, adjust_hint = excluded.adjust_hint, created_at = now()
+             where reviews.source = 'claude' and reviews.verdict is null`,
+            [randomUUID(), row.id, r.verdict, r.comment, JSON.stringify(r.reminders), r.model, r.adjust_hint],
+          );
+          console.log(`review for activity ${activity.id}: ${r.verdict} (${r.reminders.length} reminders)${r.adjust_hint ? ` hint: ${r.adjust_hint}` : ""}`);
+        } catch (err) {
+          // Not requeued (SQS would only retry the same failure). Recorded so the
+          // app can show "分析失敗" with a retry instead of waiting forever.
+          console.error(`auto review failed for activity ${activity.id}`, err);
+          const reason = err instanceof Error ? err.message.slice(0, 300) : String(err);
           await query(
             `insert into reviews (id, activity_id, verdict, comment, reminders, source, model)
-             values ($1, $2, $3, $4, $5, 'claude', $6)
+             values ($1, $2, null, $3, '[]', 'claude', null)
              on conflict (activity_id) do nothing`,
-            [randomUUID(), row.id, r.verdict, r.comment, JSON.stringify(r.reminders), r.model],
+            [randomUUID(), row.id, `分析失敗：${reason}`],
           );
-          console.log(`review for activity ${activity.id}: ${r.verdict} (${r.reminders.length} reminders)`);
-        } catch (err) {
-          console.error(`auto review failed for activity ${activity.id}`, err);
         }
       }
     }

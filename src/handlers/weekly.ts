@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { weeklyReview } from "../lib/claude";
-import { query } from "../lib/db";
-import type { ActivityRow, PlanRow, PlannedSessionRow } from "../types";
+import { historyBetween, loadPlanWeeks } from "../lib/context";
+import { query, queryOne } from "../lib/db";
+import type { PlanRow, PlannedSessionRow, StoredAdjustments } from "../types";
 
 // EventBridge Scheduler fires this every Sunday 21:00 Asia/Tokyo.
 // Optional manual invoke: { "week_start": "YYYY-MM-DD" } (a Monday) to backfill.
@@ -29,7 +30,7 @@ function currentWeekStartJst(): string {
 export const handler = async (event: { week_start?: string } = {}) => {
   const weekStart = event.week_start ?? currentWeekStartJst();
   const weekEnd = addDays(weekStart, 6);
-  const upcomingEnd = addDays(weekStart, 20);
+  const upcomingEnd = addDays(weekStart, 27); // next three weeks are adjustable
 
   const plans = await query<PlanRow & { display_name: string }>(
     `select p.*, to_char(p.race_date, 'YYYY-MM-DD') as race_date, u.display_name
@@ -54,27 +55,37 @@ export const handler = async (event: { week_start?: string } = {}) => {
         order by planned_sessions.scheduled_date`,
       [plan.id, addDays(weekEnd, 1), upcomingEnd],
     );
-    const activities = await query<ActivityRow>(
-      `select id, user_id, strava_activity_id, session_id, sport_type, start_time, distance_m, moving_time_sec,
-              avg_pace_sec_km, avg_hr, max_hr, avg_watts, kcal, description, device_name, gear_id,
-              gear_name, weather, memo, rpe, memo_updated_at, splits, match_status
-         from activities
-        where user_id = $1
-          and match_status <> 'ignored'
-          and (session_id is not null or sport_type is null or sport_type in ('Run', 'TrailRun', 'VirtualRun'))
-          and (start_time at time zone 'Asia/Tokyo')::date between $2 and $3
-        order by start_time`,
+    const activities = await historyBetween(plan.user_id, weekStart, weekEnd);
+    const hints = (await query<{ adjust_hint: string }>(
+      `select r.adjust_hint from reviews r join activities a on a.id = r.activity_id
+        where a.user_id = $1 and r.adjust_hint is not null
+          and (a.start_time at time zone 'Asia/Tokyo')::date between $2 and $3
+        order by a.start_time`,
       [plan.user_id, weekStart, weekEnd],
+    )).map((r) => r.adjust_hint);
+    const previous = await queryOne<{ summary: string | null }>(
+      "select summary from weekly_reviews where plan_id = $1 and week_start < $2 order by week_start desc limit 1",
+      [plan.id, weekStart],
     );
+    const weeks = await loadPlanWeeks(plan.id);
 
-    const review = await weeklyReview({ plan, weekStart, weekEnd, sessions, activities, upcoming });
+    const review = await weeklyReview({
+      plan, weeks, weekStart, weekEnd, sessions, activities, hints,
+      previousSummary: previous?.summary ?? null, upcoming,
+    });
 
-    // v1: record only. Adjustments are NOT applied automatically.
+    // Proposals only: each adjustment waits for the athlete to apply or dismiss it
+    // in the app (POST /weekly/{id}/adjustments/{index}).
+    const stored: StoredAdjustments = {
+      model: review.model,
+      hints,
+      items: review.adjustments.map((a) => ({ ...a, status: "pending" })),
+    };
     const id = randomUUID();
     await query(
       `insert into weekly_reviews (id, plan_id, week_start, summary, adjustments)
        values ($1, $2, $3, $4, $5)`,
-      [id, plan.id, weekStart, review.summary, JSON.stringify({ model: review.model, items: review.adjustments })],
+      [id, plan.id, weekStart, review.summary, JSON.stringify(stored)],
     );
     results.push({ plan_id: plan.id, review_id: id, adjustments: review.adjustments.length });
     console.log(`weekly review ${id} for plan ${plan.id} (${plan.display_name}) week ${weekStart}: ${review.adjustments.length} adjustments`);

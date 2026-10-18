@@ -49,6 +49,7 @@ export class TrainingApiStack extends cdk.Stack {
     const claudeEnv = {
       ANTHROPIC_API_KEY: required("ANTHROPIC_API_KEY"),
       CLAUDE_MODEL: process.env.CLAUDE_MODEL ?? "claude-haiku-4-5",
+      CLAUDE_MODEL_WEEKLY: process.env.CLAUDE_MODEL_WEEKLY ?? "claude-sonnet-5-5",
     };
     // Comma-separated front-end origins, e.g. "https://training.pages.dev,http://localhost:5173"
     const corsOrigins = (process.env.CORS_ORIGIN ?? "https://iamwuwei.github.io")
@@ -207,7 +208,7 @@ export class TrainingApiStack extends cdk.Stack {
       apiName: name(),
       corsPreflight: {
         allowOrigins: corsOrigins,
-        allowMethods: [apigw.CorsHttpMethod.GET, apigw.CorsHttpMethod.PUT, apigw.CorsHttpMethod.DELETE, apigw.CorsHttpMethod.OPTIONS],
+        allowMethods: [apigw.CorsHttpMethod.GET, apigw.CorsHttpMethod.POST, apigw.CorsHttpMethod.PUT, apigw.CorsHttpMethod.DELETE, apigw.CorsHttpMethod.OPTIONS],
         allowHeaders: ["content-type", "authorization"],
         maxAge: cdk.Duration.hours(1),
       },
@@ -222,6 +223,9 @@ export class TrainingApiStack extends cdk.Stack {
       ["/activities/{id}/review", [apigw.HttpMethod.PUT]],
       ["/activities/{id}/session", [apigw.HttpMethod.PUT]],
       ["/activities/{id}/memo", [apigw.HttpMethod.PUT]],
+      ["/activities/{id}/rereview", [apigw.HttpMethod.POST]],
+      ["/weekly", [apigw.HttpMethod.GET]],
+      ["/weekly/{id}/adjustments/{index}", [apigw.HttpMethod.POST]],
     ] as const) {
       httpApi.addRoutes({ path: p, methods: [...methods], integration, authorizer });
     }

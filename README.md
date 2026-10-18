@@ -34,7 +34,8 @@ cp .env.example .env
 | `STRAVA_CLIENT_ID` / `STRAVA_CLIENT_SECRET` | https://www.strava.com/settings/api |
 | `STRAVA_VERIFY_TOKEN` | 自己亂打一串，註冊 webhook 時 Strava 會拿它來驗證 |
 | `ANTHROPIC_API_KEY` | 週總結用 |
-| `CLAUDE_MODEL` | 預設 `claude-haiku-4-5` |
+| `CLAUDE_MODEL` | 單次判定，預設 `claude-haiku-4-5` |
+| `CLAUDE_MODEL_WEEKLY` | 週總結，預設 `claude-sonnet-5-5`（一週一次，讀整份課表＋兩週資料） |
 | `AUTO_REVIEW` | `true`（預設）：使用者把活動對應到課表後，worker 請 Claude 寫判定；`false` 關掉 |
 | `STAGE` | 預設 `prod`，決定所有資源名稱的後綴 |
 | `CORS_ORIGIN` | 逗號分隔，例如 `https://training.pages.dev,http://localhost:5173`；同時是 API CORS 和 Cognito 的 callback / logout URL |
@@ -193,13 +194,18 @@ Aurora 閒置 5 分鐘會 pause，之後第一個請求要等它醒（15〜30 �
 - `GET <ApiUrl>/plan` → `PlanResponse { plan, weeks, sessions, activities, unassigned }`：active plan、每週階段/重點、未 superseded 的 sessions（含原始 `label`、`content`、`target` 原文、配速/心拍上下限、`week_no`、`phase`）、已對應的 activities、`unassigned`（最近 45 天還沒對應的活動，任何運動）（含 `review`、最高心拍、功率、卡路里、鞋、裝置、天氣、每公里分段）。
 - `GET <ApiUrl>/activities?status=unplanned` → `ActivitiesResponse`（所有運動；不會自動配對，`unplanned` 是等使用者選的），`status` 可為 `auto | confirmed | unplanned | ignored`，省略則全部。
 - `PUT <ApiUrl>/activities/{id}/review` body `PutReviewRequest { verdict, comment?, reminders?, rpe? }` → 手動判定，會覆蓋 Claude 的。
+- `POST <ApiUrl>/activities/{id}/rereview` → 刪掉 Claude 判定、丟回 SQS 重評（202）。沒有對應課表或有手動判定回 409。
+- `GET <ApiUrl>/weekly` → `WeeklyResponse { reviews }`：每週總結（最新在前）與調整建議，每條建議有 `status: pending | applied | dismissed`。
+- `POST <ApiUrl>/weekly/{id}/adjustments/{index}` body `{ action: "apply" | "dismiss" }` → 採用會新增一筆 `version+1` 的 planned_session、舊的標 `superseded`、活動跟著搬；`/plan` 立刻反映。
 - `PUT <ApiUrl>/activities/{id}/memo` body `PutMemoRequest { memo, rpe? }` → 跑者自己的心得和 RPE（1〜10）。存完如果那筆的判定是 Claude 寫的，會刪掉重評，新的判定會參考這段自述；手動判定不動。
 - `PUT <ApiUrl>/activities/{id}/session` body `PutSessionRequest { session_id, memo?, rpe?, replace?, status? }` → 使用者指定這筆活動是哪堂課（`confirmed`），可同時帶心得與 RPE。原本 `auto` 占著那個 session 的活動會退回 `unplanned`；`confirmed` 占著回 409（帶 `replace: true` 才換）。指定後舊的 Claude 判定刪掉、丟回 SQS 重評一次。`session_id: null` 配 `status: "ignored"` 表示這筆不算。
 
 ## 心得 vs 判定
 
 - **跑者這邊**：`activities.memo` / `rpe`（app 裡寫，`PUT …/memo`），`activities.description`（Strava 上寫的，自動同步）。前端顯示 `memo ?? description`。
-- **教練這邊**：`reviews`（Claude 或手動的 verdict / comment / reminders）。每筆活動的判定會把跑者自己寫的 RPE 和心得連同數據一起給 Claude，並要求評語直接回應自述；每週總結也會帶入該週每筆活動的自述。非跑步活動（重訓、Hyrox）對應到課表後也會被評，只是不看配速與距離。
+- **教練這邊**：`reviews`（Claude 或手動的 verdict / comment / reminders / adjust_hint）。每次判定 Claude 拿到的是（`src/lib/context.ts`）：跑者目標與距離比賽幾週、整份課表的階段、本週課表與完成狀況、最近 14 天的練習（數據、判定、RPE、心得）、同類型上 5 次、上一次的提醒，再加上今天的課和數據。**判定只看數據**，自述不能放寬判定（提到疼痛可以往嚴的方向壓一級）；自述和歷史用在評語與提醒。`adjust_hint` 是給週總結的一句調整提示，不會直接改課表。非跑步活動（重訓、Hyrox）對應到課表後也會被評，只是不看配速與距離。
+- Claude 失敗（API key、額度、拒答）時 worker 會寫一筆 `verdict null`、`comment = 分析失敗：…` 的 claude review，API 回 `review.failed = true`；前端顯示失敗並提供 `POST …/rereview` 重新分析。不會經 SQS 重試（同樣的錯重試也一樣）。
+- worker 遇到 Aurora 冷啟動（連線逾時）會在同一次執行內等 8 秒再試一次，之後才交給 SQS 重送。
 
 ## 判定（reviews）
 
@@ -219,7 +225,11 @@ Strava 同步進來的活動（所有運動）一律存成 `unplanned`、`sessio
 
 ## 週總結（`src/handlers/weekly.ts`）
 
-每週日 21:00 JST 對每個 active plan 抓本週（一〜日）的課表和活動，加上接下來兩週的課表，請 Claude 回 `{ summary, adjustments[] }`，整包寫進 `weekly_reviews`。**第一版只記錄不套用 adjustments。** 要補跑某一週：在 Lambda console 用 `{"week_start": "2026-10-12"}`（週一）手動 invoke。
+每週日 21:00 JST（EventBridge Scheduler）對每個 active plan 跑一次，用 `CLAUDE_MODEL_WEEKLY`。輸入：目標、課表階段、上週總結、本週課表、本週每筆活動（含判定、RPE、心得）、單次判定留下的 `adjust_hint`、接下來三週的課表。輸出 `summary` 和 `adjustments`，存進 `weekly_reviews`，每條建議 `status = pending`。
+
+**建議不會自動套用。** 前端顯示建議，跑者按「採用」才呼叫 `POST /weekly/{id}/adjustments/{index}`；採用是版本化的（舊 session `superseded`、新 session `version+1`），原始課表還在。
+
+手動補跑某一週：`aws lambda invoke --function-name training-api-weekly-prod --payload '{"week_start":"2026-10-12"}' out.json`。
 
 ## 檔案
 

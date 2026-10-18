@@ -3,7 +3,7 @@ import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyResultV2 } from "aws-lambda";
 import { isDbWaking, query, queryOne } from "../lib/db";
 import { deauthorize } from "../lib/strava";
-import type { ActivityRow, PlanRow, PlanWeekRow, PlannedSessionRow, ReviewRow, StravaConnectionRow, UserRow } from "../types";
+import type { ActivityRow, PlanRow, PlanWeekRow, PlannedSessionRow, ReviewRow, StoredAdjustments, StravaConnectionRow, UserRow, WeeklyReviewRow } from "../types";
 import type {
   ActivitiesResponse,
   ApiActivity,
@@ -19,6 +19,11 @@ import type {
   PutSessionResponse,
   PutMemoRequest,
   PutMemoResponse,
+  RereviewResponse,
+  WeeklyResponse,
+  ApiWeeklyReview,
+  PostAdjustmentRequest,
+  PostAdjustmentResponse,
 } from "../../types/api";
 
 // Lambda training-api-prod. Behind API Gateway (HTTP API) with a Cognito JWT authorizer: by the time we
@@ -32,6 +37,9 @@ import type {
 //   PUT /activities/{id}/review      set a manual verdict
 //   PUT /activities/{id}/session     the athlete's pick: which planned session this activity was (+ memo/RPE), or ignore it
 //   PUT /activities/{id}/memo        athlete's own note + RPE (re-triggers the Claude review)
+//   POST /activities/{id}/rereview   drop the Claude review (failed or stale) and queue a new one
+//   GET /weekly                      weekly coach reviews with their adjustment proposals
+//   POST /weekly/{id}/adjustments/{index}   apply or dismiss one proposal
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const STATUSES = new Set<string>(["auto", "confirmed", "unplanned", "ignored"] satisfies MatchStatus[]);
@@ -39,7 +47,7 @@ const VERDICTS = new Set<string>(["達成", "達成但有提醒", "未達成"]);
 
 const sqs = new SQSClient({});
 
-const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | PutSessionResponse | PutMemoResponse | ErrorResponse>(
+const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | PutSessionResponse | PutMemoResponse | RereviewResponse | WeeklyResponse | PostAdjustmentResponse | ErrorResponse>(
   statusCode: number,
   body: T,
 ): APIGatewayProxyResultV2 => ({
@@ -97,13 +105,19 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
   if (method === "GET" && path === "/plan") return getPlan(user.id);
   if (method === "GET" && path === "/activities") return getActivities(user.id, q.status);
 
+  const raw = event.isBase64Encoded ? Buffer.from(event.body ?? "", "base64").toString("utf8") : event.body ?? "";
   const sub = /^\/activities\/([^/]+)\/(review|session|memo)$/.exec(path);
   if (method === "PUT" && sub) {
-    const raw = event.isBase64Encoded ? Buffer.from(event.body ?? "", "base64").toString("utf8") : event.body ?? "";
     if (sub[2] === "review") return putReview(user.id, sub[1], raw);
     if (sub[2] === "session") return putSession(user.id, sub[1], raw);
     return putMemo(user.id, sub[1], raw);
   }
+  const re = /^\/activities\/([^/]+)\/rereview$/.exec(path);
+  if (method === "POST" && re) return rereview(user.id, re[1]);
+
+  if (method === "GET" && path === "/weekly") return getWeekly(user.id);
+  const adj = /^\/weekly\/([^/]+)\/adjustments\/(\d+)$/.exec(path);
+  if (method === "POST" && adj) return postAdjustment(user.id, adj[1], Number(adj[2]), raw);
 
   return json(404, { error: "not found" });
 }
@@ -131,7 +145,7 @@ const ACTIVITY_SELECT = `
   a.avg_pace_sec_km, a.avg_hr, a.max_hr, a.avg_watts, a.kcal, a.description, a.device_name, a.gear_id,
   a.gear_name, a.weather, a.memo, a.rpe, a.memo_updated_at, a.splits, a.match_status,
   r.verdict as r_verdict, r.comment as r_comment, r.reminders as r_reminders,
-  r.source as r_source, r.model as r_model, r.created_at as r_created_at`;
+  r.source as r_source, r.model as r_model, r.adjust_hint as r_adjust_hint, r.created_at as r_created_at`;
 
 type ActivityJoined = Omit<ActivityRow, "raw"> & {
   r_verdict: ReviewRow["verdict"];
@@ -139,22 +153,27 @@ type ActivityJoined = Omit<ActivityRow, "raw"> & {
   r_reminders: string[] | null;
   r_source: ReviewRow["source"] | null;
   r_model: string | null;
+  r_adjust_hint: string | null;
   r_created_at: Date | null;
 };
 
-function toApiReview(r: Pick<ReviewRow, "verdict" | "comment" | "reminders" | "source" | "model" | "created_at">): ApiReview {
+function toApiReview(r: Pick<ReviewRow, "verdict" | "comment" | "reminders" | "source" | "model" | "adjust_hint" | "created_at">): ApiReview {
+  const failed = r.source === "claude" && r.verdict === null;
   return {
     verdict: r.verdict,
-    comment: r.comment,
+    comment: failed ? null : r.comment,
     reminders: r.reminders ?? [],
     source: r.source,
     model: r.model,
+    adjust_hint: r.adjust_hint ?? null,
+    failed,
+    error: failed ? (r.comment ?? "").replace(/^分析失敗：/, "") || "unknown" : null,
     created_at: new Date(r.created_at).toISOString(),
   };
 }
 
 function toApiActivity(a: ActivityJoined): ApiActivity {
-  const { r_verdict, r_comment, r_reminders, r_source, r_model, r_created_at, ...rest } = a;
+  const { r_verdict, r_comment, r_reminders, r_source, r_model, r_adjust_hint, r_created_at, ...rest } = a;
   return {
     ...rest,
     start_time: new Date(a.start_time).toISOString(),
@@ -163,7 +182,7 @@ function toApiActivity(a: ActivityJoined): ApiActivity {
     review: r_created_at
       ? toApiReview({
           verdict: r_verdict, comment: r_comment, reminders: r_reminders,
-          source: r_source ?? "manual", model: r_model, created_at: r_created_at,
+          source: r_source ?? "manual", model: r_model, adjust_hint: r_adjust_hint, created_at: r_created_at,
         })
       : null,
   };
@@ -270,11 +289,11 @@ async function putReview(userId: string, activityId: string, raw: string) {
   if (!owned) return json(404, { error: "activity not found" });
 
   const [review] = await query<ReviewRow>(
-    `insert into reviews (id, activity_id, verdict, comment, reminders, source, model)
-     values ($1, $2, $3, $4, $5, 'manual', null)
+    `insert into reviews (id, activity_id, verdict, comment, reminders, source, model, adjust_hint)
+     values ($1, $2, $3, $4, $5, 'manual', null, null)
      on conflict (activity_id) do update set
        verdict = excluded.verdict, comment = excluded.comment, reminders = excluded.reminders,
-       source = 'manual', model = null, created_at = now()
+       source = 'manual', model = null, adjust_hint = null, created_at = now()
      returning *`,
     [randomUUID(), activityId, body.verdict, body.comment ?? null, JSON.stringify(reminders)],
   );
@@ -416,4 +435,130 @@ async function putMemo(userId: string, activityId: string, raw: string) {
     [activityId],
   );
   return json<PutMemoResponse>(200, { activity: toApiActivity(row) });
+}
+
+/** Drop the Claude review (failed, stale or just unwanted) and have the worker write a new one. */
+async function rereview(userId: string, activityId: string) {
+  if (!UUID_RE.test(activityId)) return json(400, { error: "invalid activity id" });
+  const activity = await queryOne<{ id: string; strava_activity_id: string; session_id: string | null }>(
+    "select id, strava_activity_id, session_id from activities where id = $1 and user_id = $2",
+    [activityId, userId],
+  );
+  if (!activity) return json(404, { error: "activity not found" });
+  if (!activity.session_id) return json(409, { error: "assign the activity to a session first" });
+  const manual = await queryOne<{ id: string }>("select id from reviews where activity_id = $1 and source = 'manual'", [activityId]);
+  if (manual) return json(409, { error: "a manual review is kept; remove it first" });
+
+  await query("delete from reviews where activity_id = $1 and source = 'claude'", [activityId]);
+  await requeue(userId, activity.strava_activity_id, "rereview requested");
+  return json<RereviewResponse>(202, { queued: true });
+}
+
+// ---- weekly reviews & adjustment proposals -----------------------------------
+
+function toApiWeekly(w: WeeklyReviewRow): ApiWeeklyReview {
+  const stored = (w.adjustments ?? { model: null, items: [] }) as Partial<StoredAdjustments>;
+  return {
+    id: w.id,
+    week_start: w.week_start,
+    summary: w.summary,
+    model: stored.model ?? null,
+    adjustments: (stored.items ?? []).map((a, index) => ({
+      index,
+      session_id: a.session_id,
+      field: a.field,
+      old: a.old,
+      new: a.new,
+      reason: a.reason,
+      status: a.status ?? "pending",
+      decided_at: a.decided_at ?? null,
+      applied_session_id: a.applied_session_id ?? null,
+    })),
+    created_at: new Date(w.created_at).toISOString(),
+  };
+}
+
+async function getWeekly(userId: string) {
+  const rows = await query<WeeklyReviewRow>(
+    `select w.id, w.plan_id, to_char(w.week_start, 'YYYY-MM-DD') as week_start, w.summary, w.adjustments, w.created_at
+       from weekly_reviews w join plans p on p.id = w.plan_id
+      where p.user_id = $1 and p.status = 'active'
+      order by w.week_start desc, w.created_at desc
+      limit 20`,
+    [userId],
+  );
+  return json<WeeklyResponse>(200, { reviews: rows.map(toApiWeekly) });
+}
+
+const ADJUST_FIELDS = new Set(["type", "target_distance_m", "target_pace_sec_km", "scheduled_date", "note"]);
+
+/**
+ * Apply or dismiss one proposal. Applying writes a new planned_sessions row (version+1),
+ * marks the old one superseded, and moves any activity over, so the original plan stays
+ * readable and the app's session ids keep working.
+ */
+async function postAdjustment(userId: string, weeklyId: string, index: number, raw: string) {
+  if (!UUID_RE.test(weeklyId)) return json(400, { error: "invalid weekly review id" });
+  let body: PostAdjustmentRequest;
+  try {
+    body = JSON.parse(raw) as PostAdjustmentRequest;
+  } catch {
+    return json(400, { error: "invalid json" });
+  }
+  if (body.action !== "apply" && body.action !== "dismiss") return json(400, { error: "action must be apply or dismiss" });
+
+  const w = await queryOne<WeeklyReviewRow>(
+    `select w.id, w.plan_id, to_char(w.week_start, 'YYYY-MM-DD') as week_start, w.summary, w.adjustments, w.created_at
+       from weekly_reviews w join plans p on p.id = w.plan_id
+      where w.id = $1 and p.user_id = $2`,
+    [weeklyId, userId],
+  );
+  if (!w) return json(404, { error: "weekly review not found" });
+  const stored = (w.adjustments ?? { model: null, items: [] }) as StoredAdjustments;
+  const item = stored.items?.[index];
+  if (!item) return json(404, { error: "adjustment not found" });
+  if (item.status && item.status !== "pending") return json(409, { error: `already ${item.status}` });
+
+  if (body.action === "apply") {
+    if (!ADJUST_FIELDS.has(item.field)) return json(400, { error: "unsupported field" });
+    const old = await queryOne<PlannedSessionRow>(
+      `select *, to_char(scheduled_date, 'YYYY-MM-DD') as scheduled_date
+         from planned_sessions where id = $1 and plan_id = $2 and superseded = false`,
+      [item.session_id, w.plan_id],
+    );
+    if (!old) return json(409, { error: "that session was already changed; dismiss this proposal" });
+
+    const next: Record<string, unknown> = { ...old, id: randomUUID(), version: old.version + 1, superseded: false };
+    next[item.field] = item.new;
+    if (item.field === "target_pace_sec_km" && typeof item.new === "number" && old.target_pace_sec_km) {
+      // Keep the allowed range the same width around the new midpoint.
+      const d = item.new - old.target_pace_sec_km;
+      if (old.target_pace_min_sec_km != null) next.target_pace_min_sec_km = old.target_pace_min_sec_km + d;
+      if (old.target_pace_max_sec_km != null) next.target_pace_max_sec_km = old.target_pace_max_sec_km + d;
+    }
+    await query(
+      `insert into planned_sessions
+         (id, plan_id, scheduled_date, week_no, phase, label, type, content, note, target, target_distance_m,
+          target_pace_sec_km, target_pace_min_sec_km, target_pace_max_sec_km, target_hr_min, target_hr_max, version, superseded)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, false)`,
+      [
+        next.id, old.plan_id, next.scheduled_date, old.week_no, old.phase, old.label, next.type, old.content, next.note,
+        old.target, next.target_distance_m, next.target_pace_sec_km, next.target_pace_min_sec_km, next.target_pace_max_sec_km,
+        old.target_hr_min, old.target_hr_max, next.version,
+      ],
+    );
+    await query("update planned_sessions set superseded = true where id = $1", [old.id]);
+    await query("update activities set session_id = $2 where session_id = $1", [old.id, next.id]);
+    item.applied_session_id = next.id as string;
+  }
+
+  item.status = body.action === "apply" ? "applied" : "dismissed";
+  item.decided_at = new Date().toISOString();
+  await query("update weekly_reviews set adjustments = $2 where id = $1", [w.id, JSON.stringify(stored)]);
+
+  const updated = await queryOne<WeeklyReviewRow>(
+    `select id, plan_id, to_char(week_start, 'YYYY-MM-DD') as week_start, summary, adjustments, created_at from weekly_reviews where id = $1`,
+    [w.id],
+  );
+  return json<PostAdjustmentResponse>(200, { review: toApiWeekly(updated!) });
 }

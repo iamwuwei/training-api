@@ -104,6 +104,7 @@ create table if not exists reviews (
 );
 alter table reviews add column if not exists reminders jsonb;                        -- string[]
 alter table reviews add column if not exists source text not null default 'manual'; -- manual | claude
+alter table reviews add column if not exists adjust_hint text;                      -- Claude's one-line plan-adjustment suggestion (weekly review input)
 
 create table if not exists weekly_reviews (
   id uuid primary key,

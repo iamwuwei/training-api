@@ -86,13 +86,21 @@ export interface ApiSplit {
   average_heartrate?: number;
 }
 
-/** Coach side (Claude or manual): the verdict on this activity. */
+/**
+ * Coach side (Claude or manual): the verdict on this activity.
+ * `failed` = Claude could not review it (API error, refusal …): verdict is null,
+ * `error` says why; POST …/rereview tries again. Nothing at all (activity.review
+ * null) with a session assigned = still being analysed.
+ */
 export interface ApiReview {
   verdict: Verdict | null;
   comment: string | null;     // coach comment paragraph
-  reminders: string[];        // 提醒 bullets
+  reminders: string[];        // 提醒 bullets, most important first
   source: "manual" | "claude";
   model: string | null;
+  adjust_hint: string | null; // one-line plan-adjustment suggestion for the weekly review
+  failed: boolean;
+  error: string | null;
   created_at: string;
 }
 
@@ -195,6 +203,57 @@ export interface PutMemoRequest {
 
 export interface PutMemoResponse {
   activity: ApiActivity;
+}
+
+// ---- POST <ApiUrl>/activities/{id}/rereview ------------------------------------
+// Drops the Claude review (failed or stale) and queues a new one; the result arrives
+// a few seconds to a minute later on /plan and /activities. 409 when the activity has no
+// session yet, or carries a manual review.
+
+export interface RereviewResponse {
+  queued: true;
+}
+
+// ---- GET <ApiUrl>/weekly -------------------------------------------------------
+// The coach's weekly reviews (newest first) with their adjustment proposals. A
+// proposal changes nothing until the athlete applies it.
+
+export interface ApiAdjustment {
+  index: number;              // position inside the review; the key for POST
+  session_id: string;         // the planned session (as it was when proposed)
+  field: "type" | "target_distance_m" | "target_pace_sec_km" | "scheduled_date" | "note";
+  old: string | number | null;
+  new: string | number | null;
+  reason: string;
+  status: "pending" | "applied" | "dismissed";
+  decided_at: string | null;
+  applied_session_id: string | null; // after apply: the new session row (the old one is superseded)
+}
+
+export interface ApiWeeklyReview {
+  id: string;
+  week_start: string; // 'YYYY-MM-DD' (Monday)
+  summary: string | null;
+  model: string | null;
+  adjustments: ApiAdjustment[];
+  created_at: string;
+}
+
+export interface WeeklyResponse {
+  reviews: ApiWeeklyReview[];
+}
+
+// ---- POST <ApiUrl>/weekly/{id}/adjustments/{index} -----------------------------
+// apply: a new version of that planned session is written and the old one superseded
+// (activities move with it; /plan reflects it immediately). dismiss: just recorded.
+// 409 when the proposal was already decided, or the session changed since.
+
+export interface PostAdjustmentRequest {
+  action: "apply" | "dismiss";
+}
+
+export interface PostAdjustmentResponse {
+  review: ApiWeeklyReview;
 }
 
 // ---- errors (any non-2xx) ----------------------------------------------------
