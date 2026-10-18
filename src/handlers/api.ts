@@ -598,6 +598,18 @@ function toApiCoachMessage(m: CoachMessageRow): ApiCoachMessage {
 }
 
 async function getCoach(userId: string) {
+  // Weekly reviews written before the thread existed (or whose post failed) get
+  // their message now, dated when the review was written so they sort in place.
+  await query(
+    `insert into coach_messages (id, user_id, role, kind, text, meta, weekly_review_id, status, created_at)
+     select gen_random_uuid(), p.user_id, 'coach', 'weekly', coalesce(w.summary, ''),
+            jsonb_build_object('week_start', to_char(w.week_start, 'YYYY-MM-DD'), 'backfilled', true),
+            w.id, 'sent', w.created_at
+       from weekly_reviews w join plans p on p.id = w.plan_id
+      where p.user_id = $1 and w.summary is not null
+        and not exists (select 1 from coach_messages m where m.weekly_review_id = w.id)`,
+    [userId],
+  );
   const rows = await query<CoachMessageRow>(
     "select * from coach_messages where user_id = $1 order by created_at desc limit 100",
     [userId],
