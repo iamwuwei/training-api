@@ -96,7 +96,10 @@ export const handler = async (event: APIGatewayProxyEventV2WithJWTAuthorizer): P
         body: JSON.stringify({ error: "database starting, retry shortly" } satisfies ErrorResponse),
       };
     }
-    throw err;
+    // Anything else: answer with the message instead of letting API Gateway turn it
+    // into a bare "Internal Server Error", so the app can show what went wrong.
+    console.error("api error:", err);
+    return json(500, { error: err instanceof Error ? err.message.slice(0, 300) : String(err) });
   }
 };
 
