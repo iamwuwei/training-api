@@ -36,6 +36,7 @@ cp .env.example .env
 | `ANTHROPIC_API_KEY` | 週總結用 |
 | `CLAUDE_MODEL` | 單次判定，預設 `claude-haiku-4-5` |
 | `CLAUDE_MODEL_WEEKLY` | 週總結，預設 `claude-sonnet-5-5`（一週一次，讀整份課表＋兩週資料） |
+| `CLAUDE_MODEL_COACH` | Woo 回話，預設 `claude-sonnet-5-5`，帶 web search（地點、路線、天氣、賽事會先查） |
 | `AUTO_REVIEW` | `true`（預設）：使用者把活動對應到課表後，worker 請 Claude 寫判定；`false` 關掉 |
 | `STAGE` | 預設 `prod`，決定所有資源名稱的後綴 |
 | `CORS_ORIGIN` | 逗號分隔，例如 `https://training.pages.dev,http://localhost:5173`；同時是 API CORS 和 Cognito 的 callback / logout URL |
@@ -229,7 +230,7 @@ Strava 同步進來的活動（所有運動）一律存成 `unplanned`、`sessio
 
 一條 `coach_messages` 對話串。週總結（`kind = weekly`）和每次跑完的判定（`kind = review`，`meta` 帶課名、判定、第一條提醒）由系統自動貼進去；跑者回話走 `POST /coach/messages` → SQS `{ type: "coach_reply" }` → worker 的 `answerCoachMessage`。
 
-Woo 拿到的：目標、課表階段、本週與下週課表（含完成狀況）、最近 14 天的練習（數據、判定、自述）、對話串最近 20 則，以及跑者引用的活動。模型 `CLAUDE_MODEL`（Haiku），回覆上限 400 tokens，2〜4 句。
+Woo 拿到的：目標、課表階段、本週與下週課表（含完成狀況）、最近 14 天的練習（數據、判定、自述）、對話串最近 20 則，以及跑者引用的活動。模型 `CLAUDE_MODEL_COACH`（Sonnet），可用 Anthropic 的 web search（一則最多 3 次，地點設東京），問到地點、路線、坡道、天氣、賽事會先查再答；回覆 2〜4 句，`meta.searches` 記錄查了幾次。
 
 範圍只限跑步、課表、比賽、恢復、睡眠補給、傷痛；離題一句話帶回來，叫它換角色或忘記規則也不理。它不能改課表，只能說明要在週回顧裡提出。回覆失敗時跑者的訊息標 `failed`（`meta.error`），前端顯示可以重送。
 

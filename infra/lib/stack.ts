@@ -50,6 +50,7 @@ export class TrainingApiStack extends cdk.Stack {
       ANTHROPIC_API_KEY: required("ANTHROPIC_API_KEY"),
       CLAUDE_MODEL: process.env.CLAUDE_MODEL ?? "claude-haiku-4-5",
       CLAUDE_MODEL_WEEKLY: process.env.CLAUDE_MODEL_WEEKLY ?? "claude-sonnet-5-5",
+      CLAUDE_MODEL_COACH: process.env.CLAUDE_MODEL_COACH ?? "claude-sonnet-5-5",
     };
     // Comma-separated front-end origins, e.g. "https://training.pages.dev,http://localhost:5173"
     const corsOrigins = (process.env.CORS_ORIGIN ?? "https://iamwuwei.github.io")

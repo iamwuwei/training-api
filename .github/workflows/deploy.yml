@@ -19,6 +19,7 @@ env:
   DB_USER: postgres
   CLAUDE_MODEL: claude-haiku-4-5
   CLAUDE_MODEL_WEEKLY: claude-sonnet-5-5
+  CLAUDE_MODEL_COACH: claude-sonnet-5-5
   AUTO_REVIEW: "true"
   STAGE: prod
   # logs the IAM auth token parameters (never the signature) from the api Lambda

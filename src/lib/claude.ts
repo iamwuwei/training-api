@@ -13,6 +13,8 @@ import type {
 export const DEFAULT_MODEL = "claude-haiku-4-5";
 /** The weekly review reads two weeks of data plus the whole plan: a stronger model, once a week. */
 export const DEFAULT_WEEKLY_MODEL = "claude-sonnet-5-5";
+/** The coach's chat replies: needs world knowledge (routes, terrain, the race) and web search. */
+export const DEFAULT_COACH_MODEL = "claude-sonnet-5-5";
 
 function client() {
   return new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -24,6 +26,10 @@ function model() {
 
 function weeklyModel() {
   return process.env.CLAUDE_MODEL_WEEKLY || DEFAULT_WEEKLY_MODEL;
+}
+
+export function coachModel(): string {
+  return process.env.CLAUDE_MODEL_COACH || DEFAULT_COACH_MODEL;
 }
 
 function pace(sec: number | null | undefined): string {
