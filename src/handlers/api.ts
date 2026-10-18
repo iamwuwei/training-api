@@ -2,8 +2,9 @@ import { randomUUID } from "node:crypto";
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyResultV2 } from "aws-lambda";
 import { isDbWaking, query, queryOne } from "../lib/db";
+import { COACH_NAME, MAX_MESSAGE_CHARS, postCoachMessage } from "../lib/coach";
 import { deauthorize } from "../lib/strava";
-import type { ActivityRow, PlanRow, PlanWeekRow, PlannedSessionRow, ReviewRow, StoredAdjustments, StravaConnectionRow, UserRow, WeeklyReviewRow } from "../types";
+import type { ActivityRow, CoachMessageRow, CoachReplyJob, PlanRow, PlanWeekRow, PlannedSessionRow, ReviewRow, StoredAdjustments, StravaConnectionRow, UserRow, WeeklyReviewRow } from "../types";
 import type {
   ActivitiesResponse,
   ApiActivity,
@@ -11,6 +12,7 @@ import type {
   ApiReview,
   ErrorResponse,
   MatchStatus,
+  Verdict,
   MeResponse,
   PlanResponse,
   PutReviewRequest,
@@ -24,6 +26,10 @@ import type {
   ApiWeeklyReview,
   PostAdjustmentRequest,
   PostAdjustmentResponse,
+  ApiCoachMessage,
+  CoachResponse,
+  PostCoachMessageRequest,
+  PostCoachMessageResponse,
 } from "../../types/api";
 
 // Lambda training-api-prod. Behind API Gateway (HTTP API) with a Cognito JWT authorizer: by the time we
@@ -40,6 +46,8 @@ import type {
 //   POST /activities/{id}/rereview   drop the Claude review (failed or stale) and queue a new one
 //   GET /weekly                      weekly coach reviews with their adjustment proposals
 //   POST /weekly/{id}/adjustments/{index}   apply or dismiss one proposal
+//   GET /coach                       the coach's thread (weekly reviews, verdicts, chat)
+//   POST /coach/messages             say something to the coach; the worker answers
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const STATUSES = new Set<string>(["auto", "confirmed", "unplanned", "ignored"] satisfies MatchStatus[]);
@@ -47,7 +55,7 @@ const VERDICTS = new Set<string>(["達成", "達成但有提醒", "未達成"]);
 
 const sqs = new SQSClient({});
 
-const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | PutSessionResponse | PutMemoResponse | RereviewResponse | WeeklyResponse | PostAdjustmentResponse | ErrorResponse>(
+const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | PutSessionResponse | PutMemoResponse | RereviewResponse | WeeklyResponse | PostAdjustmentResponse | CoachResponse | PostCoachMessageResponse | ErrorResponse>(
   statusCode: number,
   body: T,
 ): APIGatewayProxyResultV2 => ({
@@ -116,6 +124,8 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
   if (method === "POST" && re) return rereview(user.id, re[1]);
 
   if (method === "GET" && path === "/weekly") return getWeekly(user.id);
+  if (method === "GET" && path === "/coach") return getCoach(user.id);
+  if (method === "POST" && path === "/coach/messages") return postCoach(user.id, raw);
   const adj = /^\/weekly\/([^/]+)\/adjustments\/(\d+)$/.exec(path);
   if (method === "POST" && adj) return postAdjustment(user.id, adj[1], Number(adj[2]), raw);
 
@@ -561,4 +571,83 @@ async function postAdjustment(userId: string, weeklyId: string, index: number, r
     [w.id],
   );
   return json<PostAdjustmentResponse>(200, { review: toApiWeekly(updated!) });
+}
+
+// ---- the coach's thread ----------------------------------------------------------
+
+function toApiCoachMessage(m: CoachMessageRow): ApiCoachMessage {
+  const meta = (m.meta ?? {}) as Record<string, unknown>;
+  return {
+    id: m.id,
+    role: m.role,
+    kind: m.kind,
+    text: m.text,
+    activity_id: m.activity_id,
+    weekly_review_id: m.weekly_review_id,
+    status: m.status,
+    review: m.kind === "review"
+      ? { label: String(meta.label ?? ""), verdict: (meta.verdict as Verdict | undefined) ?? null, reminder: (meta.reminder as string | null) ?? null, date: (meta.date as string | undefined) ?? null }
+      : null,
+    quote: typeof meta.quote === "string" ? meta.quote : null,
+    error: typeof meta.error === "string" ? meta.error : null,
+    created_at: new Date(m.created_at).toISOString(),
+  };
+}
+
+async function getCoach(userId: string) {
+  const rows = await query<CoachMessageRow>(
+    "select * from coach_messages where user_id = $1 order by created_at desc limit 100",
+    [userId],
+  );
+  return json<CoachResponse>(200, { coach: { name: COACH_NAME }, messages: rows.reverse().map(toApiCoachMessage) });
+}
+
+async function postCoach(userId: string, raw: string) {
+  let body: PostCoachMessageRequest;
+  try {
+    body = JSON.parse(raw) as PostCoachMessageRequest;
+  } catch {
+    return json(400, { error: "invalid json" });
+  }
+  const text = typeof body.text === "string" ? body.text.trim() : "";
+  if (!text) return json(400, { error: "text is required" });
+  if (text.length > MAX_MESSAGE_CHARS) return json(400, { error: `text too long (${MAX_MESSAGE_CHARS} chars)` });
+
+  // Daily cap, off by default (COACH_DAILY_LIMIT=0). For when this opens to other people.
+  const limit = Number(process.env.COACH_DAILY_LIMIT ?? 0);
+  if (limit > 0) {
+    const { n } = (await queryOne<{ n: string }>(
+      `select count(*) as n from coach_messages
+        where user_id = $1 and role = 'athlete'
+          and (created_at at time zone 'Asia/Tokyo')::date = (now() at time zone 'Asia/Tokyo')::date`,
+      [userId],
+    ))!;
+    if (Number(n) >= limit) return json(429, { error: "daily limit reached" });
+  }
+
+  let quote: string | null = null;
+  if (body.activity_id) {
+    if (!UUID_RE.test(body.activity_id)) return json(400, { error: "invalid activity id" });
+    const a = await queryOne<{ date: string; label: string | null; distance_m: number; avg_pace_sec_km: number | null; avg_hr: number | null; max_hr: number | null; verdict: string | null }>(
+      `select to_char(a.start_time at time zone 'Asia/Tokyo', 'MM/DD') as date, ps.label, a.distance_m, a.avg_pace_sec_km, a.avg_hr, a.max_hr, r.verdict
+         from activities a left join planned_sessions ps on ps.id = a.session_id left join reviews r on r.activity_id = a.id
+        where a.id = $1 and a.user_id = $2`,
+      [body.activity_id, userId],
+    );
+    if (!a) return json(404, { error: "activity not found" });
+    const p = a.avg_pace_sec_km ? `${Math.floor(a.avg_pace_sec_km / 60)}:${String(a.avg_pace_sec_km % 60).padStart(2, "0")}/km` : null;
+    quote = [`${a.date} ${a.label ?? "未排課"} ${(a.distance_m / 1000).toFixed(2)} km`, p, a.avg_hr != null ? `心拍 ${a.avg_hr}${a.max_hr != null ? `（最高 ${a.max_hr}）` : ""}` : null, a.verdict].filter(Boolean).join(" · ");
+  }
+
+  const m = await postCoachMessage({
+    user_id: userId, role: "athlete", kind: "chat", text, status: "pending",
+    activity_id: body.activity_id ?? null, meta: quote ? { quote } : null,
+  });
+  if (process.env.QUEUE_URL) {
+    await sqs.send(new SendMessageCommand({
+      QueueUrl: process.env.QUEUE_URL,
+      MessageBody: JSON.stringify({ type: "coach_reply", user_id: userId, message_id: m.id } satisfies CoachReplyJob),
+    }));
+  }
+  return json<PostCoachMessageResponse>(202, { message: toApiCoachMessage(m) });
 }

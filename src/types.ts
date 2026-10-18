@@ -102,6 +102,26 @@ export interface ReviewRow {
   created_at: Date;
 }
 
+export interface CoachMessageRow {
+  id: string;
+  user_id: string;
+  role: "coach" | "athlete";
+  kind: "weekly" | "review" | "chat";
+  text: string;
+  meta: Record<string, unknown> | null;
+  activity_id: string | null;
+  weekly_review_id: string | null;
+  status: "pending" | "sent" | "failed";
+  created_at: Date;
+}
+
+/** SQS message asking the worker to answer an athlete's coach message. */
+export interface CoachReplyJob {
+  type: "coach_reply";
+  user_id: string;
+  message_id: string;
+}
+
 export interface WeeklyReviewRow {
   id: string;
   plan_id: string;

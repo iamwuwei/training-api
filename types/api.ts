@@ -256,6 +256,44 @@ export interface PostAdjustmentResponse {
   review: ApiWeeklyReview;
 }
 
+// ---- GET <ApiUrl>/coach ---------------------------------------------------------
+// The coach's thread, oldest first (last 100). Coach messages are posted by the
+// system (weekly review, each run's verdict) or written in reply; athlete messages
+// are `pending` until the coach answers, `failed` if the answer could not be made.
+
+export interface ApiCoachMessage {
+  id: string;
+  role: "coach" | "athlete";
+  kind: "weekly" | "review" | "chat";
+  text: string;
+  activity_id: string | null;        // review: the reviewed run; athlete chat: the quoted run
+  weekly_review_id: string | null;   // weekly: look its proposals up in GET /weekly
+  status: "pending" | "sent" | "failed";
+  review: { label: string; verdict: Verdict | null; reminder: string | null; date: string | null } | null;
+  quote: string | null;              // athlete chat sent from a report: one line about that run
+  error: string | null;              // failed: why
+  created_at: string;
+}
+
+export interface CoachResponse {
+  coach: { name: string };
+  messages: ApiCoachMessage[];
+}
+
+// ---- POST <ApiUrl>/coach/messages ----------------------------------------------
+// 202: the message is stored (status pending) and the worker will answer; poll
+// GET /coach until the athlete message is `sent` (the reply follows it) or `failed`.
+// 400 over 500 chars; 429 when a daily limit is set and reached.
+
+export interface PostCoachMessageRequest {
+  text: string;          // ≤ 500 chars
+  activity_id?: string;  // quote this run (from the report page's 問教練)
+}
+
+export interface PostCoachMessageResponse {
+  message: ApiCoachMessage;
+}
+
 // ---- errors (any non-2xx) ----------------------------------------------------
 
 /**

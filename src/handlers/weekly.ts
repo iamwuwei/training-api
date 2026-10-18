@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { weeklyReview } from "../lib/claude";
+import { postCoachMessage } from "../lib/coach";
 import { historyBetween, loadPlanWeeks } from "../lib/context";
 import { query, queryOne } from "../lib/db";
 import type { PlanRow, PlannedSessionRow, StoredAdjustments } from "../types";
@@ -87,6 +88,10 @@ export const handler = async (event: { week_start?: string } = {}) => {
        values ($1, $2, $3, $4, $5)`,
       [id, plan.id, weekStart, review.summary, JSON.stringify(stored)],
     );
+    await postCoachMessage({
+      user_id: plan.user_id, role: "coach", kind: "weekly", text: review.summary, weekly_review_id: id,
+      meta: { week_start: weekStart, proposals: review.adjustments.length },
+    });
     results.push({ plan_id: plan.id, review_id: id, adjustments: review.adjustments.length });
     console.log(`weekly review ${id} for plan ${plan.id} (${plan.display_name}) week ${weekStart}: ${review.adjustments.length} adjustments`);
   }

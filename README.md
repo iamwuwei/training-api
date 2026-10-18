@@ -197,6 +197,8 @@ Aurora 閒置 5 分鐘會 pause，之後第一個請求要等它醒（15〜30 �
 - `POST <ApiUrl>/activities/{id}/rereview` → 刪掉 Claude 判定、丟回 SQS 重評（202）。沒有對應課表或有手動判定回 409。
 - `GET <ApiUrl>/weekly` → `WeeklyResponse { reviews }`：每週總結（最新在前）與調整建議，每條建議有 `status: pending | applied | dismissed`。
 - `POST <ApiUrl>/weekly/{id}/adjustments/{index}` body `{ action: "apply" | "dismiss" }` → 採用會新增一筆 `version+1` 的 planned_session、舊的標 `superseded`、活動跟著搬；`/plan` 立刻反映。
+- `GET <ApiUrl>/coach` → `CoachResponse { coach: { name: "Woo" }, messages }`：教練的對話串（最近 100 則，舊在前）。週總結和每次判定由系統貼進來；跑者的訊息 `pending` 直到 Woo 回覆、失敗是 `failed`。
+- `POST <ApiUrl>/coach/messages` body `{ text, activity_id? }` → 202，存成 `pending` 並丟 SQS，worker 用 Haiku 回（`src/lib/coach.ts`）；前端輪詢 `GET /coach`。`activity_id` 會把那筆活動的一行摘要當引用。500 字上限；`COACH_DAILY_LIMIT`（預設 0 = 不限）之後開放給別人用時再打開。
 - `PUT <ApiUrl>/activities/{id}/memo` body `PutMemoRequest { memo, rpe? }` → 跑者自己的心得和 RPE（1〜10）。存完如果那筆的判定是 Claude 寫的，會刪掉重評，新的判定會參考這段自述；手動判定不動。
 - `PUT <ApiUrl>/activities/{id}/session` body `PutSessionRequest { session_id, memo?, rpe?, replace?, status? }` → 使用者指定這筆活動是哪堂課（`confirmed`），可同時帶心得與 RPE。原本 `auto` 占著那個 session 的活動會退回 `unplanned`；`confirmed` 占著回 409（帶 `replace: true` 才換）。指定後舊的 Claude 判定刪掉、丟回 SQS 重評一次。`session_id: null` 配 `status: "ignored"` 表示這筆不算。
 
@@ -222,6 +224,14 @@ Strava 同步進來的活動（所有運動）一律存成 `unplanned`、`sessio
 - 同一個 session 只能有一個活動。已 `confirmed` 的持有者要換掉得帶 `replace: true`，否則 409。
 - `{ session_id: null, status: "ignored" }` 把活動排除在清單外；`{ session_id: null }` 退回 `unplanned`。
 - 重跑 Strava update 事件不會動使用者的選擇。
+
+## 教練 Woo（`src/lib/coach.ts`）
+
+一條 `coach_messages` 對話串。週總結（`kind = weekly`）和每次跑完的判定（`kind = review`，`meta` 帶課名、判定、第一條提醒）由系統自動貼進去；跑者回話走 `POST /coach/messages` → SQS `{ type: "coach_reply" }` → worker 的 `answerCoachMessage`。
+
+Woo 拿到的：目標、課表階段、本週與下週課表（含完成狀況）、最近 14 天的練習（數據、判定、自述）、對話串最近 20 則，以及跑者引用的活動。模型 `CLAUDE_MODEL`（Haiku），回覆上限 400 tokens，2〜4 句。
+
+範圍只限跑步、課表、比賽、恢復、睡眠補給、傷痛；離題一句話帶回來，叫它換角色或忘記規則也不理。它不能改課表，只能說明要在週回顧裡提出。回覆失敗時跑者的訊息標 `failed`（`meta.error`），前端顯示可以重送。
 
 ## 週總結（`src/handlers/weekly.ts`）
 

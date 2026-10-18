@@ -114,3 +114,19 @@ create table if not exists weekly_reviews (
   adjustments jsonb,
   created_at timestamptz not null default now()
 );
+
+-- The coach's thread with each athlete: weekly reviews and per-run verdicts are posted
+-- here automatically; the athlete can reply and the coach answers (worker, Claude).
+create table if not exists coach_messages (
+  id uuid primary key,
+  user_id uuid not null references users(id),
+  role text not null,                      -- coach | athlete
+  kind text not null,                      -- weekly | review | chat
+  text text not null,
+  meta jsonb,                              -- review: {label, verdict, reminder}; athlete chat: {quote}; failed: {error}
+  activity_id uuid references activities(id),
+  weekly_review_id uuid references weekly_reviews(id),
+  status text not null default 'sent',     -- athlete messages: pending (awaiting the coach) | sent | failed
+  created_at timestamptz not null default now()
+);
+create index if not exists coach_messages_user_id_created_at_idx on coach_messages (user_id, created_at);

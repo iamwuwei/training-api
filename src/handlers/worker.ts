@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { SQSHandler } from "aws-lambda";
 import { reviewActivity } from "../lib/claude";
+import { answerCoachMessage, postCoachMessage } from "../lib/coach";
 import { loadReviewContext } from "../lib/context";
 import { isDbWaking, query, queryOne } from "../lib/db";
 import { getActivity, refreshToken, StravaError } from "../lib/strava";
-import type { PlannedSessionRow, StravaConnectionRow, StravaWebhookEvent } from "../types";
+import type { CoachReplyJob, PlannedSessionRow, StravaConnectionRow, StravaWebhookEvent } from "../types";
 
 // Any thrown error => SQS redelivers (visibility 90 s, 3 tries, then DLQ).
 // Aurora resuming from 0 ACU is the usual first failure: wait inside this run
@@ -12,16 +13,26 @@ import type { PlannedSessionRow, StravaConnectionRow, StravaWebhookEvent } from 
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+const todayJst = () => new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+
+async function handleJob(body: StravaWebhookEvent | CoachReplyJob): Promise<void> {
+  if ("type" in body && body.type === "coach_reply") {
+    await answerCoachMessage(body.user_id, body.message_id, todayJst());
+    return;
+  }
+  await processEvent(body as StravaWebhookEvent);
+}
+
 export const handler: SQSHandler = async (event) => {
   for (const record of event.Records) {
-    const body = JSON.parse(record.body) as StravaWebhookEvent;
+    const body = JSON.parse(record.body) as StravaWebhookEvent | CoachReplyJob;
     try {
-      await processEvent(body);
+      await handleJob(body);
     } catch (err) {
       if (!isDbWaking(err)) throw err;
       console.warn("database waking up, retrying in 8 s:", err instanceof Error ? err.message : err);
       await sleep(8_000);
-      await processEvent(body);
+      await handleJob(body);
     }
   }
 };
@@ -171,6 +182,12 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
             [randomUUID(), row.id, r.verdict, r.comment, JSON.stringify(r.reminders), r.model, r.adjust_hint],
           );
           console.log(`review for activity ${activity.id}: ${r.verdict} (${r.reminders.length} reminders)${r.adjust_hint ? ` hint: ${r.adjust_hint}` : ""}`);
+          // The verdict also shows up in the coach's thread.
+          const label = `${session.label ?? session.type}${session.target_distance_m ? ` ${Math.round(session.target_distance_m / 100) / 10} km` : ""}`;
+          await postCoachMessage({
+            user_id: conn.user_id, role: "coach", kind: "review", text: r.comment, activity_id: row.id,
+            meta: { label, verdict: r.verdict, reminder: r.reminders[0] ?? null, date: localDate },
+          });
         } catch (err) {
           // Not requeued (SQS would only retry the same failure). Recorded so the
           // app can show "分析失敗" with a retry instead of waiting forever.
