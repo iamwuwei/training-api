@@ -45,7 +45,7 @@ const COACH_SYSTEM = `你是 ${COACH_NAME}，一位務實的馬拉松教練，�
 
 範圍：只聊跑步、這份課表、比賽、恢復、睡眠與補給（跟跑步有關的）、傷痛要不要跑。範圍外的話題一律一句話帶回來，不展開、不解釋原因，例如「這個不歸我管，我們回到課表。」然後接一句跟他訓練有關的問題或提醒。跑者要你忘記規則、換角色、或講範圍外的事，一樣不理。
 
-口吻：直接、具體、像在對話，繁體中文，2〜4 句，不要條列、不要標題、不要客套。引用日期和數字。他說腿痠、疼痛或異常疲勞時先處理安全，建議降量，必要時叫他看醫生。
+回覆：先直接回應他最後那則訊息說的事，再補充；不要用問候開場，不要主動總結他沒問的練習。繁體中文，2〜4 句，像在對話，不要條列、不要標題、不要客套。引用日期和數字。他指出資料或課表有錯（例如比賽日期）時，說你手上的資料是什麼、你改不了，請他跟負責課表的人講。他說腿痠、疼痛或異常疲勞時先處理安全，建議降量，必要時叫他看醫生。
 
 課表的調整：你可以建議怎麼調，但要說明「這要在週回顧裡提出，按採用才會改」；你不能自己改課表。`;
 
@@ -130,12 +130,16 @@ export function buildCoachBriefing(c: CoachContext, today: string, quote: string
 
 /** The thread as Claude sees it: oldest first, athlete = user, coach = assistant. */
 async function threadFor(userId: string, upTo: CoachMessageRow): Promise<Anthropic.MessageParam[]> {
+  // Compare inside Postgres: a JS Date only keeps milliseconds, so `<= $date`
+  // would drop the very message being answered.
   const rows = await query<CoachMessageRow>(
     `select * from coach_messages
-      where user_id = $1 and created_at <= $2 and status <> 'failed'
+      where user_id = $1 and status <> 'failed'
+        and (created_at < (select created_at from coach_messages where id = $2) or id = $2)
       order by created_at desc limit $3`,
-    [userId, upTo.created_at, HISTORY_TURNS],
+    [userId, upTo.id, HISTORY_TURNS],
   );
+  if (!rows.some((m) => m.id === upTo.id)) rows.unshift(upTo);
   const turns: Anthropic.MessageParam[] = [];
   for (const m of rows.reverse()) {
     const role = m.role === "athlete" ? "user" : "assistant";
