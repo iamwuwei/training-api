@@ -253,5 +253,5 @@ training-api/
 ├── types/        api.ts — API request/response 型別（前端直接複製用）
 ├── sql/          schema.sql
 ├── seed/         plans.json、seed.ts
-└── scripts/      migrate.ts、backfill.ts、sql.ts（npm run sql -- "select …"）、subscribe-webhook.ts、xlsx-to-plans.py
+└── scripts/      migrate.ts、backfill.ts、sql.ts（npm run sql -- "select …"）、fix-race-date.ts（一次性：比賽日 12/14 → 12/13）、subscribe-webhook.ts、xlsx-to-plans.py
 ```

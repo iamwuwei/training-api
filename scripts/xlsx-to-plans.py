@@ -29,7 +29,7 @@ OUT = ROOT / "seed" / "plans.json"
 import argparse
 
 RACE_NAME = "富士山マラソン"
-RACE_DATE = "2026-12-14"
+RACE_DATE = "2026-12-13"  # Sunday; the xlsx still says 12/14 on the race row
 # Per-user defaults; --goal / --days override. Keys must match USERS in seed/seed.ts.
 DEFAULTS = {
     "ww": {"goal_time_sec": 4 * 3600 + 45 * 60, "days_per_week": 4},  # 比賽目標 4:45

@@ -2,7 +2,7 @@
   {
     "user": "ww",
     "race_name": "富士山マラソン",
-    "race_date": "2026-12-14",
+    "race_date": "2026-12-13",
     "goal_time_sec": 17100,
     "days_per_week": 4,
     "weeks": [
@@ -72,16 +72,16 @@
       {
         "week_no": 10,
         "start": "2026-12-07",
-        "end": "2026-12-13",
+        "end": "2026-12-12",
         "phase": "第四階段｜Taper",
         "focus": "Taper 2"
       },
       {
         "week_no": 11,
-        "start": "2026-12-14",
-        "end": "2026-12-14",
+        "start": "2026-12-13",
+        "end": "2026-12-13",
         "phase": "比賽日",
-        "focus": "🏁 12/14 比賽"
+        "focus": "🏁 12/13 比賽"
       }
     ],
     "sessions": [
@@ -1129,22 +1129,6 @@
         "date": "2026-12-12",
         "week_no": 10,
         "phase": "第四階段｜Taper",
-        "label": "休息",
-        "type": "rest",
-        "distance_m": 0,
-        "content": "休息",
-        "note": null,
-        "target": null,
-        "pace_min_sec_km": null,
-        "pace_max_sec_km": null,
-        "hr_min": null,
-        "hr_max": null,
-        "pace_sec_km": null
-      },
-      {
-        "date": "2026-12-13",
-        "week_no": 10,
-        "phase": "第四階段｜Taper",
         "label": "完全休息",
         "type": "rest",
         "distance_m": 0,
@@ -1158,7 +1142,7 @@
         "pace_sec_km": null
       },
       {
-        "date": "2026-12-14",
+        "date": "2026-12-13",
         "week_no": 11,
         "phase": "比賽日",
         "label": "比賽",
