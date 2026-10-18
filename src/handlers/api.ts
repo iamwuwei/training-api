@@ -30,6 +30,7 @@ import type {
   CoachResponse,
   PostCoachMessageRequest,
   PostCoachMessageResponse,
+  PutCoachSeenResponse,
 } from "../../types/api";
 
 // Lambda training-api-prod. Behind API Gateway (HTTP API) with a Cognito JWT authorizer: by the time we
@@ -48,6 +49,7 @@ import type {
 //   POST /weekly/{id}/adjustments/{index}   apply or dismiss one proposal
 //   GET /coach                       the coach's thread (weekly reviews, verdicts, chat)
 //   POST /coach/messages             say something to the coach; the worker answers
+//   PUT /coach/seen                  the thread was opened; clears coach_unread on GET /plan
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const STATUSES = new Set<string>(["auto", "confirmed", "unplanned", "ignored"] satisfies MatchStatus[]);
@@ -55,7 +57,7 @@ const VERDICTS = new Set<string>(["達成", "達成但有提醒", "未達成"]);
 
 const sqs = new SQSClient({});
 
-const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | PutSessionResponse | PutMemoResponse | RereviewResponse | WeeklyResponse | PostAdjustmentResponse | CoachResponse | PostCoachMessageResponse | ErrorResponse>(
+const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | PutSessionResponse | PutMemoResponse | RereviewResponse | WeeklyResponse | PostAdjustmentResponse | CoachResponse | PostCoachMessageResponse | PutCoachSeenResponse | ErrorResponse>(
   statusCode: number,
   body: T,
 ): APIGatewayProxyResultV2 => ({
@@ -128,6 +130,7 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
 
   if (method === "GET" && path === "/weekly") return getWeekly(user.id);
   if (method === "GET" && path === "/coach") return getCoach(user.id);
+  if (method === "PUT" && path === "/coach/seen") return putCoachSeen(user.id);
   if (method === "POST" && path === "/coach/messages") return postCoach(user.id, raw);
   const adj = /^\/weekly\/([^/]+)\/adjustments\/(\d+)$/.exec(path);
   if (method === "POST" && adj) return postAdjustment(user.id, adj[1], Number(adj[2]), raw);
@@ -263,7 +266,15 @@ async function getPlan(userId: string) {
     [userId],
   );
 
+  const unread = await queryOne<{ n: string }>(
+    `select count(*) as n from coach_messages m
+      where m.user_id = $1 and m.role = 'coach'
+        and m.created_at > coalesce((select coach_seen_at from users where id = $1), '-infinity')`,
+    [userId],
+  );
+
   return json<PlanResponse>(200, {
+    coach_unread: Number(unread?.n ?? 0),
     plan,
     weeks: weeks.map(({ week_no, week_start, week_end, phase, focus }) => ({ week_no, week_start, week_end, phase, focus })),
     sessions,
@@ -615,6 +626,12 @@ async function getCoach(userId: string) {
     [userId],
   );
   return json<CoachResponse>(200, { coach: { name: COACH_NAME }, messages: rows.reverse().map(toApiCoachMessage) });
+}
+
+/** The athlete opened the thread: everything posted so far counts as seen. */
+async function putCoachSeen(userId: string) {
+  const row = await queryOne<{ seen_at: Date }>("update users set coach_seen_at = now() where id = $1 returning coach_seen_at as seen_at", [userId]);
+  return json<PutCoachSeenResponse>(200, { seen_at: new Date(row?.seen_at ?? Date.now()).toISOString() });
 }
 
 async function postCoach(userId: string, raw: string) {

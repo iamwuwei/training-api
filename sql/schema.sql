@@ -11,6 +11,7 @@ create table if not exists users (
 );
 alter table users drop column if exists apple_sub;
 alter table users add column if not exists cognito_sub text unique;  -- Cognito user `sub`
+alter table users add column if not exists coach_seen_at timestamptz;   -- when the athlete last opened the coach thread (unread badge)
 
 create table if not exists strava_connections (
   user_id uuid primary key references users(id),

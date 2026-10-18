@@ -199,6 +199,7 @@ Aurora 閒置 5 分鐘會 pause，之後第一個請求要等它醒（15〜30 �
 - `GET <ApiUrl>/weekly` → `WeeklyResponse { reviews }`：每週總結（最新在前）與調整建議，每條建議有 `status: pending | applied | dismissed`。
 - `POST <ApiUrl>/weekly/{id}/adjustments/{index}` body `{ action: "apply" | "dismiss" }` → 採用會新增一筆 `version+1` 的 planned_session、舊的標 `superseded`、活動跟著搬；`/plan` 立刻反映。
 - `GET <ApiUrl>/coach` → `CoachResponse { coach: { name: "Woo" }, messages }`：教練的對話串（最近 100 則，舊在前）。週總結和每次判定由系統貼進來；跑者的訊息 `pending` 直到 Woo 回覆、失敗是 `failed`。
+- `PUT <ApiUrl>/coach/seen` → `{ seen_at }`：跑者打開教練頁時呼叫，`GET /plan` 的 `coach_unread`（Woo 在那之後貼的訊息數）歸零；前端用它亮「教練」tab 的小點。
 - `POST <ApiUrl>/coach/messages` body `{ text, activity_id? }` → 202，存成 `pending` 並丟 SQS，worker 用 Haiku 回（`src/lib/coach.ts`）；前端輪詢 `GET /coach`。`activity_id` 會把那筆活動的一行摘要當引用。500 字上限；`COACH_DAILY_LIMIT`（預設 0 = 不限）之後開放給別人用時再打開。
 - `PUT <ApiUrl>/activities/{id}/memo` body `PutMemoRequest { memo, rpe? }` → 跑者自己的心得和 RPE（1〜10）。存完如果那筆的判定是 Claude 寫的，會刪掉重評，新的判定會參考這段自述；手動判定不動。
 - `PUT <ApiUrl>/activities/{id}/session` body `PutSessionRequest { session_id, memo?, rpe?, replace?, status? }` → 使用者指定這筆活動是哪堂課（`confirmed`），可同時帶心得與 RPE。原本 `auto` 占著那個 session 的活動會退回 `unplanned`；`confirmed` 占著回 409（帶 `replace: true` 才換）。指定後舊的 Claude 判定刪掉、丟回 SQS 重評一次。`session_id: null` 配 `status: "ignored"` 表示這筆不算。

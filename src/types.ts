@@ -9,6 +9,7 @@ export interface UserRow {
   email: string | null;
   display_name: string;
   cognito_sub: string | null;
+  coach_seen_at: Date | null;
   created_at: Date;
 }
 

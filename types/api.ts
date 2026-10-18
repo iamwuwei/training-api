@@ -131,6 +131,8 @@ export interface ApiActivity {
 }
 
 export interface PlanResponse {
+  /** Coach messages posted since the athlete last opened the thread (PUT /coach/seen). Drives the tab badge. */
+  coach_unread: number;
   plan: ApiPlan;
   weeks: ApiWeek[];
   sessions: ApiSession[];    // not superseded, ordered by date
@@ -288,6 +290,11 @@ export interface CoachResponse {
 export interface PostCoachMessageRequest {
   text: string;          // ≤ 500 chars
   activity_id?: string;  // quote this run (from the report page's 問教練)
+}
+
+/** PUT /coach/seen: the thread was opened; `coach_unread` on GET /plan drops to 0. */
+export interface PutCoachSeenResponse {
+  seen_at: string;
 }
 
 export interface PostCoachMessageResponse {
