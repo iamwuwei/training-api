@@ -60,6 +60,8 @@ jobs:
       cancel-in-progress: false
     env:
       DB_CLUSTER_RESOURCE_ID: ${{ secrets.DB_CLUSTER_RESOURCE_ID }}
+      # Supabase pooler URL; when set, the Lambdas use it instead of Aurora (DB_* above are then ignored)
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
       STRAVA_CLIENT_ID: ${{ secrets.STRAVA_CLIENT_ID }}
       STRAVA_CLIENT_SECRET: ${{ secrets.STRAVA_CLIENT_SECRET }}
       STRAVA_VERIFY_TOKEN: ${{ secrets.STRAVA_VERIFY_TOKEN }}

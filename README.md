@@ -34,6 +34,7 @@ cp .env.example .env
 | `STRAVA_CLIENT_ID` / `STRAVA_CLIENT_SECRET` | https://www.strava.com/settings/api |
 | `STRAVA_VERIFY_TOKEN` | 自己亂打一串，註冊 webhook 時 Strava 會拿它來驗證 |
 | `ANTHROPIC_API_KEY` | 週總結用 |
+| `DATABASE_URL` | Supabase 的 pooler 連線字串（Transaction pooler，port 6543）。有設就用它，下面的 `DB_*`／IAM 設定全部略過 |
 | `CLAUDE_MODEL` | 單次判定，預設 `claude-sonnet-5-5` |
 | `CLAUDE_MODEL_WEEKLY` | 週總結，預設 `claude-sonnet-5-5`（一週一次，讀整份課表＋兩週資料） |
 | `CLAUDE_MODEL_COACH` | Woo 回話，預設 `claude-sonnet-5-5`，帶 web search（地點、路線、天氣、賽事會先查） |
@@ -226,6 +227,21 @@ Strava 同步進來的活動（所有運動）一律存成 `unplanned`、`sessio
 - 同一個 session 只能有一個活動。已 `confirmed` 的持有者要換掉得帶 `replace: true`，否則 409。
 - `{ session_id: null, status: "ignored" }` 把活動排除在清單外；`{ session_id: null }` 退回 `unplanned`。
 - 重跑 Strava update 事件不會動使用者的選擇。
+
+## 資料庫：Supabase（從 Aurora 搬過來）
+
+Aurora Serverless v2 壓到 0 ACU 每次冷啟動要 15〜30 秒，所以改用 Supabase 的 Postgres。`src/lib/db.ts` 看到 `DATABASE_URL` 就用它（密碼在 URL 裡，TLS 驗證開著），沒有就走原本的 Aurora IAM 連線；兩套程式碼都還在，確認搬完再拆 Aurora。
+
+Lambda 走 IPv4，Supabase 的直連主機只有 IPv6，所以要用 **pooler** 的連線字串（Project → Connect → Transaction pooler，`…pooler.supabase.com:6543`）。
+
+搬資料的步驟（本機，`.env` 先不要設 `DATABASE_URL`，這樣 `copy-db` 的來源才是 Aurora）：
+
+```sh
+DATABASE_URL="<pooler url>" npm run migrate      # 在 Supabase 建 schema
+npm run copy-db -- --to "<pooler url>"            # 整份複製；可重跑，只補不刪
+```
+
+`copy-db` 每張表印出來源筆數、複製筆數、目標現在筆數。然後把 `DATABASE_URL` 加進 GitHub `prod` environment 的 secrets，push 一次（或 workflow_dispatch）部署；部署完 Strava webhook、API、週回顧都寫 Supabase。之後本機 `.env` 也設 `DATABASE_URL`，`migrate`／`sql`／`seed` 就都對 Supabase。
 
 ## 教練 Woo（`src/lib/coach.ts`）
 

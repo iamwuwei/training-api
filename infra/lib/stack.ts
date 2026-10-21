@@ -34,14 +34,19 @@ export class TrainingApiStack extends cdk.Stack {
     const name = (thing?: string) => (thing ? `training-api-${thing}-${stage}` : `training-api-${stage}`);
 
     // ---- config (from .env via dotenv in bin/app.ts, or cdk context) --------
-    const dbClusterResourceId =
-      (this.node.tryGetContext("dbClusterResourceId") as string | undefined) ?? required("DB_CLUSTER_RESOURCE_ID");
-    const dbEnv = {
-      DB_HOST: required("DB_HOST"),
-      DB_PORT: process.env.DB_PORT ?? "5432",
-      DB_NAME: process.env.DB_NAME ?? "postgres",
-      DB_USER: process.env.DB_USER ?? "postgres",
-    };
+    // Database: DATABASE_URL (Supabase pooler URL, a secret) or Aurora with IAM auth.
+    const databaseUrl = process.env.DATABASE_URL;
+    const dbEnv: Record<string, string> = databaseUrl
+      ? { DATABASE_URL: databaseUrl }
+      : {
+          DB_HOST: required("DB_HOST"),
+          DB_PORT: process.env.DB_PORT ?? "5432",
+          DB_NAME: process.env.DB_NAME ?? "postgres",
+          DB_USER: process.env.DB_USER ?? "postgres",
+        };
+    const dbClusterResourceId = databaseUrl
+      ? undefined
+      : (this.node.tryGetContext("dbClusterResourceId") as string | undefined) ?? required("DB_CLUSTER_RESOURCE_ID");
     const stravaEnv = {
       STRAVA_CLIENT_ID: required("STRAVA_CLIENT_ID"),
       STRAVA_CLIENT_SECRET: required("STRAVA_CLIENT_SECRET"),
@@ -56,11 +61,14 @@ export class TrainingApiStack extends cdk.Stack {
     const corsOrigins = (process.env.CORS_ORIGIN ?? "https://iamwuwei.github.io")
       .split(",").map((s) => s.trim()).filter(Boolean);
 
-    // IAM auth: rds-db:connect on the cluster's resource id / db user.
-    const rdsConnect = new iam.PolicyStatement({
-      actions: ["rds-db:connect"],
-      resources: [`arn:aws:rds-db:${this.region}:${this.account}:dbuser:${dbClusterResourceId}/${dbEnv.DB_USER}`],
-    });
+    // Aurora only: IAM auth needs rds-db:connect on the cluster's resource id / db user.
+    const rdsConnect = dbClusterResourceId
+      ? new iam.PolicyStatement({
+          actions: ["rds-db:connect"],
+          resources: [`arn:aws:rds-db:${this.region}:${this.account}:dbuser:${dbClusterResourceId}/${dbEnv.DB_USER}`],
+        })
+      : undefined;
+    const grantDb = (fn: lambda.Function) => { if (rdsConnect) fn.addToRolePolicy(rdsConnect); };
 
     // ---- queue ----------------------------------------------------------------
     const dlq = new sqs.Queue(this, "ActivitiesDlq", {
@@ -125,14 +133,14 @@ export class TrainingApiStack extends cdk.Stack {
       environment: { ...stravaEnv, ...claudeEnv, AUTO_REVIEW: process.env.AUTO_REVIEW ?? "true" },
       reservedConcurrentExecutions: 2,
     });
-    worker.addToRolePolicy(rdsConnect);
+    grantDb(worker);
     worker.addEventSource(new SqsEventSource(queue, { batchSize: 1 }));
 
     const oauth = fn("oauth", { environment: stravaEnv });
-    oauth.addToRolePolicy(rdsConnect);
+    grantDb(oauth);
 
     const weekly = fn("weekly", { environment: claudeEnv });
-    weekly.addToRolePolicy(rdsConnect);
+    grantDb(weekly);
 
     // training-api-prod, same name as the HTTP API. HTTP API cuts requests at
     // 30 s, so give up on a cold Aurora at 20 s and answer 503 instead.
@@ -143,7 +151,7 @@ export class TrainingApiStack extends cdk.Stack {
         COACH_DAILY_LIMIT: process.env.COACH_DAILY_LIMIT ?? "0", // 0 = no cap (two known athletes)
       },
     });
-    api.addToRolePolicy(rdsConnect);
+    grantDb(api);
     queue.grantSendMessages(api); // re-review after a manual session assignment
 
     // ---- schedule: every Sunday 21:00 Asia/Tokyo -----------------------------

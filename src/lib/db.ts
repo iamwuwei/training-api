@@ -4,9 +4,14 @@ import tls from "node:tls";
 import { Signer } from "@aws-sdk/rds-signer";
 import { Pool, type QueryResultRow } from "pg";
 
-// IAM auth tokens are valid for 15 minutes. Rebuild the pool a bit before that
-// so a warm Lambda never tries to open a new connection with a stale token.
-const TOKEN_TTL_MS = 13 * 60 * 1000;
+// Two ways to reach Postgres, picked by the environment:
+//   DATABASE_URL          Supabase (or any Postgres) with a password in the URL.
+//                         Use Supabase's pooler URL (port 6543, transaction mode)
+//                         from Lambda: the direct host is IPv6-only.
+//   DB_HOST + IAM auth    Aurora, token signed with the Lambda's own credentials
+//                         (the original setup; kept until the move is finished).
+
+const IAM_TOKEN_TTL_MS = 13 * 60 * 1000; // tokens last 15 min; rebuild the pool before that
 
 let pool: Pool | undefined;
 let poolCreatedAt = 0;
@@ -17,61 +22,83 @@ function env(name: string, fallback?: string): string {
   return v;
 }
 
-// Trust store for the Aurora TLS handshake: the RDS global CA bundle (bundled
-// next to the handler by CDK's commandHooks.afterBundling; src/lib/ under tsx)
-// PLUS Node's built-in public roots. The public endpoint (internet access
-// gateway) can present a chain signed by a public Amazon CA rather than the
-// RDS CA, which the RDS bundle alone rejects with
-// UNABLE_TO_GET_ISSUER_CERT_LOCALLY. Hostname verification stays on.
-const CA = [
-  fs.readFileSync(path.join(__dirname, "global-bundle.pem"), "utf8"),
-  ...tls.rootCertificates,
-];
+export type DbConfig =
+  | { kind: "url"; url: string }
+  | { kind: "iam"; host: string; port: number; user: string; database: string; region: string };
 
-async function getPool(): Promise<Pool> {
-  if (pool && Date.now() - poolCreatedAt < TOKEN_TTL_MS) return pool;
+/** The configuration the environment describes (DATABASE_URL wins). */
+export function dbConfigFromEnv(): DbConfig {
+  const url = process.env.DATABASE_URL;
+  if (url) return { kind: "url", url };
+  return {
+    kind: "iam",
+    host: env("DB_HOST"),
+    port: Number(env("DB_PORT", "5432")),
+    user: env("DB_USER", "postgres"),
+    database: env("DB_NAME", "postgres"),
+    region: env("AWS_REGION", "ap-northeast-1"),
+  };
+}
 
-  if (pool) {
-    const old = pool;
-    pool = undefined;
-    old.end().catch(() => {});
+// Trust store for Aurora's TLS handshake: the RDS global CA bundle (bundled next
+// to the handler by CDK's commandHooks.afterBundling; src/lib/ under tsx) plus
+// Node's public roots, which the public endpoint's chain may need. Supabase's
+// certificates chain to public roots, so the bundle is only read for Aurora.
+function rdsTrustStore(): string[] {
+  const file = path.join(__dirname, "global-bundle.pem");
+  return [...(fs.existsSync(file) ? [fs.readFileSync(file, "utf8")] : []), ...tls.rootCertificates];
+}
+
+const common = {
+  max: 2,
+  // Aurora Serverless v2 at 0 ACU can take 15-30 s to wake up. API Gateway
+  // (HTTP API) cuts the request at 30 s, so the api Lambda gives up earlier
+  // and answers 503 (see isDbWaking); SQS/scheduler callers get the full 30 s.
+  connectionTimeoutMillis: Number(process.env.DB_CONNECT_TIMEOUT_MS ?? 30_000),
+  idleTimeoutMillis: 60_000,
+};
+
+/** A pool for `config`; scripts that talk to two databases build their own. */
+export async function makePool(config: DbConfig): Promise<Pool> {
+  if (config.kind === "url") {
+    return new Pool({ connectionString: config.url, ssl: { rejectUnauthorized: true }, ...common });
   }
-
-  const hostname = env("DB_HOST");
-  const port = Number(env("DB_PORT", "5432"));
-  const username = env("DB_USER", "postgres");
-  const region = env("AWS_REGION", "ap-northeast-1");
-
-  const signer = new Signer({ hostname, port, username, region });
+  const signer = new Signer({ hostname: config.host, port: config.port, username: config.user, region: config.region });
   const token = await signer.getAuthToken();
-
   if (process.env.DB_DEBUG === "true") {
     // Token = "<host>:<port>/?Action=connect&DBUser=…&X-Amz-…". Log everything
     // but the signature so a Lambda token can be compared with a local one.
     const u = new URL(`https://${token}`);
     const q = Object.fromEntries(u.searchParams);
     console.log("db auth token", JSON.stringify({
-      host: u.host, DBUser: q.DBUser, region, credential: q["X-Amz-Credential"],
+      host: u.host, DBUser: q.DBUser, region: config.region, credential: q["X-Amz-Credential"],
       expires: q["X-Amz-Expires"], signedHeaders: q["X-Amz-SignedHeaders"],
       hasSessionToken: Boolean(q["X-Amz-Security-Token"]),
       keyPrefix: process.env.AWS_ACCESS_KEY_ID?.slice(0, 4), node: process.version,
     }));
   }
-
-  pool = new Pool({
-    host: hostname,
-    port,
-    user: username,
-    database: env("DB_NAME", "postgres"),
+  return new Pool({
+    host: config.host,
+    port: config.port,
+    user: config.user,
+    database: config.database,
     password: token,
-    ssl: { ca: CA, rejectUnauthorized: true },
-    max: 2,
-    // Aurora Serverless v2 at 0 ACU can take 15-30 s to wake up. API Gateway
-    // (HTTP API) cuts the request at 30 s, so the api Lambda gives up earlier
-    // and answers 503 (see isDbWaking); SQS/scheduler callers get the full 30 s.
-    connectionTimeoutMillis: Number(process.env.DB_CONNECT_TIMEOUT_MS ?? 30_000),
-    idleTimeoutMillis: 60_000,
+    ssl: { ca: rdsTrustStore(), rejectUnauthorized: true },
+    ...common,
   });
+}
+
+async function getPool(): Promise<Pool> {
+  const config = dbConfigFromEnv();
+  const fresh = config.kind === "url" || Date.now() - poolCreatedAt < IAM_TOKEN_TTL_MS;
+  if (pool && fresh) return pool;
+
+  if (pool) {
+    const old = pool;
+    pool = undefined;
+    old.end().catch(() => {});
+  }
+  pool = await makePool(config);
   pool.on("error", (err) => console.error("pg pool error", err));
   poolCreatedAt = Date.now();
   return pool;

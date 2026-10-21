@@ -11,6 +11,7 @@
     "backfill": "tsx scripts/backfill.ts",
     "sql": "tsx scripts/sql.ts",
     "fix-race-date": "tsx scripts/fix-race-date.ts",
+    "copy-db": "tsx scripts/copy-db.ts",
     "subscribe-webhook": "tsx scripts/subscribe-webhook.ts",
     "synth": "cdk synth",
     "deploy": "cdk deploy",
