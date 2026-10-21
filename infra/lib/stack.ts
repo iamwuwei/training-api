@@ -5,7 +5,6 @@ import * as apigw from "aws-cdk-lib/aws-apigatewayv2";
 import { HttpUserPoolAuthorizer } from "aws-cdk-lib/aws-apigatewayv2-authorizers";
 import { HttpLambdaIntegration } from "aws-cdk-lib/aws-apigatewayv2-integrations";
 import * as cognito from "aws-cdk-lib/aws-cognito";
-import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import { SqsEventSource } from "aws-cdk-lib/aws-lambda-event-sources";
 import { NodejsFunction, OutputFormat, type NodejsFunctionProps } from "aws-cdk-lib/aws-lambda-nodejs";
@@ -34,19 +33,8 @@ export class TrainingApiStack extends cdk.Stack {
     const name = (thing?: string) => (thing ? `training-api-${thing}-${stage}` : `training-api-${stage}`);
 
     // ---- config (from .env via dotenv in bin/app.ts, or cdk context) --------
-    // Database: DATABASE_URL (Supabase pooler URL, a secret) or Aurora with IAM auth.
-    const databaseUrl = process.env.DATABASE_URL;
-    const dbEnv: Record<string, string> = databaseUrl
-      ? { DATABASE_URL: databaseUrl }
-      : {
-          DB_HOST: required("DB_HOST"),
-          DB_PORT: process.env.DB_PORT ?? "5432",
-          DB_NAME: process.env.DB_NAME ?? "postgres",
-          DB_USER: process.env.DB_USER ?? "postgres",
-        };
-    const dbClusterResourceId = databaseUrl
-      ? undefined
-      : (this.node.tryGetContext("dbClusterResourceId") as string | undefined) ?? required("DB_CLUSTER_RESOURCE_ID");
+    // Database: the Supabase pooler URL (a secret), see src/lib/db.ts.
+    const dbEnv = { DATABASE_URL: required("DATABASE_URL") };
     const stravaEnv = {
       STRAVA_CLIENT_ID: required("STRAVA_CLIENT_ID"),
       STRAVA_CLIENT_SECRET: required("STRAVA_CLIENT_SECRET"),
@@ -60,15 +48,6 @@ export class TrainingApiStack extends cdk.Stack {
     // Comma-separated front-end origins, e.g. "https://training.pages.dev,http://localhost:5173"
     const corsOrigins = (process.env.CORS_ORIGIN ?? "https://iamwuwei.github.io")
       .split(",").map((s) => s.trim()).filter(Boolean);
-
-    // Aurora only: IAM auth needs rds-db:connect on the cluster's resource id / db user.
-    const rdsConnect = dbClusterResourceId
-      ? new iam.PolicyStatement({
-          actions: ["rds-db:connect"],
-          resources: [`arn:aws:rds-db:${this.region}:${this.account}:dbuser:${dbClusterResourceId}/${dbEnv.DB_USER}`],
-        })
-      : undefined;
-    const grantDb = (fn: lambda.Function) => { if (rdsConnect) fn.addToRolePolicy(rdsConnect); };
 
     // ---- queue ----------------------------------------------------------------
     const dlq = new sqs.Queue(this, "ActivitiesDlq", {
@@ -102,18 +81,14 @@ export class TrainingApiStack extends cdk.Stack {
         }),
         bundling: {
           target: "node22",
-          format: OutputFormat.CJS, // db.ts relies on __dirname
+          format: OutputFormat.CJS,
           bundleAwsSDK: true, // pin our @aws-sdk versions instead of the runtime's
           sourceMap: false,
           minify: false,
           commandHooks: {
             beforeBundling: () => [],
             beforeInstall: () => [],
-            // db.ts reads the CA bundles (global-bundle.pem for Aurora,
-            // supabase-ca.pem for Supabase) next to the bundled handler.
-            afterBundling: (inputDir, outputDir) => [
-              `cp "${path.join(inputDir, "src", "lib")}"/*.pem "${outputDir}/"`,
-            ],
+            afterBundling: () => [],
           },
         },
         ...extra,
@@ -134,25 +109,21 @@ export class TrainingApiStack extends cdk.Stack {
       environment: { ...stravaEnv, ...claudeEnv, AUTO_REVIEW: process.env.AUTO_REVIEW ?? "true" },
       reservedConcurrentExecutions: 2,
     });
-    grantDb(worker);
     worker.addEventSource(new SqsEventSource(queue, { batchSize: 1 }));
 
     const oauth = fn("oauth", { environment: stravaEnv });
-    grantDb(oauth);
 
     const weekly = fn("weekly", { environment: claudeEnv });
-    grantDb(weekly);
 
     // training-api-prod, same name as the HTTP API. HTTP API cuts requests at
     // 30 s, so give up on a cold Aurora at 20 s and answer 503 instead.
     const api = fn("api", {
       functionName: name(),
       environment: {
-        DB_CONNECT_TIMEOUT_MS: "20000", DB_DEBUG: process.env.DB_DEBUG ?? "false", QUEUE_URL: queue.queueUrl,
+        QUEUE_URL: queue.queueUrl,
         COACH_DAILY_LIMIT: process.env.COACH_DAILY_LIMIT ?? "0", // 0 = no cap (two known athletes)
       },
     });
-    grantDb(api);
     queue.grantSendMessages(api); // re-review after a manual session assignment
 
     // ---- schedule: every Sunday 21:00 Asia/Tokyo -----------------------------

@@ -13,17 +13,11 @@ permissions:
 env:
   AWS_REGION: ap-northeast-1
   # non-secret config; secrets live in the `prod` environment
-  DB_HOST: training.cluster-cvigvl3wbuuw.ap-northeast-1.rds.amazonaws.com
-  DB_PORT: "5432"
-  DB_NAME: postgres
-  DB_USER: postgres
   CLAUDE_MODEL: claude-sonnet-5-5
   CLAUDE_MODEL_WEEKLY: claude-sonnet-5-5
   CLAUDE_MODEL_COACH: claude-sonnet-5-5
   AUTO_REVIEW: "true"
   STAGE: prod
-  # logs the IAM auth token parameters (never the signature) from the api Lambda
-  DB_DEBUG: ${{ vars.DB_DEBUG || 'false' }}
   CORS_ORIGIN: ${{ vars.CORS_ORIGIN || 'https://iamwuwei.github.io' }}
   # custom API domain: set both repository variables, or neither
   API_DOMAIN: ${{ vars.API_DOMAIN }}
@@ -34,7 +28,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     env:
-      DB_CLUSTER_RESOURCE_ID: cluster-placeholder
+      DATABASE_URL: postgresql://placeholder:placeholder@placeholder.pooler.supabase.com:6543/postgres
       STRAVA_CLIENT_ID: placeholder
       STRAVA_CLIENT_SECRET: placeholder
       STRAVA_VERIFY_TOKEN: placeholder
@@ -59,8 +53,7 @@ jobs:
       group: deploy-prod
       cancel-in-progress: false
     env:
-      DB_CLUSTER_RESOURCE_ID: ${{ secrets.DB_CLUSTER_RESOURCE_ID }}
-      # Supabase pooler URL; when set, the Lambdas use it instead of Aurora (DB_* above are then ignored)
+      # Supabase pooler URL (Project → Connect → Transaction pooler)
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       STRAVA_CLIENT_ID: ${{ secrets.STRAVA_CLIENT_ID }}
       STRAVA_CLIENT_SECRET: ${{ secrets.STRAVA_CLIENT_SECRET }}

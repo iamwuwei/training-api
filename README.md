@@ -3,19 +3,19 @@
 Strava 連動的馬拉松課表追蹤後端。兩個使用者，Node.js 22 + TypeScript，infra 用 AWS CDK。
 
 ```
-Strava webhook → API Gateway /strava/webhook → Lambda webhook → SQS activities → Lambda worker → Aurora（＋ Claude 單次判定）
-Strava OAuth   → API Gateway /strava/oauth/* → Lambda oauth → Aurora
-EventBridge Scheduler（每週日 21:00 JST）→ Lambda weekly → Claude API → Aurora
+Strava webhook → API Gateway /strava/webhook → Lambda webhook → SQS activities → Lambda worker → Supabase Postgres（＋ Claude 單次判定）
+Strava OAuth   → API Gateway /strava/oauth/* → Lambda oauth → Supabase Postgres
+EventBridge Scheduler（每週日 21:00 JST）→ Lambda weekly → Claude API → Supabase Postgres
 前端 → Cognito（登入，拿 ID token）
-前端 → API Gateway HTTP API（Cognito JWT authorizer）→ Lambda api → Aurora
+前端 → API Gateway HTTP API（Cognito JWT authorizer）→ Lambda api → Supabase Postgres
 ```
 
 資源命名：全部 `training-api-<thing>-<STAGE>`；stack、HTTP API 和它後面的 api Lambda 都叫 `training-api-<STAGE>`。`STAGE` 預設 `prod`。
 
-- 所有 Lambda 都不在 VPC 內（Aurora 有公開 endpoint；Lambda 要打 Strava / Claude）。
+- 所有 Lambda 都不在 VPC 內（資料庫在 Supabase，走 pooler 的公開位址；Lambda 要打 Strava / Claude）。
 - 全部走同一個 API Gateway HTTP API（`make-it-api.life4like.com`）：`/plan`、`/activities*` 掛 Cognito JWT authorizer；`/strava/webhook`、`/strava/oauth/*` 不掛（Strava 來打的）。沒有 Function URL，所以 Lambda 重建 URL 也不變。
-- DB 認證走 IAM：`@aws-sdk/rds-signer` 產 token 當密碼，SSL 用打包進 Lambda 的 RDS global CA bundle（`src/lib/global-bundle.pem`）。
-- Aurora Serverless v2 min 0 ACU，閒置 5 分鐘會 pause；第一次連線要等 10–15 秒。Lambda timeout 60 秒（worker 90 秒），worker 連線失敗會 throw 讓 SQS 重送（3 次後進 DLQ）。
+- DB 是 Supabase 的 Postgres，`DATABASE_URL` 用 pooler 的連線字串（port 6543，transaction mode；直連主機只有 IPv6，Lambda 連不到）。TLS 驗證 Supabase 自己的憑證鏈，編在 `src/lib/supabase-ca.ts`。
+- Lambda timeout 60 秒（worker 90 秒），worker 連線失敗會 throw 讓 SQS 重送（3 次後進 DLQ）。
 
 ## 1. 安裝與 `.env`
 
@@ -29,12 +29,10 @@ cp .env.example .env
 | 變數 | 說明 |
 |---|---|
 | `AWS_REGION` | `ap-northeast-1` |
-| `DB_HOST` / `DB_PORT` / `DB_NAME` / `DB_USER` | Aurora writer endpoint、5432、`postgres`、`postgres` |
-| `DB_CLUSTER_RESOURCE_ID` | `aws rds describe-db-clusters --db-cluster-identifier training --query 'DBClusters[0].DbClusterResourceId' --output text`（CDK 用它組 `rds-db:connect` 的 ARN；也可用 `cdk synth -c dbClusterResourceId=...`） |
 | `STRAVA_CLIENT_ID` / `STRAVA_CLIENT_SECRET` | https://www.strava.com/settings/api |
 | `STRAVA_VERIFY_TOKEN` | 自己亂打一串，註冊 webhook 時 Strava 會拿它來驗證 |
 | `ANTHROPIC_API_KEY` | 週總結用 |
-| `DATABASE_URL` | Supabase 的 pooler 連線字串（Transaction pooler，port 6543）。有設就用它，下面的 `DB_*`／IAM 設定全部略過 |
+| `DATABASE_URL` | Supabase 的 pooler 連線字串（Project → Connect → Transaction pooler，port 6543），密碼在 URL 裡、有符號要 URL 編碼 |
 | `CLAUDE_MODEL` | 單次判定，預設 `claude-sonnet-5-5` |
 | `CLAUDE_MODEL_WEEKLY` | 週總結，預設 `claude-sonnet-5-5`（一週一次，讀整份課表＋兩週資料） |
 | `CLAUDE_MODEL_COACH` | Woo 回話，預設 `claude-sonnet-5-5`，帶 web search（地點、路線、天氣、賽事會先查） |
@@ -46,7 +44,7 @@ cp .env.example .env
 | `APPLE_SERVICES_ID` / `APPLE_TEAM_ID` / `APPLE_KEY_ID` / `APPLE_PRIVATE_KEY` | 選填，四個都填才會在 Cognito 加 Sign in with Apple |
 | `WEBHOOK_URL` | deploy 之後再填（給 `npm run subscribe-webhook` 用） |
 
-`.env` 只在 `cdk synth` 時由 dotenv 讀進來，直接變成 Lambda 的環境變數（沒有 Secrets Manager）。本機跑 `migrate` / `seed` 也讀同一個 `.env`，DB 連線用你本機的 AWS credentials（需要對 `training` cluster 的 `rds-db:connect` 權限）。
+`.env` 只在 `cdk synth` 時由 dotenv 讀進來，直接變成 Lambda 的環境變數（沒有 Secrets Manager）。本機跑 `migrate` / `seed` / `sql` 也讀同一個 `.env` 的 `DATABASE_URL`。
 
 ## 2. 建 schema、灌課表
 
@@ -144,12 +142,12 @@ aws cloudformation delete-stack --stack-name TrainingBackend
    | Secret | 來源 |
    |---|---|
    | `AWS_ROLE_ARN` | 上面那個 role 的 ARN |
-   | `DB_CLUSTER_RESOURCE_ID` | `aws rds describe-db-clusters --db-cluster-identifier training --query 'DBClusters[0].DbClusterResourceId' --output text` |
+   | `DATABASE_URL` | Supabase pooler 連線字串 |
    | `STRAVA_CLIENT_ID` / `STRAVA_CLIENT_SECRET` / `STRAVA_VERIFY_TOKEN` | 同 `.env` |
    | `ANTHROPIC_API_KEY` | 同 `.env` |
    | `APPLE_SERVICES_ID` / `APPLE_TEAM_ID` / `APPLE_KEY_ID` / `APPLE_PRIVATE_KEY` | 選填 |
 
-   非 secret 的（`DB_HOST`、`CLAUDE_MODEL`、`AUTO_REVIEW`、`STAGE`）寫在 workflow 的 `env`；`CORS_ORIGIN`、`API_DOMAIN`、`API_CERT_ARN` 用 repository **variables**（不是 secret）。
+   非 secret 的（`CLAUDE_MODEL`、`AUTO_REVIEW`、`STAGE`）寫在 workflow 的 `env`；`CORS_ORIGIN`、`API_DOMAIN`、`API_CERT_ARN` 用 repository **variables**（不是 secret）。
 
 ## 4. Cognito 使用者
 
@@ -169,7 +167,7 @@ aws cognito-idp admin-set-user-password --user-pool-id $POOL --username you@exam
 
 之後每個 api 請求帶 `Authorization: Bearer <ID token>`（要 **ID token**，不是 access token，因為第一次連結要 `email` claim）。API Gateway 驗簽失敗回 401；驗過但 users 表沒對到回 403。
 
-Aurora 閒置 5 分鐘會 pause，之後第一個請求要等它醒（15〜30 秒），HTTP API 的上限是 30 秒，所以 api 在 20 秒放棄並回 **503 + `Retry-After: 8`**；前端收到 503 等幾秒重試一次即可。不想有這個等待就把 cluster 的 min ACU 調到 0.5（約每月 $43）。
+連不上資料庫（逾時、拒絕）時 api 回 **503 + `Retry-After: 8`**，前端等幾秒重試一次即可。Supabase 免費方案一週沒用會暫停專案，恢復前看起來就是這樣。
 
 ## 5. Strava 設定
 
@@ -210,7 +208,7 @@ Aurora 閒置 5 分鐘會 pause，之後第一個請求要等它醒（15〜30 �
 - **跑者這邊**：`activities.memo` / `rpe`（app 裡寫，`PUT …/memo`），`activities.description`（Strava 上寫的，自動同步）。前端顯示 `memo ?? description`。
 - **教練這邊**：`reviews`（Claude 或手動的 verdict / comment / reminders / adjust_hint）。每次判定 Claude 拿到的是（`src/lib/context.ts`）：跑者目標與距離比賽幾週、整份課表的階段、本週課表與完成狀況、最近 14 天的練習（數據、判定、RPE、心得）、同類型上 5 次、上一次的提醒，再加上今天的課和數據。**判定只看數據**，自述不能放寬判定（提到疼痛可以往嚴的方向壓一級）；自述和歷史用在評語與提醒。`adjust_hint` 是給週總結的一句調整提示，不會直接改課表。非跑步活動（重訓、Hyrox）對應到課表後也會被評，只是不看配速與距離。
 - Claude 失敗（API key、額度、拒答）時 worker 會寫一筆 `verdict null`、`comment = 分析失敗：…` 的 claude review，API 回 `review.failed = true`；前端顯示失敗並提供 `POST …/rereview` 重新分析。不會經 SQS 重試（同樣的錯重試也一樣）。
-- worker 遇到 Aurora 冷啟動（連線逾時）會在同一次執行內等 8 秒再試一次，之後才交給 SQS 重送。
+- worker 遇到資料庫連線逾時會在同一次執行內等 8 秒再試一次，之後才交給 SQS 重送。
 
 ## 判定（reviews）
 
@@ -228,22 +226,13 @@ Strava 同步進來的活動（所有運動）一律存成 `unplanned`、`sessio
 - `{ session_id: null, status: "ignored" }` 把活動排除在清單外；`{ session_id: null }` 退回 `unplanned`。
 - 重跑 Strava update 事件不會動使用者的選擇。
 
-## 資料庫：Supabase（從 Aurora 搬過來）
+## 資料庫：Supabase
 
-Aurora Serverless v2 壓到 0 ACU 每次冷啟動要 15〜30 秒，所以改用 Supabase 的 Postgres。`src/lib/db.ts` 看到 `DATABASE_URL` 就用它（密碼在 URL 裡，TLS 驗證開著），沒有就走原本的 Aurora IAM 連線；兩套程式碼都還在，確認搬完再拆 Aurora。
+原本是 Aurora Serverless v2 壓到 0 ACU，每次冷啟動 15〜30 秒，2026-10-21 搬到 Supabase 的 Postgres（東京）。`src/lib/db.ts` 只認 `DATABASE_URL`；Aurora 的 IAM 連線、`rds-db:connect`、RDS CA bundle 都已拆掉。
 
-Lambda 走 IPv4，Supabase 的直連主機只有 IPv6，所以要用 **pooler** 的連線字串（Project → Connect → Transaction pooler，`…pooler.supabase.com:6543`）。
-
-TLS：Supabase 的憑證鏈到它自己的根憑證（Supabase Root 2021 CA），Node 預設不認。整條鏈放在 `src/lib/supabase-ca.pem`（用 `openssl s_client -starttls postgres -connect aws-0-ap-northeast-1.pooler.supabase.com:6543 -showcerts` 抓的）並編進 `src/lib/supabase-ca.ts`，Lambda 不需要旁邊有檔案。憑證換了就重抓、重產 `.ts`。
-
-搬資料的步驟（本機，`.env` 先不要設 `DATABASE_URL`，這樣 `copy-db` 的來源才是 Aurora）：
-
-```sh
-DATABASE_URL="<pooler url>" npm run migrate      # 在 Supabase 建 schema
-npm run copy-db -- --to "<pooler url>"            # 整份複製；可重跑，只補不刪
-```
-
-`copy-db` 每張表印出來源筆數、複製筆數、目標現在筆數。然後把 `DATABASE_URL` 加進 GitHub `prod` environment 的 secrets，push 一次（或 workflow_dispatch）部署；部署完 Strava webhook、API、週回顧都寫 Supabase。之後本機 `.env` 也設 `DATABASE_URL`，`migrate`／`sql`／`seed` 就都對 Supabase。
+- 連線字串一定用 **pooler**（`postgres.<ref>@aws-0-ap-northeast-1.pooler.supabase.com:6543`）：Lambda 走 IPv4，Supabase 的直連主機只有 IPv6。
+- TLS：Supabase 的憑證鏈到它自己的根（Supabase Root 2021 CA），整條鏈編在 `src/lib/supabase-ca.ts`。要重抓：`openssl s_client -starttls postgres -connect aws-0-ap-northeast-1.pooler.supabase.com:6543 -showcerts </dev/null | sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p'`，貼進那個檔的字串。`DB_SSL_CA`（PEM 文字）可以臨時覆蓋。
+- Schema 還是 `npm run migrate`（跑 `sql/schema.sql`，可重跑）。
 
 ## 教練 Woo（`src/lib/coach.ts`）
 
@@ -268,7 +257,7 @@ training-api/
 ├── infra/        CDK（bin/app.ts, lib/stack.ts）
 ├── src/
 │   ├── handlers/ webhook / worker / oauth / weekly / api
-│   ├── lib/      db（IAM token + pg Pool）、strava、claude
+│   ├── lib/      db（pg Pool → Supabase）、supabase-ca（憑證鏈）、strava、claude
 │   └── types.ts  內部 row / Strava 型別
 ├── types/        api.ts — API request/response 型別（前端直接複製用）
 ├── sql/          schema.sql
