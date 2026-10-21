@@ -40,13 +40,18 @@ export function dbConfigFromEnv(): DbConfig {
   };
 }
 
-// Trust store for Aurora's TLS handshake: the RDS global CA bundle (bundled next
-// to the handler by CDK's commandHooks.afterBundling; src/lib/ under tsx) plus
-// Node's public roots, which the public endpoint's chain may need. Supabase's
-// certificates chain to public roots, so the bundle is only read for Aurora.
-function rdsTrustStore(): string[] {
-  const file = path.join(__dirname, "global-bundle.pem");
-  return [...(fs.existsSync(file) ? [fs.readFileSync(file, "utf8")] : []), ...tls.rootCertificates];
+// Trust stores. Both databases present chains that end in their own root, so
+// each gets its CA bundle (copied next to the handler by CDK's
+// commandHooks.afterBundling; read from src/lib/ under tsx) plus Node's public
+// roots. Aurora: the RDS global bundle. Supabase: `supabase-ca.pem`, downloaded
+// from Project Settings → Database → SSL Configuration ("prod-ca-2021.crt");
+// DB_SSL_CA (PEM text) overrides the file, e.g. for a one-off script.
+function trustStore(file: string, envName?: string): string[] {
+  const fromEnv = envName ? process.env[envName] : undefined;
+  const p = path.join(__dirname, file);
+  const own = fromEnv ? [fromEnv] : fs.existsSync(p) ? [fs.readFileSync(p, "utf8")] : [];
+  if (!own.length) console.warn(`${file} not found: relying on Node's public roots only`);
+  return [...own, ...tls.rootCertificates];
 }
 
 const common = {
@@ -61,7 +66,7 @@ const common = {
 /** A pool for `config`; scripts that talk to two databases build their own. */
 export async function makePool(config: DbConfig): Promise<Pool> {
   if (config.kind === "url") {
-    return new Pool({ connectionString: config.url, ssl: { rejectUnauthorized: true }, ...common });
+    return new Pool({ connectionString: config.url, ssl: { ca: trustStore("supabase-ca.pem", "DB_SSL_CA"), rejectUnauthorized: true }, ...common });
   }
   const signer = new Signer({ hostname: config.host, port: config.port, username: config.user, region: config.region });
   const token = await signer.getAuthToken();
@@ -83,7 +88,7 @@ export async function makePool(config: DbConfig): Promise<Pool> {
     user: config.user,
     database: config.database,
     password: token,
-    ssl: { ca: rdsTrustStore(), rejectUnauthorized: true },
+    ssl: { ca: trustStore("global-bundle.pem"), rejectUnauthorized: true },
     ...common,
   });
 }

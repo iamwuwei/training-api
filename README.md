@@ -234,6 +234,8 @@ Aurora Serverless v2 壓到 0 ACU 每次冷啟動要 15〜30 秒，所以改用 
 
 Lambda 走 IPv4，Supabase 的直連主機只有 IPv6，所以要用 **pooler** 的連線字串（Project → Connect → Transaction pooler，`…pooler.supabase.com:6543`）。
 
+TLS：Supabase 的憑證鏈到它自己的根憑證，Node 預設不認。到 Project Settings → Database → SSL Configuration 下載 `prod-ca-2021.crt`，存成 `src/lib/supabase-ca.pem` 並 commit（跟 Aurora 的 `global-bundle.pem` 一樣，CDK 會把 `src/lib/*.pem` 複製到 Lambda 旁邊）。沒有這個檔會印警告並只用公開根憑證，連線會失敗。
+
 搬資料的步驟（本機，`.env` 先不要設 `DATABASE_URL`，這樣 `copy-db` 的來源才是 Aurora）：
 
 ```sh

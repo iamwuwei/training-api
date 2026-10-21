@@ -109,9 +109,10 @@ export class TrainingApiStack extends cdk.Stack {
           commandHooks: {
             beforeBundling: () => [],
             beforeInstall: () => [],
-            // db.ts reads global-bundle.pem next to the bundled handler.
+            // db.ts reads the CA bundles (global-bundle.pem for Aurora,
+            // supabase-ca.pem for Supabase) next to the bundled handler.
             afterBundling: (inputDir, outputDir) => [
-              `cp "${path.join(inputDir, "src", "lib", "global-bundle.pem")}" "${outputDir}/"`,
+              `cp "${path.join(inputDir, "src", "lib")}"/*.pem "${outputDir}/"`,
             ],
           },
         },
