@@ -1,14 +1,15 @@
 import "dotenv/config";
 import fs from "node:fs";
 import path from "node:path";
-import { end, query } from "../src/lib/db";
+import { dbConfigFromEnv, end, query } from "../src/lib/db";
 
 // Runs sql/schema.sql against Aurora using your local AWS credentials
 // (IAM auth, same as the Lambdas). Schema is idempotent.
 
 async function main() {
   const sql = fs.readFileSync(path.join(__dirname, "..", "sql", "schema.sql"), "utf8");
-  console.log(`connecting to ${process.env.DB_HOST} (Aurora may take ~15 s to wake)…`);
+  const cfg = dbConfigFromEnv();
+  console.log(cfg.kind === "url" ? `connecting to ${new URL(cfg.url).host}…` : `connecting to ${cfg.host} (Aurora may take ~15 s to wake)…`);
   await query(sql);
   const tables = await query<{ table_name: string }>(
     "select table_name from information_schema.tables where table_schema = 'public' order by 1",
