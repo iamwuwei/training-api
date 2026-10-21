@@ -34,7 +34,7 @@ cp .env.example .env
 | `STRAVA_CLIENT_ID` / `STRAVA_CLIENT_SECRET` | https://www.strava.com/settings/api |
 | `STRAVA_VERIFY_TOKEN` | 自己亂打一串，註冊 webhook 時 Strava 會拿它來驗證 |
 | `ANTHROPIC_API_KEY` | 週總結用 |
-| `CLAUDE_MODEL` | 單次判定，預設 `claude-haiku-4-5` |
+| `CLAUDE_MODEL` | 單次判定，預設 `claude-sonnet-5-5` |
 | `CLAUDE_MODEL_WEEKLY` | 週總結，預設 `claude-sonnet-5-5`（一週一次，讀整份課表＋兩週資料） |
 | `CLAUDE_MODEL_COACH` | Woo 回話，預設 `claude-sonnet-5-5`，帶 web search（地點、路線、天氣、賽事會先查） |
 | `AUTO_REVIEW` | `true`（預設）：使用者把活動對應到課表後，worker 請 Claude 寫判定；`false` 關掉 |

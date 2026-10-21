@@ -48,7 +48,7 @@ export class TrainingApiStack extends cdk.Stack {
     };
     const claudeEnv = {
       ANTHROPIC_API_KEY: required("ANTHROPIC_API_KEY"),
-      CLAUDE_MODEL: process.env.CLAUDE_MODEL ?? "claude-haiku-4-5",
+      CLAUDE_MODEL: process.env.CLAUDE_MODEL ?? "claude-sonnet-5-5",
       CLAUDE_MODEL_WEEKLY: process.env.CLAUDE_MODEL_WEEKLY ?? "claude-sonnet-5-5",
       CLAUDE_MODEL_COACH: process.env.CLAUDE_MODEL_COACH ?? "claude-sonnet-5-5",
     };
