@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run typecheck)",
+      "Bash(npm run lint)",
+      "Bash(npx tsc --noEmit)",
+      "Bash(git fetch *)",
+      "Bash(git ls-remote *)",
+      "mcp__github__actions_list",
+      "mcp__github__get_job_logs",
+      "mcp__github__pull_request_read",
+      "mcp__github__get_file_contents",
+      "mcp__github__list_pull_requests",
+      "mcp__github__list_commits",
+      "mcp__github__list_branches",
+      "mcp__github__get_check_run",
+      "mcp__github__get_me",
+      "mcp__claude-code-remote__list_repos",
+      "mcp__claude-code-remote__read_documentation",
+      "mcp__claude-code-remote__get_session",
+      "mcp__claude-code-remote__list_sessions"
+    ]
+  }
+}
