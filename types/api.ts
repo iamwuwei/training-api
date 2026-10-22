@@ -133,7 +133,7 @@ export interface ApiActivity {
 export interface PlanResponse {
   /** Coach messages posted since the athlete last opened the thread (PUT /coach/seen). Drives the tab badge. */
   coach_unread: number;
-  /** Woo has an unanswered "which activity was today's session?" check-in; the today page points to /coach. */
+  /** Woo is waiting on the athlete: an open check-in (which activity?) or an open question (how did it feel?). The today page points to /coach. */
   coach_checkin_open: boolean;
   plan: ApiPlan;
   weeks: ApiWeek[];

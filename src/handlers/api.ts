@@ -281,7 +281,7 @@ async function getPlan(userId: string) {
   );
 
   const openCheckin = await queryOne<{ id: string }>(
-    "select id from coach_messages where user_id = $1 and kind = 'checkin' and meta->>'state' = 'open' limit 1",
+    `select id from coach_messages where user_id = $1 and meta->>'state' = 'open' and kind in ('checkin', 'ask') limit 1`,
     [userId],
   );
 
