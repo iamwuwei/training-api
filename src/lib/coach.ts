@@ -145,7 +145,9 @@ async function threadFor(userId: string, upTo: CoachMessageRow): Promise<Anthrop
   const turns: Anthropic.MessageParam[] = [];
   for (const m of rows.reverse()) {
     const role = m.role === "athlete" ? "user" : "assistant";
-    const prefix = m.kind === "weekly" ? "（週回顧）" : m.kind === "review" ? `（跑完的判定：${(m.meta as { label?: string; verdict?: string } | null)?.label ?? ""} ${(m.meta as { verdict?: string } | null)?.verdict ?? ""}）` : "";
+    const prefix = m.kind === "weekly" ? "（週回顧）"
+      : m.kind === "review" ? `（跑完的判定：${(m.meta as { label?: string; verdict?: string } | null)?.label ?? ""} ${(m.meta as { verdict?: string } | null)?.verdict ?? ""}）`
+      : m.kind === "checkin" ? "（跑完的確認）" : m.kind === "pick" ? "（他選了：）" : m.kind === "ask" ? "（問感受）" : "";
     const text = `${prefix}${m.text}`.trim();
     const last = turns[turns.length - 1];
     if (last && last.role === role) last.content = `${last.content as string}\n\n${text}`; // the API wants alternating roles

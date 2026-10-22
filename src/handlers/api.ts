@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyResultV2 } from "aws-lambda";
 import { isDbWaking, query, queryOne } from "../lib/db";
+import { type CheckinMeta } from "../lib/checkin";
 import { COACH_NAME, MAX_MESSAGE_CHARS, postCoachMessage } from "../lib/coach";
 import { deauthorize } from "../lib/strava";
-import type { ActivityRow, CoachMessageRow, CoachReplyJob, PlanRow, PlanWeekRow, PlannedSessionRow, ReviewRow, StoredAdjustments, StravaConnectionRow, UserRow, WeeklyReviewRow } from "../types";
+import type { ActivityRow, CoachAskJob, CoachMessageRow, CoachReplyJob, PlanRow, PlanWeekRow, PlannedSessionRow, ReviewRow, StoredAdjustments, StravaConnectionRow, UserRow, WeeklyReviewRow } from "../types";
 import type {
   ActivitiesResponse,
   ApiActivity,
@@ -30,6 +31,9 @@ import type {
   CoachResponse,
   PostCoachMessageRequest,
   PostCoachMessageResponse,
+  ApiCheckin,
+  PostCheckinPickRequest,
+  PostCheckinPickResponse,
   PutCoachSeenResponse,
 } from "../../types/api";
 
@@ -50,6 +54,7 @@ import type {
 //   GET /coach                       the coach's thread (weekly reviews, verdicts, chat)
 //   POST /coach/messages             say something to the coach; the worker answers
 //   PUT /coach/seen                  the thread was opened; clears coach_unread on GET /plan
+//   POST /coach/checkins/{id}/pick   which activity was today's session (Woo's check-in chips)
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const STATUSES = new Set<string>(["auto", "confirmed", "unplanned", "ignored"] satisfies MatchStatus[]);
@@ -57,7 +62,7 @@ const VERDICTS = new Set<string>(["達成", "達成但有提醒", "未達成"]);
 
 const sqs = new SQSClient({});
 
-const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | PutSessionResponse | PutMemoResponse | RereviewResponse | WeeklyResponse | PostAdjustmentResponse | CoachResponse | PostCoachMessageResponse | PutCoachSeenResponse | ErrorResponse>(
+const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | PutSessionResponse | PutMemoResponse | RereviewResponse | WeeklyResponse | PostAdjustmentResponse | CoachResponse | PostCoachMessageResponse | PutCoachSeenResponse | PostCheckinPickResponse | ErrorResponse>(
   statusCode: number,
   body: T,
 ): APIGatewayProxyResultV2 => ({
@@ -131,6 +136,8 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
   if (method === "GET" && path === "/weekly") return getWeekly(user.id);
   if (method === "GET" && path === "/coach") return getCoach(user.id);
   if (method === "PUT" && path === "/coach/seen") return putCoachSeen(user.id);
+  const pick = /^\/coach\/checkins\/([^/]+)\/pick$/.exec(path);
+  if (method === "POST" && pick) return postCheckinPick(user.id, pick[1], raw);
   if (method === "POST" && path === "/coach/messages") return postCoach(user.id, raw);
   const adj = /^\/weekly\/([^/]+)\/adjustments\/(\d+)$/.exec(path);
   if (method === "POST" && adj) return postAdjustment(user.id, adj[1], Number(adj[2]), raw);
@@ -273,8 +280,14 @@ async function getPlan(userId: string) {
     [userId],
   );
 
+  const openCheckin = await queryOne<{ id: string }>(
+    "select id from coach_messages where user_id = $1 and kind = 'checkin' and meta->>'state' = 'open' limit 1",
+    [userId],
+  );
+
   return json<PlanResponse>(200, {
     coach_unread: Number(unread?.n ?? 0),
+    coach_checkin_open: Boolean(openCheckin),
     plan,
     weeks: weeks.map(({ week_no, week_start, week_end, phase, focus }) => ({ week_no, week_start, week_end, phase, focus })),
     sessions,
@@ -360,28 +373,8 @@ async function putSession(userId: string, activityId: string, raw: string) {
     await query("update activities set session_id = null, match_status = $2 where id = $1", [activityId, status]);
     await query("delete from reviews where activity_id = $1 and source = 'claude'", [activityId]);
   } else {
-    if (!UUID_RE.test(body.session_id)) return json(400, { error: "invalid session id" });
-    const session = await queryOne<{ id: string }>(
-      `select ps.id from planned_sessions ps join plans p on p.id = ps.plan_id
-        where ps.id = $1 and p.user_id = $2 and ps.superseded = false`,
-      [body.session_id, userId],
-    );
-    if (!session) return json(404, { error: "session not found" });
-
-    // One activity per session: bump an automatic holder; a confirmed one only with `replace`.
-    const holder = await queryOne<{ id: string; match_status: MatchStatus }>(
-      "select id, match_status from activities where session_id = $1 and id <> $2",
-      [session.id, activityId],
-    );
-    if (holder?.match_status === "confirmed" && !body.replace) {
-      return json(409, { error: "session already confirmed for another activity" });
-    }
-    if (holder) {
-      await query("update activities set session_id = null, match_status = 'unplanned' where id = $1", [holder.id]);
-      await query("delete from reviews where activity_id = $1 and source = 'claude'", [holder.id]);
-    }
-
-    await query("update activities set session_id = $2, match_status = 'confirmed' where id = $1", [activityId, session.id]);
+    const err = await assignSession(userId, activityId, body.session_id, Boolean(body.replace));
+    if (err) return json(err.status, { error: err.error });
     if (memoFields) {
       await query("update activities set memo = $2, rpe = $3, memo_updated_at = now() where id = $1", [activityId, memoFields.memo, memoFields.rpe]);
     }
@@ -400,6 +393,31 @@ async function putSession(userId: string, activityId: string, raw: string) {
     [activityId],
   );
   return json<PutSessionResponse>(200, { activity: toApiActivity(row) });
+}
+
+/**
+ * Point `activityId` at `sessionId` (match_status confirmed), bumping an automatic
+ * holder; a confirmed holder only with `replace`. No review is queued here.
+ */
+async function assignSession(userId: string, activityId: string, sessionId: string, replace: boolean): Promise<{ status: number; error: string } | null> {
+  if (!UUID_RE.test(sessionId)) return { status: 400, error: "invalid session id" };
+  const session = await queryOne<{ id: string }>(
+    `select ps.id from planned_sessions ps join plans p on p.id = ps.plan_id
+      where ps.id = $1 and p.user_id = $2 and ps.superseded = false`,
+    [sessionId, userId],
+  );
+  if (!session) return { status: 404, error: "session not found" };
+  const holder = await queryOne<{ id: string; match_status: MatchStatus }>(
+    "select id, match_status from activities where session_id = $1 and id <> $2",
+    [session.id, activityId],
+  );
+  if (holder?.match_status === "confirmed" && !replace) return { status: 409, error: "session already confirmed for another activity" };
+  if (holder) {
+    await query("update activities set session_id = null, match_status = 'unplanned' where id = $1", [holder.id]);
+    await query("delete from reviews where activity_id = $1 and source = 'claude'", [holder.id]);
+  }
+  await query("update activities set session_id = $2, match_status = 'confirmed' where id = $1", [activityId, session.id]);
+  return null;
 }
 
 /** Push the activity back through the worker so a Claude review is regenerated. */
@@ -603,8 +621,22 @@ function toApiCoachMessage(m: CoachMessageRow): ApiCoachMessage {
       ? { label: String(meta.label ?? ""), verdict: (meta.verdict as Verdict | undefined) ?? null, reminder: (meta.reminder as string | null) ?? null, date: (meta.date as string | undefined) ?? null }
       : null,
     quote: typeof meta.quote === "string" ? meta.quote : null,
+    rpe: typeof meta.rpe === "number" ? meta.rpe : null,
+    checkin: m.kind === "checkin" ? toApiCheckin(meta as unknown as CheckinMeta) : null,
+    ask: m.kind === "ask" ? { state: meta.state === "answered" ? "answered" : "open", activity_id: String(meta.activity_id ?? ""), session_id: String(meta.session_id ?? "") } : null,
     error: typeof meta.error === "string" ? meta.error : null,
     created_at: new Date(m.created_at).toISOString(),
+  };
+}
+
+function toApiCheckin(meta: CheckinMeta): ApiCheckin {
+  return {
+    state: meta.state ?? "open",
+    mode: meta.mode ?? "activity",
+    date: meta.date ?? "",
+    session_id: meta.session_id ?? null,
+    session_label: meta.session_label ?? null,
+    candidates: Array.isArray(meta.candidates) ? meta.candidates : [],
   };
 }
 
@@ -634,6 +666,57 @@ async function putCoachSeen(userId: string) {
   return json<PutCoachSeenResponse>(200, { seen_at: new Date(row?.seen_at ?? Date.now()).toISOString() });
 }
 
+async function postCheckinPick(userId: string, checkinId: string, raw: string) {
+  if (!UUID_RE.test(checkinId)) return json(400, { error: "invalid check-in id" });
+  let body: PostCheckinPickRequest;
+  try {
+    body = JSON.parse(raw) as PostCheckinPickRequest;
+  } catch {
+    return json(400, { error: "invalid json" });
+  }
+  const checkin = await queryOne<CoachMessageRow>("select * from coach_messages where id = $1 and user_id = $2 and kind = 'checkin'", [checkinId, userId]);
+  if (!checkin) return json(404, { error: "check-in not found" });
+  const meta = (checkin.meta ?? {}) as unknown as CheckinMeta;
+  if (meta.state !== "open") return json(409, { error: "check-in is no longer open" });
+
+  const setMeta = (patch: Partial<CheckinMeta>) =>
+    query("update coach_messages set meta = $2 where id = $1", [checkin.id, JSON.stringify({ ...meta, ...patch })]);
+
+  if (body.none) {
+    await setMeta({ state: "dismissed" });
+    const pick = await postCoachMessage({ user_id: userId, role: "athlete", kind: "pick", text: "都不是", meta: { none: true } });
+    await postCoachMessage({ user_id: userId, role: "coach", kind: "chat", text: "好，這趟不算。要記到別堂課的話，今天頁的表單可以選。" });
+    const [c] = await query<CoachMessageRow>("select * from coach_messages where id = $1", [checkin.id]);
+    return json<PostCheckinPickResponse>(200, { checkin: toApiCoachMessage(c), pick: toApiCoachMessage(pick) });
+  }
+
+  // activity mode: the chip is an activity, the session is today's; session mode: the reverse.
+  const activityId = meta.mode === "activity" ? body.activity_id : checkin.activity_id;
+  const sessionId = meta.mode === "activity" ? meta.session_id : body.session_id;
+  if (!activityId || !sessionId || !UUID_RE.test(activityId)) return json(400, { error: meta.mode === "activity" ? "activity_id is required" : "session_id is required" });
+  const candidate = meta.candidates.find((c) => (meta.mode === "activity" ? c.activity_id === activityId : c.session_id === sessionId));
+  if (!candidate) return json(400, { error: "not one of the candidates" });
+
+  const err = await assignSession(userId, activityId, sessionId, false);
+  if (err) return json(err.status, { error: err.error });
+  await setMeta({ state: "picked", picked: { activity_id: activityId, session_id: sessionId } });
+
+  const pick = await postCoachMessage({
+    user_id: userId, role: "athlete", kind: "pick", text: candidate.label, status: "pending", activity_id: activityId,
+    meta: { activity_id: activityId, session_id: sessionId },
+  });
+  if (process.env.QUEUE_URL) {
+    await sqs.send(new SendMessageCommand({
+      QueueUrl: process.env.QUEUE_URL,
+      MessageBody: JSON.stringify({ type: "coach_ask", user_id: userId, message_id: pick.id } satisfies CoachAskJob),
+    }));
+  } else {
+    await query("update coach_messages set status = 'sent' where id = $1", [pick.id]);
+  }
+  const [c] = await query<CoachMessageRow>("select * from coach_messages where id = $1", [checkin.id]);
+  return json<PostCheckinPickResponse>(200, { checkin: toApiCoachMessage(c), pick: toApiCoachMessage(pick) });
+}
+
 async function postCoach(userId: string, raw: string) {
   let body: PostCoachMessageRequest;
   try {
@@ -655,6 +738,33 @@ async function postCoach(userId: string, raw: string) {
       [userId],
     ))!;
     if (Number(n) >= limit) return json(429, { error: "daily limit reached" });
+  }
+
+  // Answering Woo's question after a check-in: the words become the memo, the
+  // review runs with them, and its verdict is the reply.
+  if (body.answer_to) {
+    if (!UUID_RE.test(body.answer_to)) return json(400, { error: "invalid answer_to" });
+    const ask = await queryOne<CoachMessageRow>("select * from coach_messages where id = $1 and user_id = $2 and kind = 'ask'", [body.answer_to, userId]);
+    if (!ask) return json(404, { error: "question not found" });
+    const am = (ask.meta ?? {}) as { activity_id?: string; state?: string };
+    if (am.state === "answered") return json(409, { error: "already answered" });
+    const parsed = parseMemo({ memo: text, rpe: body.rpe ?? null });
+    if (typeof parsed === "string") return json(400, { error: parsed });
+    const activity = await queryOne<{ id: string; strava_activity_id: string; session_id: string | null }>(
+      "select id, strava_activity_id, session_id from activities where id = $1 and user_id = $2",
+      [am.activity_id ?? "", userId],
+    );
+    if (!activity) return json(404, { error: "activity not found" });
+    await query("update activities set memo = $2, rpe = $3, memo_updated_at = now() where id = $1", [activity.id, parsed.memo, parsed.rpe]);
+    await query("update coach_messages set meta = coalesce(meta, '{}'::jsonb) || '{\"state\":\"answered\"}'::jsonb where id = $1", [ask.id]);
+    const m = await postCoachMessage({
+      user_id: userId, role: "athlete", kind: "chat", text, status: "pending", activity_id: activity.id,
+      meta: { answer_to: ask.id, rpe: parsed.rpe },
+    });
+    await query("delete from reviews where activity_id = $1 and source = 'claude'", [activity.id]);
+    if (activity.session_id) await requeue(userId, activity.strava_activity_id, "check-in answered");
+    else await query("update coach_messages set status = 'sent' where id = $1", [m.id]);
+    return json<PostCoachMessageResponse>(202, { message: toApiCoachMessage(m) });
   }
 
   let quote: string | null = null;

@@ -133,6 +133,8 @@ export interface ApiActivity {
 export interface PlanResponse {
   /** Coach messages posted since the athlete last opened the thread (PUT /coach/seen). Drives the tab badge. */
   coach_unread: number;
+  /** Woo has an unanswered "which activity was today's session?" check-in; the today page points to /coach. */
+  coach_checkin_open: boolean;
   plan: ApiPlan;
   weeks: ApiWeek[];
   sessions: ApiSession[];    // not superseded, ordered by date
@@ -263,18 +265,39 @@ export interface PostAdjustmentResponse {
 // system (weekly review, each run's verdict) or written in reply; athlete messages
 // are `pending` until the coach answers, `failed` if the answer could not be made.
 
+/**
+ * Kinds: weekly (coach, Sunday review), review (coach, a run's verdict), chat
+ * (either side), and the post-run check-in trio — checkin (coach: "which
+ * activity was today's session?" with chips), pick (athlete: the chip they
+ * chose; pending until Woo's question arrives), ask (coach: the follow-up
+ * question; answered with POST /coach/messages { answer_to }).
+ */
 export interface ApiCoachMessage {
   id: string;
   role: "coach" | "athlete";
-  kind: "weekly" | "review" | "chat";
+  kind: "weekly" | "review" | "chat" | "checkin" | "pick" | "ask";
   text: string;
-  activity_id: string | null;        // review: the reviewed run; athlete chat: the quoted run
+  activity_id: string | null;        // review/ask/pick: that run; athlete chat: the quoted run
   weekly_review_id: string | null;   // weekly: look its proposals up in GET /weekly
   status: "pending" | "sent" | "failed";
   review: { label: string; verdict: Verdict | null; reminder: string | null; date: string | null } | null;
   quote: string | null;              // athlete chat sent from a report: one line about that run
+  rpe: number | null;                // athlete answer to an ask: the RPE they picked
+  checkin: ApiCheckin | null;        // kind checkin
+  ask: { state: "open" | "answered"; activity_id: string; session_id: string } | null; // kind ask
   error: string | null;              // failed: why
   created_at: string;
+}
+
+export interface ApiCheckin {
+  state: "open" | "picked" | "dismissed";
+  /** activity: today's session is known, chips are the day's activities; session: rest day, chips are this week's open sessions. */
+  mode: "activity" | "session";
+  date: string;
+  session_id: string | null;
+  session_label: string | null;
+  /** First candidate is Woo's guess. */
+  candidates: { activity_id?: string; session_id?: string; label: string }[];
 }
 
 export interface CoachResponse {
@@ -290,6 +313,30 @@ export interface CoachResponse {
 export interface PostCoachMessageRequest {
   text: string;          // ≤ 500 chars
   activity_id?: string;  // quote this run (from the report page's 問教練)
+  /**
+   * Answering Woo's `ask` after a check-in: the text becomes the activity's
+   * memo (rpe too), the review is queued and its verdict is the reply. No chat
+   * reply is generated for an answer.
+   */
+  answer_to?: string;
+  rpe?: number;          // 1-10, only with answer_to
+}
+
+// ---- POST <ApiUrl>/coach/checkins/{id}/pick ---------------------------------------
+// The athlete tapped a chip on a `checkin`. activity mode: { activity_id };
+// session mode: { session_id }; "都不是": { none: true }. Assigns the activity
+// (no review yet), posts the athlete's `pick` (pending) and queues Woo's `ask`.
+// 409 when the check-in is no longer open.
+
+export interface PostCheckinPickRequest {
+  activity_id?: string;
+  session_id?: string;
+  none?: boolean;
+}
+
+export interface PostCheckinPickResponse {
+  checkin: ApiCoachMessage;
+  pick: ApiCoachMessage | null;
 }
 
 /** PUT /coach/seen: the thread was opened; `coach_unread` on GET /plan drops to 0. */

@@ -199,6 +199,8 @@ aws cognito-idp admin-set-user-password --user-pool-id $POOL --username you@exam
 - `POST <ApiUrl>/weekly/{id}/adjustments/{index}` body `{ action: "apply" | "dismiss" }` → 採用會新增一筆 `version+1` 的 planned_session、舊的標 `superseded`、活動跟著搬；`/plan` 立刻反映。
 - `GET <ApiUrl>/coach` → `CoachResponse { coach: { name: "Woo" }, messages }`：教練的對話串（最近 100 則，舊在前）。週總結和每次判定由系統貼進來；跑者的訊息 `pending` 直到 Woo 回覆、失敗是 `failed`。
 - `PUT <ApiUrl>/coach/seen` → `{ seen_at }`：跑者打開教練頁時呼叫，`GET /plan` 的 `coach_unread`（Woo 在那之後貼的訊息數）歸零；前端用它亮「教練」tab 的小點。
+- `POST <ApiUrl>/coach/checkins/{id}/pick` body `{ activity_id }`（休息日模式 `{ session_id }`）或 `{ none: true }` → `{ checkin, pick }`：Woo 的 check-in 選了一個 chip。把活動配到今天的課（不先分析），貼跑者的 `pick`（`pending`），丟 SQS `{ type: "coach_ask" }` 讓 worker 用教練模型寫一句追問（`ask`）。`none` 是「都不是」，Woo 回一句、不配課。
+- `POST <ApiUrl>/coach/messages` 多了 `answer_to`（`ask` 的 id）和 `rpe`：回 Woo 的追問。文字存成活動的心得、RPE 存進活動，刪掉舊的 Claude 判定、requeue 分析；判定貼進對話串後跑者這則由 `pending` 變 `sent`。不會另外產生聊天回覆。
 - `POST <ApiUrl>/coach/messages` body `{ text, activity_id? }` → 202，存成 `pending` 並丟 SQS，worker 用 Haiku 回（`src/lib/coach.ts`）；前端輪詢 `GET /coach`。`activity_id` 會把那筆活動的一行摘要當引用。500 字上限；`COACH_DAILY_LIMIT`（預設 0 = 不限）之後開放給別人用時再打開。
 - `PUT <ApiUrl>/activities/{id}/memo` body `PutMemoRequest { memo, rpe? }` → 跑者自己的心得和 RPE（1〜10）。存完如果那筆的判定是 Claude 寫的，會刪掉重評，新的判定會參考這段自述；手動判定不動。
 - `PUT <ApiUrl>/activities/{id}/session` body `PutSessionRequest { session_id, memo?, rpe?, replace?, status? }` → 使用者指定這筆活動是哪堂課（`confirmed`），可同時帶心得與 RPE。原本 `auto` 占著那個 session 的活動會退回 `unplanned`；`confirmed` 占著回 409（帶 `replace: true` 才換）。指定後舊的 Claude 判定刪掉、丟回 SQS 重評一次。`session_id: null` 配 `status: "ignored"` 表示這筆不算。
@@ -233,6 +235,16 @@ Strava 同步進來的活動（所有運動）一律存成 `unplanned`、`sessio
 - 連線字串一定用 **pooler**（`postgres.<ref>@aws-0-ap-northeast-1.pooler.supabase.com:6543`）：Lambda 走 IPv4，Supabase 的直連主機只有 IPv6。
 - TLS：Supabase 的憑證鏈到它自己的根（Supabase Root 2021 CA），整條鏈編在 `src/lib/supabase-ca.ts`。要重抓：`openssl s_client -starttls postgres -connect aws-0-ap-northeast-1.pooler.supabase.com:6543 -showcerts </dev/null | sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p'`，貼進那個檔的字串。`DB_SSL_CA`（PEM 文字）可以臨時覆蓋。
 - Schema 還是 `npm run migrate`（跑 `sql/schema.sql`，可重跑）。
+
+## 跑完的 check-in（`src/lib/checkin.ts`）
+
+Strava 活動一存進來（新的、還沒配課）worker 就叫 `maybeCheckin`：
+
+1. 今天有非休息的課、還沒配活動、而且類型對得上（跑步對跑步課，重訓類對 `肌力` 日）→ 貼一則 `checkin`：「今天的課是 X：內容。Strava 剛進來 N 個活動，哪一個是這堂？」`meta.candidates` 是當天還沒配課、同類型的活動（最新的排第一＝Woo 猜的）。同一天已有開著的 check-in 就更新它，不疊第二則。
+2. 今天是休息日 → `mode = session`：「今天是休息日，剛進來 ○○，要算這週的哪一堂？」候選是本週還沒完成、同類型的課。
+3. 其他情況（走路、課已完成）不吵人。
+
+選了 chip → `POST /coach/checkins/{id}/pick` 配課、貼 `pick`、worker 的 `askAboutActivity` 用 `CLAUDE_MODEL_COACH` 寫 1〜2 句追問（模型失敗就用課型的固定問句，流程不會卡住）。跑者回答 → `POST /coach/messages { answer_to, rpe }` → 心得存進活動、requeue 分析 → 判定貼進對話串。`GET /plan` 的 `coach_checkin_open` 告訴今天頁要顯示「Woo 在問這趟練得怎麼樣」。
 
 ## 教練 Woo（`src/lib/coach.ts`）
 

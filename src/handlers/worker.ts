@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type { SQSHandler } from "aws-lambda";
 import { reviewActivity } from "../lib/claude";
+import { askAboutActivity, maybeCheckin, settleAthleteMessages } from "../lib/checkin";
 import { answerCoachMessage, postCoachMessage } from "../lib/coach";
 import { loadReviewContext } from "../lib/context";
 import { isDbWaking, query, queryOne } from "../lib/db";
 import { getActivity, refreshToken, StravaError } from "../lib/strava";
-import type { CoachReplyJob, PlannedSessionRow, StravaConnectionRow, StravaWebhookEvent } from "../types";
+import type { CoachAskJob, CoachReplyJob, PlannedSessionRow, StravaConnectionRow, StravaWebhookEvent } from "../types";
 
 // Any thrown error => SQS redelivers (visibility 90 s, 3 tries, then DLQ).
 // Aurora resuming from 0 ACU is the usual first failure: wait inside this run
@@ -15,9 +16,15 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const todayJst = () => new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
 
-async function handleJob(body: StravaWebhookEvent | CoachReplyJob): Promise<void> {
+type Job = StravaWebhookEvent | CoachReplyJob | CoachAskJob;
+
+async function handleJob(body: Job): Promise<void> {
   if ("type" in body && body.type === "coach_reply") {
     await answerCoachMessage(body.user_id, body.message_id, todayJst());
+    return;
+  }
+  if ("type" in body && body.type === "coach_ask") {
+    await askAboutActivity(body.user_id, body.message_id);
     return;
   }
   await processEvent(body as StravaWebhookEvent);
@@ -25,7 +32,7 @@ async function handleJob(body: StravaWebhookEvent | CoachReplyJob): Promise<void
 
 export const handler: SQSHandler = async (event) => {
   for (const record of event.Records) {
-    const body = JSON.parse(record.body) as StravaWebhookEvent | CoachReplyJob;
+    const body = JSON.parse(record.body) as Job;
     try {
       await handleJob(body);
     } catch (err) {
@@ -87,7 +94,7 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
   const activityId = randomUUID();
 
   // On update events the athlete's choice (session_id / match_status) is never touched.
-  const [row] = await query<{ id: string; session_id: string | null; memo: string | null; rpe: number | null }>(
+  const [row] = await query<{ id: string; session_id: string | null; memo: string | null; rpe: number | null; inserted: boolean }>(
     `insert into activities
        (id, user_id, strava_activity_id, session_id, start_time, distance_m, moving_time_sec,
         avg_pace_sec_km, avg_hr, max_hr, avg_watts, kcal, description, device_name, gear_id, gear_name,
@@ -109,7 +116,7 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
        gear_name       = coalesce(excluded.gear_name, activities.gear_name),
        splits          = excluded.splits,
        raw             = excluded.raw
-     returning id, session_id, memo, rpe`,
+     returning id, session_id, memo, rpe, (xmax = 0) as inserted`,
     [
       activityId,
       conn.user_id,
@@ -136,6 +143,18 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
     `activity ${activity.id} (${localDate}, ${activity.sport_type}, ${(distance_m / 1000).toFixed(2)} km) -> ` +
       (row.session_id ? `session ${row.session_id}` : "waiting for the athlete to pick a session"),
   );
+
+  // A new, unassigned activity: Woo asks which session it was (if any fits today).
+  if (row.inserted && !row.session_id) {
+    try {
+      await maybeCheckin(conn.user_id, {
+        id: row.id, sport_type: activity.sport_type ?? activity.type, start_time: new Date(activity.start_date),
+        distance_m, moving_time_sec, avg_pace_sec_km, avg_hr: round(activity.average_heartrate), max_hr: round(activity.max_heartrate),
+      }, localDate);
+    } catch (err) {
+      console.error(`check-in failed for activity ${activity.id}`, err); // the athlete can still log it from the today page
+    }
+  }
 
   // Claude verdict (AUTO_REVIEW=true): only once the athlete has assigned the
   // activity to a session (the api requeues it then), once per activity, never over
@@ -188,6 +207,7 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
             user_id: conn.user_id, role: "coach", kind: "review", text: r.comment, activity_id: row.id,
             meta: { label, verdict: r.verdict, reminder: r.reminders[0] ?? null, date: localDate },
           });
+          await settleAthleteMessages(conn.user_id, row.id); // the answer that triggered this review is replied to
         } catch (err) {
           // Not requeued (SQS would only retry the same failure). Recorded so the
           // app can show "分析失敗" with a retry instead of waiting forever.
@@ -199,6 +219,8 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
              on conflict (activity_id) do nothing`,
             [randomUUID(), row.id, `分析失敗：${reason}`],
           );
+          await settleAthleteMessages(conn.user_id, row.id);
+          await postCoachMessage({ user_id: conn.user_id, role: "coach", kind: "chat", text: "這次分析沒成功，報告頁可以按「重新分析」。", activity_id: row.id });
         }
       }
     }

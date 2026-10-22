@@ -107,7 +107,7 @@ export interface CoachMessageRow {
   id: string;
   user_id: string;
   role: "coach" | "athlete";
-  kind: "weekly" | "review" | "chat";
+  kind: "weekly" | "review" | "chat" | "checkin" | "pick" | "ask"; // checkin/ask: coach; pick: athlete
   text: string;
   meta: Record<string, unknown> | null;
   activity_id: string | null;
@@ -121,6 +121,13 @@ export interface CoachReplyJob {
   type: "coach_reply";
   user_id: string;
   message_id: string;
+}
+
+/** SQS message asking the worker to post Woo's follow-up question after a check-in pick. */
+export interface CoachAskJob {
+  type: "coach_ask";
+  user_id: string;
+  message_id: string; // the athlete's `pick` message
 }
 
 export interface WeeklyReviewRow {
