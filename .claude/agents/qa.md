@@ -1,6 +1,6 @@
 ---
 name: qa
-description: 功能測試與 regression。照要件書的驗收條件和既有流程，在 mock 模式用 Playwright 走畫面並截圖，跑 typecheck/lint/build/tsc，回報通過與失敗。流程第 5 關，與 security 平行。
+description: 功能測試與 regression。照要件書的驗收條件和既有流程，在 mock 模式用 Playwright 走畫面並截圖，跑 typecheck/lint/build/tsc，回報通過與失敗。流程第 5 關（reviewer 通過後），與 security 平行。
 tools: Read, Grep, Glob, Bash
 model: inherit
 ---
@@ -15,4 +15,4 @@ model: inherit
 
 這次的驗收：01-要件.md 的驗收條件一條一條走，寫結果。
 
-產出 docs/work/<題目>/05-測試.md：通過／失敗清單（失敗附截圖路徑和重現步驟）、regression 有沒有退步、沒辦法在 mock 測到的項目（例如要真的 Strava／Claude 才會動的）明確列出。
+產出 docs/work/<題目>/06-測試.md：通過／失敗清單（失敗附截圖路徑和重現步驟）、regression 有沒有退步、沒辦法在 mock 測到的項目（例如要真的 Strava／Claude 才會動的）明確列出。
