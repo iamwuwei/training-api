@@ -54,7 +54,7 @@ function kindMatches(a: ActivityLite, s: PlannedSessionRow): boolean {
 }
 
 export interface CheckinMeta {
-  state: "open" | "picked" | "dismissed";
+  state: "open" | "picked" | "dismissed" | "reset"; // reset: the athlete asked to pick again (a new open one follows)
   mode: "activity" | "session";            // chips are activities (today's session known) or sessions (rest day)
   date: string;
   session_id: string | null;

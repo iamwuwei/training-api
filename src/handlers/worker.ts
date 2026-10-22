@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
 import type { SQSHandler } from "aws-lambda";
 import { reviewActivity } from "../lib/claude";
+import { writeBriefs } from "../lib/briefs";
 import { askAboutActivity, maybeCheckin, settleAthleteMessages } from "../lib/checkin";
+import { writeRoutine } from "../lib/strength";
 import { answerCoachMessage, postCoachMessage } from "../lib/coach";
 import { loadReviewContext } from "../lib/context";
 import { isDbWaking, query, queryOne } from "../lib/db";
 import { getActivity, refreshToken, StravaError } from "../lib/strava";
-import type { CoachAskJob, CoachReplyJob, PlannedSessionRow, StravaConnectionRow, StravaWebhookEvent } from "../types";
+import type { BriefsJob, CoachAskJob, CoachReplyJob, PlannedSessionRow, RoutineJob, StravaConnectionRow, StravaWebhookEvent } from "../types";
 
 // Any thrown error => SQS redelivers (visibility 90 s, 3 tries, then DLQ).
 // Aurora resuming from 0 ACU is the usual first failure: wait inside this run
@@ -16,7 +18,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const todayJst = () => new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
 
-type Job = StravaWebhookEvent | CoachReplyJob | CoachAskJob;
+type Job = StravaWebhookEvent | CoachReplyJob | CoachAskJob | RoutineJob | BriefsJob;
 
 async function handleJob(body: Job): Promise<void> {
   if ("type" in body && body.type === "coach_reply") {
@@ -25,6 +27,18 @@ async function handleJob(body: Job): Promise<void> {
   }
   if ("type" in body && body.type === "coach_ask") {
     await askAboutActivity(body.user_id, body.message_id);
+    return;
+  }
+  if ("type" in body && body.type === "routine") {
+    await writeRoutine(body.user_id, body.routine_id);
+    return;
+  }
+  if ("type" in body && body.type === "briefs") {
+    try {
+      await writeBriefs(body.user_id, body.from, body.to, body.force);
+    } catch (err) {
+      console.error(`briefs failed for user ${body.user_id}`, err); // not requeued; GET /plan asks again later
+    }
     return;
   }
   await processEvent(body as StravaWebhookEvent);

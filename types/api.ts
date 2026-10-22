@@ -72,6 +72,8 @@ export interface ApiSession {
   target_pace_max_sec_km: number | null; // slowest allowed
   target_hr_min: number | null;
   target_hr_max: number | null;
+  /** Woo's one line about this session ("第 1 趟當熱身，從第 2 趟才用力"), written by the worker; null until then. */
+  brief: string | null;
   version: number;
   superseded: boolean;
 }
@@ -145,6 +147,55 @@ export interface PlanResponse {
    * "which activity was this session?" picker come from here.
    */
   unassigned: ApiActivity[];
+  /** 肌力 checklists Woo wrote for sessions of this plan (see POST /sessions/{id}/routine). */
+  routines: ApiRoutine[];
+}
+
+// ---- 肌力 day: Woo's checklist ---------------------------------------------------
+// POST /sessions/{id}/routine { place } creates the routine (status pending) and the
+// worker fills it in a few seconds (poll GET /plan). With `regenerate: true` an
+// existing routine is replaced. PUT /sessions/{id}/routine ticks items, sets RPE /
+// note, and with `complete: true` closes it: Woo posts one line in the thread.
+
+export interface ApiRoutineItem {
+  name: string;       // '平板支撐 3 × 40 秒'
+  how: string | null; // one line on how to do it, behind the "?" button
+  done: boolean;
+}
+
+export interface ApiRoutine {
+  id: string;
+  session_id: string;
+  place: "home" | "gym";
+  status: "pending" | "ready" | "failed";
+  minutes: number | null;
+  rules: string | null;  // '組間休息 45 秒 · 動作之間 1 分鐘 · 全程 RPE 6〜7'
+  items: ApiRoutineItem[];
+  error: string | null;
+  rpe: number | null;
+  note: string | null;
+  completed_at: string | null;
+  created_at: string;
+}
+
+export interface PostRoutineRequest {
+  place: "home" | "gym";
+  regenerate?: boolean;
+}
+
+export interface PostRoutineResponse {
+  routine: ApiRoutine;
+}
+
+export interface PutRoutineRequest {
+  done?: boolean[];      // one per item, same length as items
+  rpe?: number | null;   // 1-10
+  note?: string | null;
+  complete?: boolean;    // close it (completed_at); Woo posts one line
+}
+
+export interface PutRoutineResponse {
+  routine: ApiRoutine;
 }
 
 // ---- GET <ApiUrl>/activities?status=<MatchStatus> --------------------------------
@@ -290,7 +341,8 @@ export interface ApiCoachMessage {
 }
 
 export interface ApiCheckin {
-  state: "open" | "picked" | "dismissed";
+  /** reset: the athlete asked to pick again; a new open check-in follows it in the thread. */
+  state: "open" | "picked" | "dismissed" | "reset";
   /** activity: today's session is known, chips are the day's activities; session: rest day, chips are this week's open sessions. */
   mode: "activity" | "session";
   date: string;
@@ -337,6 +389,16 @@ export interface PostCheckinPickRequest {
 export interface PostCheckinPickResponse {
   checkin: ApiCoachMessage;
   pick: ApiCoachMessage | null;
+}
+
+// ---- POST <ApiUrl>/coach/checkins/{id}/reset ---------------------------------------
+// "選錯了" / "重新選": a picked check-in's activity is unassigned again (its review
+// dropped, Woo's open question closed), a dismissed one is reopened. The old
+// check-in goes to state `reset`; a new open one (`checkin`) with the same chips is
+// posted after it. 409 when the check-in is still open.
+
+export interface PostCheckinResetResponse {
+  checkin: ApiCoachMessage;
 }
 
 /** PUT /coach/seen: the thread was opened; `coach_unread` on GET /plan drops to 0. */

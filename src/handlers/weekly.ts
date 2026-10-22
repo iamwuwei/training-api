@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { writeBriefs } from "../lib/briefs";
 import { weeklyReview } from "../lib/claude";
 import { postCoachMessage } from "../lib/coach";
 import { historyBetween, loadPlanWeeks } from "../lib/context";
@@ -92,6 +93,12 @@ export const handler = async (event: { week_start?: string } = {}) => {
       user_id: plan.user_id, role: "coach", kind: "weekly", text: review.summary, weekly_review_id: id,
       meta: { week_start: weekStart, proposals: review.adjustments.length },
     });
+    // Woo's one line per session for the next two weeks, rewritten with this week in mind.
+    try {
+      await writeBriefs(plan.user_id, addDays(weekEnd, 1), addDays(weekEnd, 14), true);
+    } catch (err) {
+      console.error(`briefs after weekly review failed for plan ${plan.id}`, err);
+    }
     results.push({ plan_id: plan.id, review_id: id, adjustments: review.adjustments.length });
     console.log(`weekly review ${id} for plan ${plan.id} (${plan.display_name}) week ${weekStart}: ${review.adjustments.length} adjustments`);
   }

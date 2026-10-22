@@ -59,6 +59,7 @@ export interface PlannedSessionRow {
   target_pace_max_sec_km: number | null;
   target_hr_min: number | null;
   target_hr_max: number | null;
+  brief: string | null;
   version: number;
   superseded: boolean;
 }
@@ -128,6 +129,45 @@ export interface CoachAskJob {
   type: "coach_ask";
   user_id: string;
   message_id: string; // the athlete's `pick` message
+}
+
+/** SQS message asking the worker to write a 肌力 checklist for a session_routines row. */
+export interface RoutineJob {
+  type: "routine";
+  user_id: string;
+  routine_id: string;
+}
+
+/** SQS message asking the worker to write Woo's one-line briefs for upcoming sessions. */
+export interface BriefsJob {
+  type: "briefs";
+  user_id: string;
+  from: string; // 'YYYY-MM-DD'
+  to: string;
+  force?: boolean; // rewrite existing briefs too (after a weekly review)
+}
+
+export interface RoutineItem {
+  name: string;        // '平板支撐 3 × 40 秒'
+  how: string | null;  // one line on how to do it
+  done: boolean;
+}
+
+export interface SessionRoutineRow {
+  id: string;
+  session_id: string;
+  user_id: string;
+  place: "home" | "gym";
+  status: "pending" | "ready" | "failed";
+  minutes: number | null;
+  rules: string | null;
+  items: RoutineItem[];
+  model: string | null;
+  error: string | null;
+  rpe: number | null;
+  note: string | null;
+  completed_at: Date | null;
+  created_at: Date;
 }
 
 export interface WeeklyReviewRow {

@@ -213,7 +213,9 @@ export class TrainingApiStack extends cdk.Stack {
       ["/coach", [apigw.HttpMethod.GET]],
       ["/coach/seen", [apigw.HttpMethod.PUT]],
       ["/coach/checkins/{id}/pick", [apigw.HttpMethod.POST]],
+      ["/coach/checkins/{id}/reset", [apigw.HttpMethod.POST]],
       ["/coach/messages", [apigw.HttpMethod.POST]],
+      ["/sessions/{id}/routine", [apigw.HttpMethod.POST, apigw.HttpMethod.PUT]],
     ] as const) {
       httpApi.addRoutes({ path: p, methods: [...methods], integration, authorizer });
     }
