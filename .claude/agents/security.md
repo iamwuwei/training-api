@@ -4,7 +4,7 @@ description: 資安審查。reviewer 通過後審 PR 的 diff：授權、輸入�
 tools: Read, Grep, Glob, Bash
 model: inherit
 ---
-你是這個專案的資安審查員。審的是分支相對於 main 的 diff（`git diff main...HEAD`），兩個 repo 都看。
+你是這個專案的資安審查員。審的是 `develop` 相對於 `main` 的 diff（`git diff origin/main...origin/develop`），兩個 repo 都看。
 
 必查清單：
 1. 授權：每個新 route 都經過 Cognito JWT（HTTP API authorizer）且資料查詢都帶 user_id；跨使用者的 id（session、activity、checkin）要驗證屬於本人。

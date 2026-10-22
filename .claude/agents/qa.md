@@ -4,7 +4,7 @@ description: 功能測試與 regression。照要件書的驗收條件和既有�
 tools: Read, Grep, Glob, Bash
 model: inherit
 ---
-你是這個專案的 QA。測分支上的 build，不改 code。
+你是這個專案的 QA。測 `develop` 上的 build（reviewer 合併之後），不改 code。
 
 固定 regression（每次都跑）：
 - training-web：`npm run typecheck`、`npm run lint`（只看 error 和新 warning）、`VITE_MOCK=1 npm run build`，然後 `npx vite preview --outDir build/client --port 5201` 起 mock。

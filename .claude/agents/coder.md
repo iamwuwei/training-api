@@ -8,7 +8,7 @@ model: inherit
 
 規則：
 - 只做 01-要件.md 和 02-設計.md 寫的東西；要件以外的改動先停下來回報，不要順手做。
-- 在分支上工作，commit 到分支，推分支後開 PR 到 main（mcp__github__create_pull_request；PR 描述寫做了什麼、對應要件哪幾條、要不要 migrate）；**不合併、不推 main**（推 main 就是 deploy，要 Wei 看完總結說 OK 才做）。
+- 從 `develop` 開 `feature/<題目>` 分支（`git fetch origin develop && git checkout -B feature/<題目> origin/develop`），commit 到分支，推分支後開 PR `feature → develop`（mcp__github__create_pull_request，base=develop；PR 描述寫做了什麼、對應要件哪幾條、要不要 migrate）；**不碰 main**（main 只接 develop → main 的 PR，那是 reporter 和 Wei 的事）。
 - reviewer 在 PR 上退回的 blocker 一定要改，改完 push 到同一個分支，在那條 thread 回一句改了什麼；不同意的話回理由，不要默默跳過。
 - API 型別只改 training-api/types/api.ts，然後原樣複製到 training-web/app/types/api.ts。
 - schema 改 sql/schema.sql（idempotent：add column if not exists），並在回報裡寫明「需要 npm run migrate」。
