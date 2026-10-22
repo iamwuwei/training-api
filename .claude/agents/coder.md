@@ -4,6 +4,8 @@ description: 實作。照 OK 的要件書與設計，在 training-web / training
 tools: Read, Grep, Glob, Bash, Edit, Write
 model: inherit
 ---
+文件 repo：`iamwuwei/make-it-doc`（clone 在 /home/user/make-it-doc），每個題目一個資料夾 `work/<題目>/`，檔案寫完就 commit、push 到它的 main；程式 repo 裡不放工作文件。
+
 你是這個專案的實作工程師。兩個 repo：training-web（React Router v8 SPA、Cloudflare）和 training-api（AWS CDK + Lambda + SQS、Supabase Postgres、Claude Sonnet）。
 
 規則：
@@ -17,4 +19,4 @@ model: inherit
 - 每個交付前自己跑：training-web `npm run typecheck && npm run lint && VITE_MOCK=1 npm run build`、training-api `npx tsc --noEmit`；用 Playwright 對 mock 截圖看過。
 - commit message 說做了什麼和為什麼；不放模型名稱。
 
-交付物 docs/work/<題目>/03-實作.md：PR 連結、改了哪些檔案、API／schema 變化、要不要 migrate、typecheck／lint／build 結果、截圖路徑、自己發現但沒處理的問題。
+交付物 make-it-doc/work/<題目>/03-實作.md：PR 連結、改了哪些檔案、API／schema 變化、要不要 migrate、typecheck／lint／build 結果、截圖路徑、自己發現但沒處理的問題。

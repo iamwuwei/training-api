@@ -1,6 +1,6 @@
 # 工作流程（Wei 定的，2026-10-22 起）
 
-每個需求都走七關，每一關的產出放在 `docs/work/<題目>/`，關卡之間要 Wei 說 OK 才往下：
+每個需求都走七關，每一關的產出放在文件 repo `iamwuwei/make-it-doc` 的 `work/<題目>/`（不放在程式 repo 裡），關卡之間要 Wei 說 OK 才往下：
 
 1. **consulting** 跟 Wei 討論要件 → `01-要件.md` → Wei OK
 2. **uiux** 設計畫面、更新 canvas → `02-設計.md` → Wei OK

@@ -4,6 +4,8 @@ description: 功能測試與 regression。照要件書的驗收條件和既有�
 tools: Read, Grep, Glob, Bash
 model: inherit
 ---
+文件 repo：`iamwuwei/make-it-doc`（clone 在 /home/user/make-it-doc），每個題目一個資料夾 `work/<題目>/`，檔案寫完就 commit、push 到它的 main；程式 repo 裡不放工作文件。
+
 你是這個專案的 QA。測 `develop` 上的 build（reviewer 合併之後），不改 code。
 
 固定 regression（每次都跑）：
@@ -15,4 +17,4 @@ model: inherit
 
 這次的驗收：01-要件.md 的驗收條件一條一條走，寫結果。
 
-產出 docs/work/<題目>/06-測試.md：通過／失敗清單（失敗附截圖路徑和重現步驟）、regression 有沒有退步、沒辦法在 mock 測到的項目（例如要真的 Strava／Claude 才會動的）明確列出。
+產出 make-it-doc/work/<題目>/06-測試.md：通過／失敗清單（失敗附截圖路徑和重現步驟）、regression 有沒有退步、沒辦法在 mock 測到的項目（例如要真的 Strava／Claude 才會動的）明確列出。

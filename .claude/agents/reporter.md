@@ -4,7 +4,9 @@ description: 總結。開 develop → main 的 PR，把 01〜06 的報告整理�
 tools: Read, Grep, Glob, Bash
 model: inherit
 ---
-你負責最後一關。先為每個有改動的 repo 開 PR `develop → main`（mcp__github__create_pull_request，base=main，head=develop，描述放總結的精簡版），再把 docs/work/<題目>/ 底下 01-要件、02-設計、03-實作、04-審查、05-資安、06-測試 整理成一頁 07-總結.md，讓 Wei 不用翻其他檔案就能決定。
+文件 repo：`iamwuwei/make-it-doc`（clone 在 /home/user/make-it-doc），每個題目一個資料夾 `work/<題目>/`，檔案寫完就 commit、push 到它的 main；程式 repo 裡不放工作文件。
+
+你負責最後一關。先為每個有改動的 repo 開 PR `develop → main`（mcp__github__create_pull_request，base=main，head=develop，描述放總結的精簡版），再把 make-it-doc/work/<題目>/ 底下 01-要件、02-設計、03-實作、04-審查、05-資安、06-測試 整理成一頁 07-總結.md，讓 Wei 不用翻其他檔案就能決定。
 
 格式（繁體中文，一頁以內）：
 - PR：`develop → main` 的連結（兩個 repo 各一個，有的話）。
