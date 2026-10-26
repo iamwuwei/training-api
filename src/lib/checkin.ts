@@ -2,6 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { coachModel } from "./claude";
 import { COACH_NAME, postCoachMessage } from "./coach";
 import { query, queryOne } from "./db";
+import { isRunSport, sessionLabel, shortDate, sportName } from "./labels";
 import type { ActivityRow, CoachMessageRow, PlannedSessionRow } from "../types";
 
 // Woo comes to the athlete after a run. When a Strava activity lands, he posts a
@@ -11,16 +12,6 @@ import type { ActivityRow, CoachMessageRow, PlannedSessionRow } from "../types";
 // follow-up question about how it felt. The athlete's answer (POST /coach/messages
 // with answer_to) becomes the memo and triggers the review, whose verdict is the
 // reply. Templates here, the model only for the question.
-
-export const RUN_SPORTS = new Set(["Run", "TrailRun", "VirtualRun"]);
-export const isRunSport = (sport: string | null | undefined) => !sport || RUN_SPORTS.has(sport);
-
-const SPORT_NAMES: Record<string, string> = {
-  Run: "跑步", TrailRun: "越野跑", VirtualRun: "跑步機", Walk: "走路", Hike: "健行", Ride: "騎車",
-  VirtualRide: "騎車", Swim: "游泳", WeightTraining: "重訓", Workout: "運動", Crossfit: "Crossfit",
-  HighIntensityIntervalTraining: "HIIT", Yoga: "瑜伽", Elliptical: "橢圓機", StairStepper: "爬梯機",
-};
-export const sportName = (sport: string | null | undefined) => (sport ? SPORT_NAMES[sport] ?? sport : "跑步");
 
 function pace(sec: number | null | undefined): string | null {
   if (!sec) return null;
@@ -39,11 +30,6 @@ export function activityLabel(a: ActivityLite): string {
   if (run && a.avg_pace_sec_km) parts.push(pace(a.avg_pace_sec_km)!);
   else if (a.avg_hr != null) parts.push(`心拍 ${a.avg_hr}`);
   return parts.join(" · ");
-}
-
-export function sessionLabel(s: PlannedSessionRow): string {
-  const km = s.target_distance_m ? ` ${Math.round(s.target_distance_m / 100) / 10} km` : "";
-  return `${s.label ?? s.type}${km}`;
 }
 
 const isStrength = (s: PlannedSessionRow) => s.type === "rest" && /肌力|重訓|Hyrox/i.test(s.label ?? "");
@@ -120,7 +106,7 @@ export async function maybeCheckin(userId: string, a: ActivityLite, localDate: s
     if (!open.length) return false;
     text = `今天是休息日，Strava 剛進來 ${activityLabel(a)}。要算這週的哪一堂，還是不算？`;
     meta = { state: "open", mode: "session", date: localDate, session_id: null, session_label: null,
-      candidates: open.map((s) => ({ session_id: s.id, label: `${s.scheduled_date.slice(5).replace("-", "/")} ${sessionLabel(s)}` })) };
+      candidates: open.map((s) => ({ session_id: s.id, label: `${shortDate(s.scheduled_date)} ${sessionLabel(s)}` })) };
   }
 
   // One open check-in per day: refresh it rather than stacking a second one.
@@ -167,18 +153,39 @@ export interface MismatchAskMeta {
   activity_id: string;
   session_id: string;
   reason: string;
-  checkin_id: string; // the check-in the pick came from (reset target for 不是)
-  pick_id: string;    // the athlete's pick message (coach_ask target for 是)
+  /** The check-in the pick came from (reset target for 不是); null when the athlete picked on the report page (PUT …/session). */
+  checkin_id: string | null;
+  /** The athlete's pick message (coach_ask target for 是); null for a report-page pick. */
+  pick_id: string | null;
 }
 
 /** Post Woo's "真的是這趟嗎？" instead of the feel question. */
 export async function postMismatchAsk(userId: string, meta: Omit<MismatchAskMeta, "state" | "kind">, date: string, s: PlannedSessionRow): Promise<CoachMessageRow> {
-  const day = date.slice(5).replace("-", "/");
-  const text = `${meta.reason}。真的要算成 ${day} 的${s.label ?? s.type}嗎？`;
+  const text = `${meta.reason}。真的要算成 ${shortDate(date)} 的 ${s.label ?? s.type} 嗎？`;
   return postCoachMessage({
     user_id: userId, role: "coach", kind: "ask", text, activity_id: meta.activity_id,
     meta: { state: "open", kind: "mismatch", ...meta } satisfies MismatchAskMeta,
   });
+}
+
+/**
+ * Take the activity back off its session: unplanned again, the Claude review dropped,
+ * Woo's open question about it (feel or mismatch) closed, the athlete's pending
+ * messages about it settled. Used by 選錯了 (resetCheckin) and by 不是 on a mismatch
+ * question that came from the report page (no check-in to reset).
+ */
+export async function undoPick(userId: string, activityId: string, sessionId: string | null): Promise<void> {
+  await query(
+    "update activities set session_id = null, match_status = 'unplanned' where id = $1 and user_id = $2 and ($3::uuid is null or session_id = $3)",
+    [activityId, userId, sessionId],
+  );
+  await query("delete from reviews where activity_id = $1 and source = 'claude'", [activityId]);
+  await query(
+    `update coach_messages set meta = coalesce(meta, '{}'::jsonb) || '{"state":"closed"}'::jsonb
+      where user_id = $1 and kind = 'ask' and activity_id = $2 and meta->>'state' = 'open'`,
+    [userId, activityId],
+  );
+  await query("update coach_messages set status = 'sent' where user_id = $1 and role = 'athlete' and status = 'pending' and activity_id = $2", [userId, activityId]);
 }
 
 /**
@@ -191,18 +198,7 @@ export async function resetCheckin(userId: string, checkin: CoachMessageRow): Pr
   if (meta.state === "open") return "check-in is still open";
   if (meta.state === "reset") return "check-in was already reset";
 
-  if (meta.state === "picked" && meta.picked) {
-    const { activity_id, session_id } = meta.picked;
-    await query("update activities set session_id = null, match_status = 'unplanned' where id = $1 and session_id = $2", [activity_id, session_id]);
-    await query("delete from reviews where activity_id = $1 and source = 'claude'", [activity_id]);
-    // Woo's open question about that activity (feel or mismatch) is closed; the athlete's pending messages settled.
-    await query(
-      `update coach_messages set meta = coalesce(meta, '{}'::jsonb) || '{"state":"closed"}'::jsonb
-        where user_id = $1 and kind = 'ask' and activity_id = $2 and meta->>'state' = 'open'`,
-      [userId, activity_id],
-    );
-    await query("update coach_messages set status = 'sent' where user_id = $1 and role = 'athlete' and status = 'pending' and activity_id = $2", [userId, activity_id]);
-  }
+  if (meta.state === "picked" && meta.picked) await undoPick(userId, meta.picked.activity_id, meta.picked.session_id);
   await query("update coach_messages set meta = $2 where id = $1", [checkin.id, JSON.stringify({ ...meta, state: "reset" })]);
   const fresh: CheckinMeta = { ...meta, state: "open", picked: null };
   const text = meta.mode === "activity"

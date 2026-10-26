@@ -113,7 +113,9 @@ export class TrainingApiStack extends cdk.Stack {
 
     const oauth = fn("oauth", { environment: stravaEnv });
 
-    const weekly = fn("weekly", { environment: claudeEnv });
+    // Two plans × (weekly model call + briefs model call) does not fit in 60 s; a
+    // timeout would make the Scheduler retry and regenerate reviews it just wrote.
+    const weekly = fn("weekly", { timeout: cdk.Duration.minutes(5), environment: claudeEnv });
 
     // training-api-prod, same name as the HTTP API. HTTP API cuts requests at
     // 30 s, so give up on a cold Aurora at 20 s and answer 503 instead.

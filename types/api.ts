@@ -219,7 +219,10 @@ export interface ActivitiesResponse {
 //        -> match_status "confirmed". If another activity already holds the
 //           session: an `auto` one is bumped back to "unplanned"; a "confirmed"
 //           one is a 409 unless `replace: true`. The Claude review of this
-//           activity is regenerated (arrives a few seconds later; poll /plan).
+//           activity is regenerated (arrives a few seconds later; poll /plan) —
+//           unless the pick looks wrong (a walk on a long-run day, a run far
+//           shorter than the session): then Woo posts a `mismatch` ask in the
+//           thread instead and the review waits for the answer (see ApiCoachMessage.ask).
 //   { session_id: null, status: "ignored" } -> not a training activity (kept out of lists)
 //   { session_id: null }                    -> back to "unplanned"
 
@@ -343,9 +346,11 @@ export interface ApiCoachMessage {
   checkin: ApiCheckin | null;        // kind checkin
   /**
    * kind ask. `feel`: Woo's "how did it feel?" after a pick (answer with POST /coach/messages
-   * { answer_to }). `mismatch`: the pick looked wrong (a walk on a long-run day, a run far
-   * shorter than the session); `reason` is Woo's sentence, the chips are 是／不是 (POST
-   * /coach/messages { answer_to, confirm_match }). state `answered` covers both answered and closed.
+   * { answer_to }). `mismatch`: the pick (a check-in chip or PUT /activities/{id}/session)
+   * looked wrong (a walk on a long-run day, a run far shorter than the session); `reason` is
+   * Woo's sentence, the chips are 是／不是 (POST /coach/messages { answer_to, confirm_match }).
+   * 不是 after a chip resets the check-in; after a report-page pick it only unassigns the
+   * activity (no new check-in). state `answered` covers both answered and closed.
    */
   ask: { state: "open" | "answered"; kind: "feel" | "mismatch"; activity_id: string; session_id: string; reason: string | null } | null;
   /** kind weekly: the review's open questions, the "updated" line and the cancelled proposals. */

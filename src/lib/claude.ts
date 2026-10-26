@@ -1,4 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { FIELD_NAMES, isRunSport, shortDate } from "./labels";
 import { splitsSummary } from "./splits";
 import type {
   ActivityReviewResult,
@@ -63,9 +64,6 @@ async function ask<T>(modelId: string, system: string, user: string, schema: Rec
     .join("");
   return { data: extractJson<T>(text), model: response.model };
 }
-
-const RUN_SPORTS = new Set(["Run", "TrailRun", "VirtualRun"]);
-const isRunSport = (sport: string | null | undefined) => !sport || RUN_SPORTS.has(sport);
 
 /**
  * What the app is, so the coach describes it the same way everywhere (chat, verdicts,
@@ -137,11 +135,11 @@ const REVIEW_SYSTEM = `你是 Woo，一位務實的馬拉松教練，長期帶�
 
 評語（comment，2〜4 句繁體中文）：你手上有他的目標、現在的階段、同類型的歷史、最近兩週的負荷、他的自述和上一次的提醒。挑今天最值得講的一兩件事講清楚，引用具體日期和數字；其他的不用提，也不用每樣都交代。像教練在跟他說話，不要訓話、不要下結論式的大標籤。他自述裡有講到的，數據同意就說同意，不同意就指出數據看到什麼。
 
-${appNotes("Woo")}
-
 提醒（reminders，0〜3 條）：只寫下次要改的具體動作，依重要性排序（第一條會單獨顯示在 app 首頁），每條一句、20 字以內；沒有就空陣列，不要硬湊。
 
-課表調整建議（adjust_hint）：一句話或 null。只在有明確理由時給（連續兩次同類型都超標、自述疼痛、連續漏課、明顯超前），寫「建議怎麼調、為什麼」。這只是給每週回顧參考，不會直接改課表，所以不要每次都填。`;
+課表調整建議（adjust_hint）：一句話或 null。只在有明確理由時給（連續兩次同類型都超標、自述疼痛、連續漏課、明顯超前），寫「建議怎麼調、為什麼」。這只是給每週回顧參考，不會直接改課表，所以不要每次都填。
+
+${appNotes("Woo")}`;
 
 const REVIEW_SCHEMA = {
   type: "object",
@@ -375,12 +373,11 @@ export function buildWeeklyPrompt(input: WeeklyReviewInput): string {
   ].join("\n");
 }
 
-const FIELD_NAMES: Record<string, string> = { type: "類型", target_distance_m: "距離", target_pace_sec_km: "配速", scheduled_date: "日期", note: "備註", skip: "改休息" };
 const fmtValue = (field: string, v: string | number | null): string => {
   if (v == null) return "-";
   if (field === "target_distance_m" && typeof v === "number") return `${Math.round(v / 100) / 10} km`;
   if (field === "target_pace_sec_km" && typeof v === "number") return pace(v).replace("/km", "");
-  if (field === "scheduled_date" && typeof v === "string") return v.slice(5).replace("-", "/");
+  if (field === "scheduled_date" && typeof v === "string") return shortDate(v);
   return String(v);
 };
 /** "距離 18 km → 16 km（理由）" — one adjustment as text. */

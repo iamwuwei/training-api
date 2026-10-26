@@ -143,9 +143,10 @@ const PACE_SAME = 15;    // sec/km: "the pace did not move"
 const UPHILL_M = 8;      // elevation gain per km that counts as an uphill km
 
 /**
- * Kilometres whose HR looks like a sensor jump: 25+ bpm above the neighbouring kms
+ * Kilometres whose HR looks like a sensor jump: 25+ bpm above both neighbouring kms
  * while the pace stayed within 15 s/km of them. The first km is never a suspect (its
- * HR is simply not counted).
+ * HR is simply not counted); a km with only one neighbour (the last one, or next to a
+ * km without HR) is not judged — a real finishing kick must not be called noise.
  */
 export function hrSuspects(sps: StravaSplit[]): { split: number; hr: number }[] {
   const out: { split: number; hr: number }[] = [];
@@ -153,7 +154,7 @@ export function hrSuspects(sps: StravaSplit[]): { split: number; hr: number }[] 
     const cur = sps[i];
     if (cur.average_heartrate == null) continue;
     const neighbours = [sps[i - 1], sps[i + 1]].filter((n): n is StravaSplit => n != null && n.average_heartrate != null);
-    if (!neighbours.length) continue;
+    if (neighbours.length < 2) continue;
     const hrHigh = neighbours.every((n) => cur.average_heartrate! - n.average_heartrate! >= HR_JUMP);
     const paceSame = neighbours.every((n) => Math.abs(splitPace(cur) - splitPace(n)) <= PACE_SAME);
     if (hrHigh && paceSame) out.push({ split: cur.split, hr: Math.round(cur.average_heartrate) });

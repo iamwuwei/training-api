@@ -2,11 +2,12 @@ import { randomUUID } from "node:crypto";
 import type { SQSHandler } from "aws-lambda";
 import { reviewActivity } from "../lib/claude";
 import { writeBriefs } from "../lib/briefs";
-import { askAboutActivity, maybeCheckin, settleAthleteMessages, sportName } from "../lib/checkin";
+import { askAboutActivity, maybeCheckin, settleAthleteMessages } from "../lib/checkin";
 import { writeRoutine } from "../lib/strength";
 import { answerCoachMessage, postCoachMessage } from "../lib/coach";
 import { loadReviewContext } from "../lib/context";
 import { isDbWaking, query, queryOne } from "../lib/db";
+import { sessionLabel, shortDate, sportName } from "../lib/labels";
 import { getActivity, refreshToken, StravaError } from "../lib/strava";
 import { maybeRerunWeeklyReview, runWeeklyReview, WEEKLY_REVIEW_SELECT } from "../lib/weekly";
 import type { BriefsJob, CoachAskJob, CoachReplyJob, PlanRow, PlannedSessionRow, RoutineJob, StravaConnectionRow, StravaWebhookEvent, WeeklyRerunJob, WeeklyReviewRow } from "../types";
@@ -65,21 +66,19 @@ export const handler: SQSHandler = async (event) => {
 
 /** The athlete answered 沒跑 to a weekly question: regenerate that review. A redelivery after it ran is skipped. */
 async function rerunWeekly(job: WeeklyRerunJob): Promise<void> {
-  const w = await queryOne<WeeklyReviewRow & { user_id: string }>(
-    `${WEEKLY_REVIEW_SELECT.replace("from weekly_reviews", ", (select user_id from plans where id = plan_id) as user_id from weekly_reviews")} where id = $1`,
-    [job.weekly_review_id],
+  const w = await queryOne<WeeklyReviewRow>(
+    `${WEEKLY_REVIEW_SELECT} where id = $1 and plan_id in (select id from plans where user_id = $2)`,
+    [job.weekly_review_id, job.user_id],
   );
-  if (!w || w.user_id !== job.user_id) return;
+  if (!w) return;
   if (w.updated_at && new Date(w.updated_at).getTime() >= Date.parse(job.requested_at)) return; // already done
   const plan = await queryOne<PlanRow & { display_name: string }>(
     `select p.*, to_char(p.race_date, 'YYYY-MM-DD') as race_date, u.display_name from plans p join users u on u.id = p.user_id where p.id = $1`,
     [w.plan_id],
   );
   if (!plan) return;
-  const { user_id, ...row } = w;
-  void user_id;
   try {
-    const r = await runWeeklyReview(plan, w.week_start, row, job.reason);
+    const r = await runWeeklyReview(plan, w.week_start, w, job.reason);
     console.log(`weekly review ${r.review_id} regenerated (${job.reason}): ${r.adjustments} adjustments, ${r.asks} asks`);
   } catch (err) {
     console.error(`weekly rerun failed for review ${job.weekly_review_id}`, err); // not requeued (same failure again); the next activity tries again
@@ -187,7 +186,7 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
   );
 
   // A new, unassigned activity: Woo asks which session it was (if any fits today).
-  const day = localDate.slice(5).replace("-", "/");
+  const day = shortDate(localDate);
   if (row.inserted && !row.session_id) {
     let asked = false;
     try {
@@ -200,7 +199,7 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
     }
     // Nothing to pick: the week's review (if already written) learns about it now.
     // With a check-in open, the regeneration waits for the pick and its verdict below.
-    if (!asked) await maybeRerunWeeklyReview(conn.user_id, row.id, localDate, `${day} 的${sportName(activity.sport_type ?? activity.type)}進來了`);
+    if (!asked) await maybeRerunWeeklyReview(conn.user_id, row.id, localDate, `${day} 的 ${sportName(activity.sport_type ?? activity.type)} 進來了`);
   }
 
   // Claude verdict (AUTO_REVIEW=true): only once the athlete has assigned the
@@ -249,14 +248,14 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
           );
           console.log(`review for activity ${activity.id}: ${r.verdict} (${r.reminders.length} reminders)${r.adjust_hint ? ` hint: ${r.adjust_hint}` : ""}`);
           // The verdict also shows up in the coach's thread.
-          const label = `${session.label ?? session.type}${session.target_distance_m ? ` ${Math.round(session.target_distance_m / 100) / 10} km` : ""}`;
+          const label = sessionLabel(session);
           await postCoachMessage({
             user_id: conn.user_id, role: "coach", kind: "review", text: r.comment, activity_id: row.id,
             meta: { label, verdict: r.verdict, reminder: r.reminders[0] ?? null, date: localDate },
           });
           await settleAthleteMessages(conn.user_id, row.id); // the answer that triggered this review is replied to
           // The week's review was written without this activity (late sync): regenerate it in place.
-          await maybeRerunWeeklyReview(conn.user_id, row.id, localDate, `${day} 的${session.label ?? session.type}進來了`);
+          await maybeRerunWeeklyReview(conn.user_id, row.id, localDate, `${day} 的 ${session.label ?? session.type} 進來了`);
         } catch (err) {
           // Not requeued (SQS would only retry the same failure). Recorded so the
           // app can show "分析失敗" with a retry instead of waiting forever.

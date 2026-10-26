@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { formatAdjustmentValue } from "./claude";
 import { postCoachMessage } from "./coach";
 import { type Querier, query, withTransaction } from "./db";
+import { FIELD_NAMES, RUN_SPORTS, sessionLabel, shortDate } from "./labels";
 import type { PlanWeekRow, PlannedSessionRow, ProposalField, ProposalItem, ProposalRow } from "../types";
 
 // Woo's proposals: one card = one or more changes applied together. The weekly
@@ -11,23 +12,17 @@ import type { PlanWeekRow, PlannedSessionRow, ProposalField, ProposalItem, Propo
 // the original plan stays readable and activities move along.
 
 export const PROPOSAL_FIELDS = new Set<string>(["type", "target_distance_m", "target_pace_sec_km", "scheduled_date", "note", "skip"] satisfies ProposalField[]);
-const SESSION_TYPES = new Set(["easy", "long", "tempo", "interval", "rest", "race"]);
+/** What a session may be turned into: never `race` (the race day is not Woo's to make or move). */
+const PROPOSAL_TYPES = new Set(["easy", "long", "tempo", "interval", "rest"]);
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 const addDays = (iso: string, n: number) => new Date(Date.parse(`${iso}T00:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10);
 const km = (m: number) => Math.round(m / 100) / 10;
 
-/** "長跑 16 km" */
-export function sessionLabel(s: Pick<PlannedSessionRow, "label" | "type" | "target_distance_m">): string {
-  return `${s.label ?? s.type}${s.target_distance_m ? ` ${km(s.target_distance_m)} km` : ""}`;
-}
-
-const FIELD_NAMES: Record<string, string> = { type: "類型", target_distance_m: "距離", target_pace_sec_km: "配速", scheduled_date: "日期", note: "備註", skip: "改休息" };
-
 /** "11/1 距離 18 km → 16 km" — a change as one line (the cancelled list, Woo's confirmation). */
 export function describeChange(c: { field: string; old: string | number | null; new: string | number | null; date?: string | null }, dateFallback?: string | null): string {
   const d = c.date ?? dateFallback;
-  const day = d ? `${d.slice(5).replace("-", "/")} ` : "";
+  const day = d ? `${shortDate(d)} ` : "";
   if (c.field === "skip") return `${day}改休息`;
   return `${day}${FIELD_NAMES[c.field] ?? c.field} ${formatAdjustmentValue(c.field, c.old)} → ${formatAdjustmentValue(c.field, c.new)}`;
 }
@@ -35,7 +30,7 @@ export function describeChange(c: { field: string; old: string | number | null; 
 /** A string error when the value does not fit the field, else null. */
 export function validateChangeValue(field: string, value: string | number | null): string | null {
   switch (field) {
-    case "type": return typeof value === "string" && SESSION_TYPES.has(value) ? null : "type must be a session type";
+    case "type": return typeof value === "string" && PROPOSAL_TYPES.has(value) ? null : "type must be easy, long, tempo, interval or rest";
     case "target_distance_m": return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100_000 ? null : "target_distance_m must be metres";
     case "target_pace_sec_km": return typeof value === "number" && Number.isFinite(value) && value >= 120 && value <= 1200 ? null : "target_pace_sec_km must be seconds per km";
     case "scheduled_date": return typeof value === "string" && DATE_RE.test(value) ? null : "scheduled_date must be YYYY-MM-DD";
@@ -72,15 +67,16 @@ export async function applyChange(q: Querier, old: PlannedSessionRow, field: Pro
       if (old.target_pace_max_sec_km != null) next.target_pace_max_sec_km = old.target_pace_max_sec_km + d;
     }
   }
+  // skipped_at travels with the session: a 沒跑 answer must not become unanswered because the date moved.
   await q(
     `insert into planned_sessions
        (id, plan_id, scheduled_date, week_no, phase, label, type, content, note, target, target_distance_m,
-        target_pace_sec_km, target_pace_min_sec_km, target_pace_max_sec_km, target_hr_min, target_hr_max, version, superseded)
-     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, false)`,
+        target_pace_sec_km, target_pace_min_sec_km, target_pace_max_sec_km, target_hr_min, target_hr_max, skipped_at, version, superseded)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, false)`,
     [
       next.id, old.plan_id, next.scheduled_date, old.week_no, old.phase, next.label, next.type, next.content, next.note,
       next.target, next.target_distance_m, next.target_pace_sec_km, next.target_pace_min_sec_km, next.target_pace_max_sec_km,
-      next.target_hr_min, next.target_hr_max, next.version,
+      next.target_hr_min, next.target_hr_max, old.skipped_at, next.version,
     ],
   );
   await q("update planned_sessions set superseded = true where id = $1", [old.id]);
@@ -101,14 +97,19 @@ export async function applyProposal(p: ProposalRow): Promise<ProposalItem[] | st
     const items: ProposalItem[] = [];
     for (const item of p.items) {
       const currentId = latest.get(item.session_id) ?? item.session_id;
-      const [old] = await q<PlannedSessionRow>(
-        `select ps.*, to_char(ps.scheduled_date, 'YYYY-MM-DD') as scheduled_date from planned_sessions ps join plans p on p.id = ps.plan_id
+      const [old] = await q<PlannedSessionRow & { race_date: string }>(
+        `select ps.*, to_char(ps.scheduled_date, 'YYYY-MM-DD') as scheduled_date, to_char(p.race_date, 'YYYY-MM-DD') as race_date
+           from planned_sessions ps join plans p on p.id = ps.plan_id
           where ps.id = $1 and p.user_id = $2 and ps.superseded = false for update`,
         [currentId, p.user_id],
       );
       if (!old) throw new ProposalConflict("that session was already changed; dismiss this proposal");
       if (old.type === "race") throw new ProposalConflict("the race day cannot be changed");
-      const id = await applyChange(q, old, item.field, item.new);
+      // Checked again here (not only in buildProposal): nothing becomes a race or lands on the race day.
+      if (item.field === "type" && item.new === "race") throw new ProposalConflict("a session cannot become the race");
+      if (item.field === "scheduled_date" && item.new === old.race_date) throw new ProposalConflict("a session cannot be moved onto the race day");
+      const { race_date: _raceDate, ...oldRow } = old;
+      const id = await applyChange(q, oldRow, item.field, item.new);
       latest.set(item.session_id, id);
       items.push({ ...item, applied_session_id: id });
     }
@@ -136,8 +137,7 @@ export async function postProposalApplied(userId: string, items: ProposalItem[])
     const s = i.applied_session_id ? byId.get(i.applied_session_id) : undefined;
     if (!s || seen.has(i.session_id)) continue;
     seen.add(i.session_id);
-    const day = s.scheduled_date.slice(5).replace("-", "/");
-    parts.unshift(`${day} 是${sessionLabel(s)}`);
+    parts.unshift(`${shortDate(s.scheduled_date)} 是${sessionLabel(s)}`);
   }
   const text = parts.length ? `改好了，課表上${parts.join("、")}。` : "改好了。";
   await postCoachMessage({ user_id: userId, role: "coach", kind: "chat", text });
@@ -147,13 +147,15 @@ export async function postProposalApplied(userId: string, items: ProposalItem[])
 
 const WEEK_UP_PCT = 15;     // weekly volume vs last week's actual
 const LONG_UP_M = 3000;     // long run vs the longest run so far
-const RUN_SPORTS = new Set(["Run", "TrailRun", "VirtualRun"]);
 const isLong = (s: Pick<PlannedSessionRow, "label" | "type">) => s.type === "long" || /Long|長跑/i.test(s.label ?? "");
 
 /**
  * The amber lines on a card: the week's planned volume after the changes vs last
- * week's actual (+15%), a long run +3 km over the longest so far, and more volume in a
- * 減量 week. Each flag is one sentence in Chinese; empty when nothing stands out.
+ * week (+15%), a long run +3 km over the longest so far, and more volume in a 減量
+ * week. "Last week" is its actual running volume once that week is over; while it is
+ * still running (a card for next week, written mid-week) its planned volume is the
+ * baseline instead, otherwise two sessions in would make every card look like +200%.
+ * Each flag is one sentence in Chinese; empty when nothing stands out.
  */
 export async function computeFlags(
   userId: string,
@@ -193,15 +195,22 @@ export async function computeFlags(
     const before = planned(sessions, w.week_start, w.week_end);
     const after = planned(byId.values(), w.week_start, w.week_end);
     const prevFrom = addDays(w.week_start, -7), prevTo = addDays(w.week_start, -1);
-    const prev = await query<{ m: string | null }>(
-      `select sum(distance_m) as m from activities where user_id = $1 and match_status <> 'ignored'
-          and (sport_type is null or sport_type = any($4::text[]))
-          and (start_time at time zone 'Asia/Tokyo')::date between $2 and $3`,
-      [userId, prevFrom, prevTo, [...RUN_SPORTS]],
-    );
+    const prevOver = prevTo < today;
+    const prev = prevOver
+      ? await query<{ m: string | null }>(
+          `select sum(distance_m) as m from activities where user_id = $1 and match_status <> 'ignored'
+              and (sport_type is null or sport_type = any($4::text[]))
+              and (start_time at time zone 'Asia/Tokyo')::date between $2 and $3`,
+          [userId, prevFrom, prevTo, [...RUN_SPORTS]],
+        )
+      : await query<{ m: string | null }>(
+          `select sum(target_distance_m) as m from planned_sessions
+            where plan_id = $1 and superseded = false and type <> 'rest' and scheduled_date between $2 and $3`,
+          [planId, prevFrom, prevTo],
+        );
     const prevM = Number(prev[0]?.m ?? 0);
     if (prevM > 0 && after > before && after >= prevM * (1 + WEEK_UP_PCT / 100)) {
-      flags.push(`週跑量 ${km(after)} km，比上週實跑 ${km(prevM)} km 多 ${Math.round(((after - prevM) / prevM) * 100)}%`);
+      flags.push(`週跑量 ${km(after)} km，比上週${prevOver ? "實跑" : "計畫"} ${km(prevM)} km 多 ${Math.round(((after - prevM) / prevM) * 100)}%`);
     }
     if (/減量|恢復|Taper/i.test(`${w.phase ?? ""} ${w.focus ?? ""}`) && after > before) {
       flags.push(`減量週加量（${km(before)} → ${km(after)} km）`);
@@ -223,6 +232,5 @@ export async function computeFlags(
       if (it.new - longestM >= LONG_UP_M) flags.push(`比目前最長多 ${km(it.new - longestM)} km（${km(longestM)} → ${km(it.new)} km）`);
     }
   }
-  void planId;
   return [...new Set(flags)];
 }
