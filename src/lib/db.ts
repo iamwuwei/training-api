@@ -46,6 +46,30 @@ export async function queryOne<T extends QueryResultRow = QueryResultRow>(
   return rows[0];
 }
 
+/** A query function bound to one connection; what `withTransaction` hands its callback. */
+export type Querier = <T extends QueryResultRow = QueryResultRow>(text: string, params?: unknown[]) => Promise<T[]>;
+
+/**
+ * Run `fn` inside one transaction on a dedicated connection: commit when it
+ * returns, roll back (and rethrow) when it throws. Everything inside must use the
+ * `q` it is given, not the pool-level `query`.
+ */
+export async function withTransaction<R>(fn: (q: Querier) => Promise<R>): Promise<R> {
+  const client = await getPool().connect();
+  const q: Querier = async <T extends QueryResultRow = QueryResultRow>(text: string, params: unknown[] = []) => (await client.query<T>(text, params)).rows;
+  try {
+    await client.query("begin");
+    const out = await fn(q);
+    await client.query("commit");
+    return out;
+  } catch (err) {
+    try { await client.query("rollback"); } catch { /* the connection is gone; release reports it */ }
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 /** For scripts: close the pool so the process can exit. */
 export async function end(): Promise<void> {
   if (pool) {

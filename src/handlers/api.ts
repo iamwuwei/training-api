@@ -1,12 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyResultV2 } from "aws-lambda";
-import { isDbWaking, query, queryOne } from "../lib/db";
-import { type CheckinMeta } from "../lib/checkin";
-import { COACH_NAME, MAX_MESSAGE_CHARS, postCoachMessage } from "../lib/coach";
+import { isDbWaking, query, queryOne, withTransaction } from "../lib/db";
+import { type CheckinMeta, type MismatchAskMeta, mismatchReason, postMismatchAsk, resetCheckin, undoPick } from "../lib/checkin";
+import { COACH_NAME, MAX_MESSAGE_CHARS, postCoachMessage, REPLY_FAILED } from "../lib/coach";
+import { shortDate, sportName, weeklyAskQuestion } from "../lib/labels";
+import { applyChange, applyProposal, changeConflict, postProposalApplied } from "../lib/proposals";
 import { deauthorize } from "../lib/strava";
 import { postRoutineDone } from "../lib/strength";
-import type { ActivityRow, BriefsJob, CoachAskJob, CoachMessageRow, CoachReplyJob, PlanRow, PlanWeekRow, PlannedSessionRow, ReviewRow, RoutineJob, SessionRoutineRow, StoredAdjustments, StravaConnectionRow, UserRow, WeeklyReviewRow } from "../types";
+import { requestWeeklyRerun, reviewMissingActivity, WEEKLY_REVIEW_SELECT } from "../lib/weekly";
+import type { ActivityRow, BriefsJob, CoachAskJob, CoachMessageRow, CoachReplyJob, PlanRow, PlanWeekRow, PlannedSessionRow, ProposalRow, ReviewRow, RoutineJob, SessionRoutineRow, StoredAdjustments, StravaConnectionRow, UserRow, WeeklyMessageMeta, WeeklyReviewRow } from "../types";
 import type {
   ActivitiesResponse,
   ApiActivity,
@@ -42,6 +45,11 @@ import type {
   PostRoutineResponse,
   PutRoutineRequest,
   PutRoutineResponse,
+  ApiProposal,
+  ApiSession,
+  PostProposalResponse,
+  PostWeeklyAskRequest,
+  PostWeeklyAskResponse,
 } from "../../types/api";
 
 // Lambda training-api-prod. Behind API Gateway (HTTP API) with a Cognito JWT authorizer: by the time we
@@ -53,13 +61,16 @@ import type {
 //   GET /plan                        active plan + weeks + sessions + matched activities (with reviews)
 //   GET /activities?status=<status>  all activities (with reviews), newest first
 //   PUT /activities/{id}/review      set a manual verdict
-//   PUT /activities/{id}/session     the athlete's pick: which planned session this activity was (+ memo/RPE), or ignore it
+//   PUT /activities/{id}/session     the athlete's pick: which planned session this activity was (+ memo/RPE), or ignore it;
+//                                    a pick that looks wrong gets Woo's 真的是這趟嗎 in the thread instead of a verdict
 //   PUT /activities/{id}/memo        athlete's own note + RPE (re-triggers the Claude review)
 //   POST /activities/{id}/rereview   drop the Claude review (failed or stale) and queue a new one
 //   GET /weekly                      weekly coach reviews with their adjustment proposals
 //   POST /weekly/{id}/adjustments/{index}   apply or dismiss one proposal
+//   POST /weekly/{id}/asks/{session_id}     answer the review's question about a session without a record (synced / skipped)
+//   POST /proposals/{id}/apply|dismiss      a chat proposal card: apply all its changes at once, or dismiss
 //   GET /coach                       the coach's thread (weekly reviews, verdicts, chat)
-//   POST /coach/messages             say something to the coach; the worker answers
+//   POST /coach/messages             say something to the coach; the worker answers (answer_to / confirm_match for Woo's questions)
 //   PUT /coach/seen                  the thread was opened; clears coach_unread on GET /plan
 //   POST /coach/checkins/{id}/pick   which activity was today's session (Woo's check-in chips)
 //   POST /coach/checkins/{id}/reset  選錯了: unassign and ask again
@@ -72,7 +83,7 @@ const VERDICTS = new Set<string>(["達成", "達成但有提醒", "未達成"]);
 
 const sqs = new SQSClient({});
 
-const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | PutSessionResponse | PutMemoResponse | RereviewResponse | WeeklyResponse | PostAdjustmentResponse | CoachResponse | PostCoachMessageResponse | PutCoachSeenResponse | PostCheckinPickResponse | PostCheckinResetResponse | PostRoutineResponse | PutRoutineResponse | ErrorResponse>(
+const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | PutSessionResponse | PutMemoResponse | RereviewResponse | WeeklyResponse | PostAdjustmentResponse | CoachResponse | PostCoachMessageResponse | PutCoachSeenResponse | PostCheckinPickResponse | PostCheckinResetResponse | PostRoutineResponse | PutRoutineResponse | PostWeeklyAskResponse | PostProposalResponse | ErrorResponse>(
   statusCode: number,
   body: T,
 ): APIGatewayProxyResultV2 => ({
@@ -113,10 +124,10 @@ export const handler = async (event: APIGatewayProxyEventV2WithJWTAuthorizer): P
         body: JSON.stringify({ error: "database starting, retry shortly" } satisfies ErrorResponse),
       };
     }
-    // Anything else: answer with the message instead of letting API Gateway turn it
-    // into a bare "Internal Server Error", so the app can show what went wrong.
+    // Anything else: a fixed message (pg / SDK wording stays in CloudWatch, not in the app),
+    // as JSON so the app can tell it apart from API Gateway's bare "Internal Server Error".
     console.error("api error:", err);
-    return json(500, { error: err instanceof Error ? err.message.slice(0, 300) : String(err) });
+    return json(500, { error: "伺服器錯誤" });
   }
 };
 
@@ -156,6 +167,10 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
   if (method === "POST" && path === "/coach/messages") return postCoach(user.id, raw);
   const adj = /^\/weekly\/([^/]+)\/adjustments\/(\d+)$/.exec(path);
   if (method === "POST" && adj) return postAdjustment(user.id, adj[1], Number(adj[2]), raw);
+  const askRoute = /^\/weekly\/([^/]+)\/asks\/([^/]+)$/.exec(path);
+  if (method === "POST" && askRoute) return postWeeklyAsk(user.id, askRoute[1], askRoute[2], raw);
+  const proposal = /^\/proposals\/([^/]+)\/(apply|dismiss)$/.exec(path);
+  if (method === "POST" && proposal) return postProposalDecision(user.id, proposal[1], proposal[2] as "apply" | "dismiss");
 
   return json(404, { error: "not found" });
 }
@@ -205,7 +220,7 @@ function toApiReview(r: Pick<ReviewRow, "verdict" | "comment" | "reminders" | "s
     model: r.model,
     adjust_hint: r.adjust_hint ?? null,
     failed,
-    error: failed ? (r.comment ?? "").replace(/^分析失敗：/, "") || "unknown" : null,
+    error: failed ? REPLY_FAILED : null, // one fixed line for every failed model call; the provider's wording stays in the logs / the row
     created_at: new Date(r.created_at).toISOString(),
   };
 }
@@ -295,10 +310,16 @@ async function getPlan(userId: string) {
     [userId],
   );
 
-  const openCheckin = await queryOne<{ id: string }>(
-    `select id from coach_messages where user_id = $1 and meta->>'state' = 'open' and kind in ('checkin', 'ask') limit 1`,
+  // Is Woo waiting on the athlete (an open check-in or question)? One query: open asks
+  // sort first, newest first, so the row is the newest open ask when there is one (its
+  // kind decides the waiting line's wording: feel vs mismatch) and a check-in otherwise (kind null).
+  const waiting = await queryOne<{ kind: "checkin" | "ask"; ask_kind: string | null }>(
+    `select kind, meta->>'kind' as ask_kind from coach_messages
+      where user_id = $1 and meta->>'state' = 'open' and kind in ('checkin', 'ask')
+      order by (kind = 'ask') desc, created_at desc limit 1`,
     [userId],
   );
+  const openAsk = waiting?.kind === "ask" ? waiting : undefined;
 
   const routines = await query<SessionRoutineRow>(
     `select r.* from session_routines r join planned_sessions ps on ps.id = r.session_id
@@ -313,10 +334,11 @@ async function getPlan(userId: string) {
 
   return json<PlanResponse>(200, {
     coach_unread: Number(unread?.n ?? 0),
-    coach_checkin_open: Boolean(openCheckin),
+    coach_checkin_open: Boolean(waiting),
+    coach_ask_kind: openAsk ? (openAsk.ask_kind === "mismatch" ? "mismatch" : "feel") : null,
     plan,
     weeks: weeks.map(({ week_no, week_start, week_end, phase, focus }) => ({ week_no, week_start, week_end, phase, focus })),
-    sessions,
+    sessions: sessions.map(toApiSession),
     activities: activities.map(toApiActivity),
     unassigned: unassigned.map(toApiActivity),
     routines: routines.map(toApiRoutine),
@@ -325,6 +347,7 @@ async function getPlan(userId: string) {
 
 const todayJst = () => new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
 const addDays = (iso: string, n: number) => new Date(Date.parse(`${iso}T00:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10);
+const toApiSession = (s: PlannedSessionRow): ApiSession => ({ ...s, skipped_at: s.skipped_at ? new Date(s.skipped_at).toISOString() : null });
 
 // One briefs job per user per 10 minutes from this container; the worker skips sessions that got one meanwhile.
 const briefsAsked = new Map<string, number>();
@@ -428,7 +451,31 @@ async function putSession(userId: string, activityId: string, raw: string) {
       [activityId],
     );
     const hasManual = await queryOne<{ id: string }>("select id from reviews where activity_id = $1", [activityId]);
-    if (dropped.length > 0 || !hasManual) await requeue(userId, activity.strava_activity_id, "session reassigned");
+    // Same doubt check as after a check-in chip: a walk on a long-run day, a run far
+    // shorter than the session. Then Woo asks 真的是這趟嗎 (POST /coach/messages
+    // { answer_to, confirm_match }) and the verdict waits for the answer.
+    const full = await queryOne<ActivityRow>("select * from activities where id = $1 and user_id = $2", [activityId, userId]);
+    const session = await queryOne<PlannedSessionRow>(
+      `select ps.*, to_char(ps.scheduled_date, 'YYYY-MM-DD') as scheduled_date from planned_sessions ps join plans p on p.id = ps.plan_id
+        where ps.id = $1 and p.user_id = $2`,
+      [body.session_id, userId],
+    );
+    // Woo's check-in for this session (or, on a rest day, for this activity) is answered by
+    // this pick: close it like a chip pick would, so /plan stops saying Woo is waiting.
+    // The check-in's "selected" record lets 選錯了 (reset) undo this pick the same way.
+    if (session) await closeCheckinFor(userId, activityId, session);
+    const reason = full && session ? mismatchReason(full, session) : null;
+    if (reason && session) {
+      // An earlier open question about this activity (a feel question, an older doubt) is about the old pick.
+      await query(
+        `update coach_messages set meta = coalesce(meta, '{}'::jsonb) || '{"state":"closed"}'::jsonb
+          where user_id = $1 and kind = 'ask' and activity_id = $2 and meta->>'state' = 'open'`,
+        [userId, activityId],
+      );
+      await postMismatchAsk(userId, { from: "report", activity_id: activityId, session_id: session.id, reason, checkin_id: null, pick_id: null }, session.scheduled_date, session);
+    } else if (dropped.length > 0 || !hasManual) {
+      await requeue(userId, activity.strava_activity_id, "session reassigned");
+    }
   }
 
   const [row] = await query<ActivityJoined>(
@@ -451,16 +498,39 @@ async function assignSession(userId: string, activityId: string, sessionId: stri
   );
   if (!session) return { status: 404, error: "session not found" };
   const holder = await queryOne<{ id: string; match_status: MatchStatus }>(
-    "select id, match_status from activities where session_id = $1 and id <> $2",
-    [session.id, activityId],
+    "select id, match_status from activities where session_id = $1 and id <> $2 and user_id = $3",
+    [session.id, activityId, userId],
   );
   if (holder?.match_status === "confirmed" && !replace) return { status: 409, error: "session already confirmed for another activity" };
-  if (holder) {
-    await query("update activities set session_id = null, match_status = 'unplanned' where id = $1", [holder.id]);
-    await query("delete from reviews where activity_id = $1 and source = 'claude'", [holder.id]);
-  }
+  // The bumped holder is unassigned exactly like 選錯了 does it: its Claude review dropped,
+  // Woo's open question about it (a feel question after a chip) closed — otherwise that
+  // question stays open forever and /plan keeps saying Woo is waiting for an answer.
+  if (holder) await undoPick(userId, holder.id, session.id);
   await query("update activities set session_id = $2, match_status = 'confirmed' where id = $1", [activityId, session.id]);
   return null;
+}
+
+/**
+ * The report page assigned `activityId` to `session`: the check-in that this answers —
+ * the one for that session's day (activity mode: "today's session is X, which
+ * activity?") or, on a rest day, the one about this activity (session mode: "which
+ * session should it count for?") — goes to `picked`, as a chip pick would, so /plan
+ * stops saying Woo is waiting. A check-in already picked for this session (the chip
+ * chose another activity, the report page replaces it) is re-pointed, so 選錯了 undoes
+ * the activity that holds the session now. Another day's check-in is left alone.
+ */
+async function closeCheckinFor(userId: string, activityId: string, session: Pick<PlannedSessionRow, "id" | "scheduled_date">): Promise<void> {
+  const checkin = await queryOne<CoachMessageRow>(
+    `select * from coach_messages where user_id = $1 and kind = 'checkin' and meta->>'state' in ('open', 'picked')
+        and ((meta->>'mode' = 'activity' and meta->>'session_id' = $2)
+          or (meta->>'mode' = 'session' and activity_id = $3)
+          or meta->'picked'->>'session_id' = $2)
+      order by created_at desc limit 1`,
+    [userId, session.id, activityId],
+  );
+  if (!checkin) return;
+  const meta = (checkin.meta ?? {}) as unknown as CheckinMeta;
+  await query("update coach_messages set meta = $2 where id = $1", [checkin.id, JSON.stringify({ ...meta, state: "picked", picked: { activity_id: activityId, session_id: session.id } } satisfies CheckinMeta)]);
 }
 
 /** Push the activity back through the worker so a Claude review is regenerated. */
@@ -560,15 +630,16 @@ function toApiWeekly(w: WeeklyReviewRow): ApiWeeklyReview {
       applied_session_id: a.applied_session_id ?? null,
     })),
     created_at: new Date(w.created_at).toISOString(),
+    updated_at: w.updated_at ? new Date(w.updated_at).toISOString() : null,
+    update_reason: w.update_reason ?? null,
   };
 }
 
 async function getWeekly(userId: string) {
   const rows = await query<WeeklyReviewRow>(
-    `select w.id, w.plan_id, to_char(w.week_start, 'YYYY-MM-DD') as week_start, w.summary, w.adjustments, w.created_at
-       from weekly_reviews w join plans p on p.id = w.plan_id
-      where p.user_id = $1 and p.status = 'active'
-      order by w.week_start desc, w.created_at desc
+    `${WEEKLY_REVIEW_SELECT}
+      where plan_id in (select id from plans where user_id = $1 and status = 'active')
+      order by week_start desc, created_at desc
       limit 20`,
     [userId],
   );
@@ -593,9 +664,7 @@ async function postAdjustment(userId: string, weeklyId: string, index: number, r
   if (body.action !== "apply" && body.action !== "dismiss") return json(400, { error: "action must be apply or dismiss" });
 
   const w = await queryOne<WeeklyReviewRow>(
-    `select w.id, w.plan_id, to_char(w.week_start, 'YYYY-MM-DD') as week_start, w.summary, w.adjustments, w.created_at
-       from weekly_reviews w join plans p on p.id = w.plan_id
-      where w.id = $1 and p.user_id = $2`,
+    `${WEEKLY_REVIEW_SELECT} where id = $1 and plan_id in (select id from plans where user_id = $2)`,
     [weeklyId, userId],
   );
   if (!w) return json(404, { error: "weekly review not found" });
@@ -606,52 +675,111 @@ async function postAdjustment(userId: string, weeklyId: string, index: number, r
 
   if (body.action === "apply") {
     if (!ADJUST_FIELDS.has(item.field)) return json(400, { error: "unsupported field" });
-    const old = await queryOne<PlannedSessionRow>(
-      `select *, to_char(scheduled_date, 'YYYY-MM-DD') as scheduled_date
-         from planned_sessions where id = $1 and plan_id = $2 and superseded = false`,
+    const old = await queryOne<PlannedSessionRow & { race_date: string }>(
+      `select ps.*, to_char(ps.scheduled_date, 'YYYY-MM-DD') as scheduled_date, to_char(p.race_date, 'YYYY-MM-DD') as race_date
+         from planned_sessions ps join plans p on p.id = ps.plan_id
+        where ps.id = $1 and ps.plan_id = $2 and ps.superseded = false`,
       [item.session_id, w.plan_id],
     );
     if (!old) return json(409, { error: "that session was already changed; dismiss this proposal" });
-
-    const next: Record<string, unknown> = { ...old, id: randomUUID(), version: old.version + 1, superseded: false };
-    next[item.field] = item.new;
-    if (item.field === "target_pace_sec_km" && typeof item.new === "number" && old.target_pace_sec_km) {
-      // Keep the allowed range the same width around the new midpoint.
-      const d = item.new - old.target_pace_sec_km;
-      if (old.target_pace_min_sec_km != null) next.target_pace_min_sec_km = old.target_pace_min_sec_km + d;
-      if (old.target_pace_max_sec_km != null) next.target_pace_max_sec_km = old.target_pace_max_sec_km + d;
-    }
-    await query(
-      `insert into planned_sessions
-         (id, plan_id, scheduled_date, week_no, phase, label, type, content, note, target, target_distance_m,
-          target_pace_sec_km, target_pace_min_sec_km, target_pace_max_sec_km, target_hr_min, target_hr_max, version, superseded)
-       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, false)`,
-      [
-        next.id, old.plan_id, next.scheduled_date, old.week_no, old.phase, old.label, next.type, old.content, next.note,
-        old.target, next.target_distance_m, next.target_pace_sec_km, next.target_pace_min_sec_km, next.target_pace_max_sec_km,
-        old.target_hr_min, old.target_hr_max, next.version,
-      ],
-    );
-    await query("update planned_sessions set superseded = true where id = $1", [old.id]);
-    await query("update activities set session_id = $2 where session_id = $1", [old.id, next.id]);
-    item.applied_session_id = next.id as string;
+    // The stored value is the model's: the same checks as a chat card before it touches the plan
+    // (value fits the field, the race day is neither changed nor made, nothing moves onto it).
+    const conflict = changeConflict(old, item.field, item.new);
+    if (conflict) return json(409, { error: `${conflict}; dismiss this proposal` });
+    const { race_date: _raceDate, ...oldRow } = old;
+    item.applied_session_id = await withTransaction((q) => applyChange(q, oldRow, item.field, item.new));
   }
 
   item.status = body.action === "apply" ? "applied" : "dismissed";
   item.decided_at = new Date().toISOString();
   await query("update weekly_reviews set adjustments = $2 where id = $1", [w.id, JSON.stringify(stored)]);
 
-  const updated = await queryOne<WeeklyReviewRow>(
-    `select id, plan_id, to_char(week_start, 'YYYY-MM-DD') as week_start, summary, adjustments, created_at from weekly_reviews where id = $1`,
-    [w.id],
-  );
+  const updated = await queryOne<WeeklyReviewRow>(`${WEEKLY_REVIEW_SELECT} where id = $1`, [w.id]);
   return json<PostAdjustmentResponse>(200, { review: toApiWeekly(updated!) });
+}
+
+/**
+ * The athlete answers the weekly review's question about a key session without a
+ * record. synced: just noted. skipped: the session gets skipped_at and the weekly
+ * Lambda regenerates the review ("你說 10/25 沒跑").
+ */
+async function postWeeklyAsk(userId: string, weeklyId: string, sessionId: string, raw: string) {
+  if (!UUID_RE.test(weeklyId) || !UUID_RE.test(sessionId)) return json(400, { error: "invalid id" });
+  let body: PostWeeklyAskRequest;
+  try {
+    body = JSON.parse(raw) as PostWeeklyAskRequest;
+  } catch {
+    return json(400, { error: "invalid json" });
+  }
+  if (body.answer !== "synced" && body.answer !== "skipped") return json(400, { error: "answer must be synced or skipped" });
+
+  const m = await queryOne<CoachMessageRow>(
+    `select m.* from coach_messages m join weekly_reviews w on w.id = m.weekly_review_id join plans p on p.id = w.plan_id
+      where m.weekly_review_id = $1 and m.user_id = $2 and p.user_id = $2 and m.kind = 'weekly' order by m.created_at limit 1`,
+    [weeklyId, userId],
+  );
+  if (!m) return json(404, { error: "weekly review not found" });
+  const meta = (m.meta ?? {}) as unknown as WeeklyMessageMeta;
+  const ask = (meta.asks ?? []).find((a) => a.session_id === sessionId);
+  if (!ask) return json(404, { error: "no question about that session" });
+  if (ask.state === "skipped") return json(409, { error: "already answered" });
+
+  ask.state = body.answer;
+  await query("update coach_messages set meta = $2 where id = $1", [m.id, JSON.stringify(meta)]);
+  if (body.answer === "skipped") {
+    await query(
+      "update planned_sessions set skipped_at = coalesce(skipped_at, now()) where id = $1 and plan_id in (select id from plans where user_id = $2)",
+      [sessionId, userId],
+    );
+    await requestWeeklyRerun({ user_id: userId, weekly_review_id: weeklyId, reason: `你說 ${shortDate(ask.date)} 沒跑` });
+  }
+  const [fresh] = await query<CoachMessageRow>("select * from coach_messages where id = $1", [m.id]);
+  return json<PostWeeklyAskResponse>(200, { message: toApiCoachMessage(fresh) });
+}
+
+// ---- chat proposals ---------------------------------------------------------------
+
+function toApiProposal(p: ProposalRow): ApiProposal {
+  return {
+    id: p.id,
+    source: p.source,
+    message_id: p.message_id,
+    changes: (Array.isArray(p.items) ? p.items : []).map((i) => ({
+      session_id: i.session_id, field: i.field, old: i.old, new: i.new,
+      label: i.label ?? null, date: i.date ?? null, applied_session_id: i.applied_session_id ?? null,
+    })),
+    why: p.why,
+    basis: Array.isArray(p.basis) ? p.basis : [],
+    flags: Array.isArray(p.flags) ? p.flags : [],
+    status: p.status,
+    created_at: new Date(p.created_at).toISOString(),
+    decided_at: p.decided_at ? new Date(p.decided_at).toISOString() : null,
+  };
+}
+
+/** Apply every change of the card in one transaction (Woo confirms in the thread), or dismiss it. */
+async function postProposalDecision(userId: string, proposalId: string, action: "apply" | "dismiss") {
+  if (!UUID_RE.test(proposalId)) return json(400, { error: "invalid proposal id" });
+  const p = await queryOne<ProposalRow>("select * from proposals where id = $1 and user_id = $2", [proposalId, userId]);
+  if (!p) return json(404, { error: "proposal not found" });
+  if (p.status !== "pending") return json(409, { error: `already ${p.status}` });
+
+  if (action === "apply") {
+    const result = await applyProposal(p);
+    if (typeof result === "string") return json(409, { error: result });
+    await postProposalApplied(userId, result);
+  } else {
+    await query("update proposals set status = 'dismissed', decided_at = now() where id = $1 and status = 'pending'", [p.id]);
+  }
+  const [fresh] = await query<ProposalRow>("select * from proposals where id = $1", [p.id]);
+  return json<PostProposalResponse>(200, { proposal: toApiProposal(fresh) });
 }
 
 // ---- the coach's thread ----------------------------------------------------------
 
-function toApiCoachMessage(m: CoachMessageRow): ApiCoachMessage {
+function toApiCoachMessage(m: CoachMessageRow, proposals?: Map<string, ProposalRow>): ApiCoachMessage {
   const meta = (m.meta ?? {}) as Record<string, unknown>;
+  const proposal = typeof meta.proposal_id === "string" ? proposals?.get(meta.proposal_id) : undefined;
   return {
     id: m.id,
     role: m.role,
@@ -666,10 +794,52 @@ function toApiCoachMessage(m: CoachMessageRow): ApiCoachMessage {
     quote: typeof meta.quote === "string" ? meta.quote : null,
     rpe: typeof meta.rpe === "number" ? meta.rpe : null,
     checkin: m.kind === "checkin" ? toApiCheckin(meta as unknown as CheckinMeta) : null,
-    ask: m.kind === "ask" ? { state: meta.state === "open" ? "open" : "answered", activity_id: String(meta.activity_id ?? ""), session_id: String(meta.session_id ?? "") } : null,
-    error: typeof meta.error === "string" ? meta.error : null,
+    ask: m.kind === "ask"
+      ? {
+          state: meta.state === "open" ? "open" : "answered",
+          kind: meta.kind === "mismatch" ? "mismatch" : "feel",
+          from: askFrom(meta),
+          activity_id: String(meta.activity_id ?? ""),
+          session_id: String(meta.session_id ?? ""),
+          reason: typeof meta.reason === "string" ? meta.reason : null,
+        }
+      : null,
+    weekly: m.kind === "weekly" ? toApiWeeklyMeta(meta as unknown as Partial<WeeklyMessageMeta>) : null,
+    proposal: proposal ? toApiProposal(proposal) : null,
+    // Rows written before the worker stored the fixed line still hold the provider's wording: never shown.
+    error: typeof meta.error === "string" && meta.error ? REPLY_FAILED : null,
     created_at: new Date(m.created_at).toISOString(),
   };
+}
+
+/**
+ * Where an ask's pick came from. A feel question only follows a check-in chip; a
+ * mismatch question says so in `from` — older ones (before the field) came from a
+ * chip when they carry a checkin_id, from the report page otherwise.
+ */
+function askFrom(meta: Record<string, unknown>): "checkin" | "report" {
+  if (meta.kind !== "mismatch") return "checkin";
+  if (meta.from === "checkin" || meta.from === "report") return meta.from;
+  return meta.checkin_id ? "checkin" : "report";
+}
+
+function toApiWeeklyMeta(meta: Partial<WeeklyMessageMeta>): ApiCoachMessage["weekly"] {
+  return {
+    week_start: meta.week_start ?? "",
+    asks: Array.isArray(meta.asks)
+      ? meta.asks.map((a) => ({ session_id: a.session_id, label: a.label, date: a.date, question: weeklyAskQuestion(a.date, a.label), state: a.state ?? "open" }))
+      : [],
+    updated: meta.updated && typeof meta.updated.at === "string" ? { at: meta.updated.at, reason: meta.updated.reason ?? "" } : null,
+    cancelled: Array.isArray(meta.cancelled) ? meta.cancelled : [],
+  };
+}
+
+/** The proposal cards attached to these messages, keyed by proposal id. */
+async function proposalsFor(userId: string, messages: CoachMessageRow[]): Promise<Map<string, ProposalRow>> {
+  const ids = messages.map((m) => (m.meta as { proposal_id?: unknown } | null)?.proposal_id).filter((id): id is string => typeof id === "string" && UUID_RE.test(id));
+  if (!ids.length) return new Map();
+  const rows = await query<ProposalRow>("select * from proposals where user_id = $1 and id = any($2::uuid[])", [userId, ids]);
+  return new Map(rows.map((p) => [p.id, p]));
 }
 
 function toApiCheckin(meta: CheckinMeta): ApiCheckin {
@@ -700,7 +870,8 @@ async function getCoach(userId: string) {
     "select * from coach_messages where user_id = $1 order by created_at desc limit 100",
     [userId],
   );
-  return json<CoachResponse>(200, { coach: { name: COACH_NAME }, messages: rows.reverse().map(toApiCoachMessage) });
+  const proposals = await proposalsFor(userId, rows);
+  return json<CoachResponse>(200, { coach: { name: COACH_NAME }, messages: rows.reverse().map((m) => toApiCoachMessage(m, proposals)) });
 }
 
 /** The athlete opened the thread: everything posted so far counts as seen. */
@@ -729,6 +900,15 @@ async function postCheckinPick(userId: string, checkinId: string, raw: string) {
     await setMeta({ state: "dismissed" });
     const pick = await postCoachMessage({ user_id: userId, role: "athlete", kind: "pick", text: "都不是", meta: { none: true } });
     await postCoachMessage({ user_id: userId, role: "coach", kind: "chat", text: "好，這趟不算。改變主意的話按「重新選」。" });
+    // The activity stays unplanned, but the week's review (if already written without it) should list it.
+    if (checkin.activity_id) {
+      const a = await queryOne<{ date: string; sport_type: string | null }>(
+        "select to_char(start_time at time zone 'Asia/Tokyo', 'YYYY-MM-DD') as date, sport_type from activities where id = $1 and user_id = $2",
+        [checkin.activity_id, userId],
+      );
+      const w = a ? await reviewMissingActivity(userId, checkin.activity_id, a.date) : undefined;
+      if (a && w) await requestWeeklyRerun({ user_id: userId, weekly_review_id: w.id, reason: `${shortDate(a.date)} 的 ${sportName(a.sport_type)} 進來了`, activity_id: checkin.activity_id });
+    }
     const [c] = await query<CoachMessageRow>("select * from coach_messages where id = $1", [checkin.id]);
     return json<PostCheckinPickResponse>(200, { checkin: toApiCoachMessage(c), pick: toApiCoachMessage(pick) });
   }
@@ -748,16 +928,37 @@ async function postCheckinPick(userId: string, checkinId: string, raw: string) {
     user_id: userId, role: "athlete", kind: "pick", text: candidate.label, status: "pending", activity_id: activityId,
     meta: { activity_id: activityId, session_id: sessionId },
   });
-  if (process.env.QUEUE_URL) {
-    await sqs.send(new SendMessageCommand({
-      QueueUrl: process.env.QUEUE_URL,
-      MessageBody: JSON.stringify({ type: "coach_ask", user_id: userId, message_id: pick.id } satisfies CoachAskJob),
-    }));
-  } else {
+
+  // Does the pick look right? A walk on a long-run day, a run far shorter than the
+  // session: Woo asks "真的是這趟嗎？" instead of the feel question (POST /coach/messages
+  // { answer_to, confirm_match } settles it).
+  const activity = await queryOne<ActivityRow>("select * from activities where id = $1 and user_id = $2", [activityId, userId]);
+  const session = await queryOne<PlannedSessionRow>(
+    `select ps.*, to_char(ps.scheduled_date, 'YYYY-MM-DD') as scheduled_date from planned_sessions ps join plans p on p.id = ps.plan_id
+      where ps.id = $1 and p.user_id = $2`,
+    [sessionId, userId],
+  );
+  const reason = activity && session ? mismatchReason(activity, session) : null;
+  if (reason && session) {
+    await postMismatchAsk(userId, { from: "checkin", activity_id: activityId, session_id: sessionId, reason, checkin_id: checkin.id, pick_id: pick.id }, session.scheduled_date, session);
     await query("update coach_messages set status = 'sent' where id = $1", [pick.id]);
+  } else {
+    await queueCoachAsk(userId, pick.id);
   }
   const [c] = await query<CoachMessageRow>("select * from coach_messages where id = $1", [checkin.id]);
   return json<PostCheckinPickResponse>(200, { checkin: toApiCoachMessage(c), pick: toApiCoachMessage(pick) });
+}
+
+/** Woo's feel question follows the pick (worker); without a queue the pick is just settled. */
+async function queueCoachAsk(userId: string, pickId: string): Promise<void> {
+  if (process.env.QUEUE_URL) {
+    await sqs.send(new SendMessageCommand({
+      QueueUrl: process.env.QUEUE_URL,
+      MessageBody: JSON.stringify({ type: "coach_ask", user_id: userId, message_id: pickId } satisfies CoachAskJob),
+    }));
+  } else {
+    await query("update coach_messages set status = 'sent' where id = $1", [pickId]);
+  }
 }
 
 /** 選錯了 / 重新選: undo the pick (or the dismissal) and ask the same question again. */
@@ -765,28 +966,8 @@ async function postCheckinReset(userId: string, checkinId: string) {
   if (!UUID_RE.test(checkinId)) return json(400, { error: "invalid check-in id" });
   const checkin = await queryOne<CoachMessageRow>("select * from coach_messages where id = $1 and user_id = $2 and kind = 'checkin'", [checkinId, userId]);
   if (!checkin) return json(404, { error: "check-in not found" });
-  const meta = (checkin.meta ?? {}) as unknown as CheckinMeta;
-  if (meta.state === "open") return json(409, { error: "check-in is still open" });
-  if (meta.state === "reset") return json(409, { error: "check-in was already reset" });
-
-  if (meta.state === "picked" && meta.picked) {
-    const { activity_id, session_id } = meta.picked;
-    await query("update activities set session_id = null, match_status = 'unplanned' where id = $1 and session_id = $2", [activity_id, session_id]);
-    await query("delete from reviews where activity_id = $1 and source = 'claude'", [activity_id]);
-    // Woo's open question about that activity is closed; the athlete's pending messages settled.
-    await query(
-      `update coach_messages set meta = coalesce(meta, '{}'::jsonb) || '{"state":"closed"}'::jsonb
-        where user_id = $1 and kind = 'ask' and activity_id = $2 and meta->>'state' = 'open'`,
-      [userId, activity_id],
-    );
-    await query("update coach_messages set status = 'sent' where user_id = $1 and role = 'athlete' and status = 'pending' and activity_id = $2", [userId, activity_id]);
-  }
-  await query("update coach_messages set meta = $2 where id = $1", [checkin.id, JSON.stringify({ ...meta, state: "reset" })]);
-  const fresh: CheckinMeta = { ...meta, state: "open", picked: null };
-  const text = meta.mode === "activity"
-    ? `好，那是哪一個？${meta.session_label ? `今天的課是 ${meta.session_label}。` : ""}`
-    : "好，那要算這週的哪一堂？";
-  const m = await postCoachMessage({ user_id: userId, role: "coach", kind: "checkin", text, meta: fresh as unknown as Record<string, unknown>, activity_id: checkin.activity_id });
+  const m = await resetCheckin(userId, checkin);
+  if (typeof m === "string") return json(409, { error: m });
   return json<PostCheckinResetResponse>(200, { checkin: toApiCoachMessage(m) });
 }
 
@@ -877,6 +1058,40 @@ async function putRoutine(userId: string, sessionId: string, raw: string) {
   return json<PutRoutineResponse>(200, { routine: toApiRoutine(updated) });
 }
 
+/**
+ * "是，就是這趟" (confirm_match true): the pick stands — after a check-in chip Woo's feel
+ * question follows; after a report-page pick (no check-in, no pick message) the verdict
+ * that PUT …/session held back is queued now.
+ * "不是，重選" (false): after a chip the check-in is reset (activity unassigned, fresh
+ * chips); after a report-page pick the activity is just unassigned again (the report
+ * page is where to pick next; no new check-in). The athlete's words are kept as a
+ * plain line; no model reply.
+ */
+async function answerMismatch(userId: string, ask: CoachMessageRow, text: string, confirm: boolean | undefined) {
+  if (typeof confirm !== "boolean") return json(400, { error: "confirm_match is required for this question" });
+  const am = (ask.meta ?? {}) as unknown as MismatchAskMeta;
+  const m = await postCoachMessage({ user_id: userId, role: "athlete", kind: "chat", text, status: "sent", activity_id: ask.activity_id, meta: { answer_to: ask.id, confirm_match: confirm } });
+  if (confirm) {
+    await query("update coach_messages set meta = coalesce(meta, '{}'::jsonb) || '{\"state\":\"answered\"}'::jsonb where id = $1", [ask.id]);
+    if (am.pick_id) {
+      // The pick goes back to pending so the worker's feel question runs for it (its redelivery guard is the status).
+      await query("update coach_messages set status = 'pending' where id = $1 and user_id = $2 and kind = 'pick'", [am.pick_id, userId]);
+      await queueCoachAsk(userId, am.pick_id);
+    } else {
+      const activity = await queryOne<{ strava_activity_id: string }>("select strava_activity_id from activities where id = $1 and user_id = $2", [am.activity_id, userId]);
+      if (activity) await requeue(userId, activity.strava_activity_id, "match confirmed");
+    }
+  } else if (am.checkin_id) {
+    const checkin = await queryOne<CoachMessageRow>("select * from coach_messages where id = $1 and user_id = $2 and kind = 'checkin'", [am.checkin_id, userId]);
+    if (!checkin) return json(404, { error: "check-in not found" });
+    const r = await resetCheckin(userId, checkin); // closes this ask too
+    if (typeof r === "string") return json(409, { error: r });
+  } else {
+    await undoPick(userId, am.activity_id, am.session_id); // closes this ask too
+  }
+  return json<PostCoachMessageResponse>(200, { message: toApiCoachMessage(m) });
+}
+
 async function postCoach(userId: string, raw: string) {
   let body: PostCoachMessageRequest;
   try {
@@ -906,8 +1121,10 @@ async function postCoach(userId: string, raw: string) {
     if (!UUID_RE.test(body.answer_to)) return json(400, { error: "invalid answer_to" });
     const ask = await queryOne<CoachMessageRow>("select * from coach_messages where id = $1 and user_id = $2 and kind = 'ask'", [body.answer_to, userId]);
     if (!ask) return json(404, { error: "question not found" });
-    const am = (ask.meta ?? {}) as { activity_id?: string; state?: string };
-    if (am.state === "answered") return json(409, { error: "already answered" });
+    const am = (ask.meta ?? {}) as { activity_id?: string; state?: string; kind?: string };
+    if (am.state !== "open") return json(409, { error: "already answered" });
+    if (am.kind === "mismatch") return answerMismatch(userId, ask, text, body.confirm_match);
+    if (body.confirm_match !== undefined) return json(400, { error: "confirm_match only answers a mismatch question" });
     const parsed = parseMemo({ memo: text, rpe: body.rpe ?? null });
     if (typeof parsed === "string") return json(400, { error: parsed });
     const activity = await queryOne<{ id: string; strava_activity_id: string; session_id: string | null }>(

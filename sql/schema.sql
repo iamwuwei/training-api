@@ -65,6 +65,7 @@ alter table planned_sessions add column if not exists target_pace_max_sec_km int
 alter table planned_sessions add column if not exists target_hr_min int;
 alter table planned_sessions add column if not exists target_hr_max int;
 alter table planned_sessions add column if not exists brief text;                  -- Woo's one line about this session (worker-written)
+alter table planned_sessions add column if not exists skipped_at timestamptz;      -- the athlete said this session was not run (weekly review ask: 沒跑)
 create index if not exists planned_sessions_plan_id_scheduled_date_idx
   on planned_sessions (plan_id, scheduled_date);
 
@@ -116,6 +117,25 @@ create table if not exists weekly_reviews (
   adjustments jsonb,
   created_at timestamptz not null default now()
 );
+alter table weekly_reviews add column if not exists updated_at timestamptz;   -- last regeneration (an activity of that week arrived after the review, or an ask was answered 沒跑)
+alter table weekly_reviews add column if not exists update_reason text;       -- why: "10/25 的長跑進來了" / "你說 10/25 沒跑"
+
+-- Woo's proposals made in chat (one card, possibly several changes applied together).
+-- The weekly review keeps its own proposals in weekly_reviews.adjustments.
+create table if not exists proposals (
+  id uuid primary key,
+  user_id uuid not null references users(id),
+  source text not null,                    -- weekly | chat
+  message_id uuid references coach_messages(id),
+  items jsonb not null default '[]',       -- [{session_id, field, old, new, label?, date?, applied_session_id?}]
+  why text,                                -- one sentence
+  basis jsonb not null default '[]',       -- string[]: the numbers Woo looked at
+  flags jsonb not null default '[]',       -- string[]: computed warnings (週跑量 +15% …), shown in amber
+  status text not null default 'pending',  -- pending | applied | dismissed
+  created_at timestamptz not null default now(),
+  decided_at timestamptz
+);
+create index if not exists proposals_user_id_created_at_idx on proposals (user_id, created_at);
 
 -- The coach's thread with each athlete: weekly reviews and per-run verdicts are posted
 -- here automatically; the athlete can reply and the coach answers (worker, Claude).

@@ -7,12 +7,16 @@ import { writeRoutine } from "../lib/strength";
 import { answerCoachMessage, postCoachMessage } from "../lib/coach";
 import { loadReviewContext } from "../lib/context";
 import { isDbWaking, query, queryOne } from "../lib/db";
+import { sessionLabel, shortDate, sportName } from "../lib/labels";
 import { getActivity, refreshToken, StravaError } from "../lib/strava";
+import { maybeRerunWeeklyReview } from "../lib/weekly";
 import type { BriefsJob, CoachAskJob, CoachReplyJob, PlannedSessionRow, RoutineJob, StravaConnectionRow, StravaWebhookEvent } from "../types";
 
 // Any thrown error => SQS redelivers (visibility 90 s, 3 tries, then DLQ).
 // Aurora resuming from 0 ACU is the usual first failure: wait inside this run
 // and try once more (the Lambda has 90 s) before leaving it to SQS.
+// Weekly reviews are never generated here: a late activity only asks the weekly
+// Lambda (5 min) to regenerate the week's review (maybeRerunWeeklyReview).
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -21,6 +25,11 @@ const todayJst = () => new Date(Date.now() + 9 * 3600 * 1000).toISOString().slic
 type Job = StravaWebhookEvent | CoachReplyJob | CoachAskJob | RoutineJob | BriefsJob;
 
 async function handleJob(body: Job): Promise<void> {
+  if ("type" in body && (body as { type: string }).type === "weekly_rerun") {
+    // Queued by an api deployed before reruns moved to the weekly Lambda; only possible right after that deploy.
+    console.warn("weekly_rerun job is legacy (reruns go to the weekly Lambda now), dropped:", JSON.stringify(body));
+    return;
+  }
   if ("type" in body && body.type === "coach_reply") {
     await answerCoachMessage(body.user_id, body.message_id, todayJst());
     return;
@@ -159,15 +168,21 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
   );
 
   // A new, unassigned activity: Woo asks which session it was (if any fits today).
+  const day = shortDate(localDate);
   if (row.inserted && !row.session_id) {
+    let asked = false;
     try {
-      await maybeCheckin(conn.user_id, {
+      asked = await maybeCheckin(conn.user_id, {
         id: row.id, sport_type: activity.sport_type ?? activity.type, start_time: new Date(activity.start_date),
         distance_m, moving_time_sec, avg_pace_sec_km, avg_hr: round(activity.average_heartrate), max_hr: round(activity.max_heartrate),
       }, localDate);
     } catch (err) {
       console.error(`check-in failed for activity ${activity.id}`, err); // the athlete can still log it from the today page
     }
+    // Nothing to pick: the week's review (if already written) learns about it now (the
+    // weekly Lambda regenerates it). With a check-in open, that waits for the pick and
+    // its verdict below.
+    if (!asked) await maybeRerunWeeklyReview(conn.user_id, row.id, localDate, `${day} 的 ${sportName(activity.sport_type ?? activity.type)} 進來了`);
   }
 
   // Claude verdict (AUTO_REVIEW=true): only once the athlete has assigned the
@@ -216,12 +231,14 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
           );
           console.log(`review for activity ${activity.id}: ${r.verdict} (${r.reminders.length} reminders)${r.adjust_hint ? ` hint: ${r.adjust_hint}` : ""}`);
           // The verdict also shows up in the coach's thread.
-          const label = `${session.label ?? session.type}${session.target_distance_m ? ` ${Math.round(session.target_distance_m / 100) / 10} km` : ""}`;
+          const label = sessionLabel(session);
           await postCoachMessage({
             user_id: conn.user_id, role: "coach", kind: "review", text: r.comment, activity_id: row.id,
             meta: { label, verdict: r.verdict, reminder: r.reminders[0] ?? null, date: localDate },
           });
           await settleAthleteMessages(conn.user_id, row.id); // the answer that triggered this review is replied to
+          // The week's review was written without this activity (late sync): the weekly Lambda regenerates it in place.
+          await maybeRerunWeeklyReview(conn.user_id, row.id, localDate, `${day} 的 ${session.label ?? session.type} 進來了`);
         } catch (err) {
           // Not requeued (SQS would only retry the same failure). Recorded so the
           // app can show "分析失敗" with a retry instead of waiting forever.
