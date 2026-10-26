@@ -150,6 +150,8 @@ export function mismatchReason(a: ActivityLite, s: PlannedSessionRow): string | 
 export interface MismatchAskMeta {
   state: "open" | "answered" | "closed";
   kind: "mismatch";
+  /** Where the pick came from: a check-in chip or the report page (PUT …/session). Decides what 不是 does and how the web words its chip. */
+  from: "checkin" | "report";
   activity_id: string;
   session_id: string;
   reason: string;
@@ -259,7 +261,7 @@ export async function askAboutActivity(userId: string, pickMessageId: string): P
   }
   await postCoachMessage({
     user_id: userId, role: "coach", kind: "ask", text, activity_id: activity.id,
-    meta: { state: "open", kind: "feel", activity_id: activity.id, session_id: session.id },
+    meta: { state: "open", kind: "feel", from: "checkin", activity_id: activity.id, session_id: session.id },
   });
   await query("update coach_messages set status = 'sent' where id = $1", [pick.id]);
 }

@@ -24,4 +24,14 @@ export function sessionLabel(s: Pick<PlannedSessionRow, "label" | "type" | "targ
 /** "10/25" from 'YYYY-MM-DD'. */
 export const shortDate = (iso: string) => iso.slice(5).replace("-", "/");
 
+/**
+ * Woo's question about a key session with no record, for the weekly message's quote
+ * block: "10/25 的 Long 16 km 我沒看到紀錄，是沒跑，還是還沒同步？". A space between
+ * Chinese and a Latin label ("的 Long"), none before a Chinese one ("的長跑 16 km").
+ */
+export function weeklyAskQuestion(date: string, label: string): string {
+  const gap = /^[A-Za-z0-9]/.test(label) ? " " : "";
+  return `${shortDate(date)} 的${gap}${label} 我沒看到紀錄，是沒跑，還是還沒同步？`;
+}
+
 export const FIELD_NAMES: Record<string, string> = { type: "類型", target_distance_m: "距離", target_pace_sec_km: "配速", scheduled_date: "日期", note: "備註", skip: "改休息" };

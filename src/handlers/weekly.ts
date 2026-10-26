@@ -5,9 +5,11 @@ import type { PlanRow, WeeklyReviewRow } from "../types";
 // EventBridge Scheduler fires this every Monday 04:00 Asia/Tokyo for the week that
 // just ended (Monday〜Sunday). A week that already has a review is skipped: the
 // Scheduler / Lambda retries after a timeout must not regenerate (and cancel the
-// proposals of) a review written a minute ago. Manual invokes:
+// proposals of) a review written a minute ago. Because of that skip a retry is safe,
+// so a plan that failed (model 529, database still waking) makes the handler throw
+// at the end and the retry picks up only the plans without a review. Manual invokes:
 //   { "week_start": "YYYY-MM-DD" }                     backfill that week (a Monday); skipped if it has a review
-//   { "week_start": "YYYY-MM-DD", "regenerate": true } regenerate it in place (reason 重新回顧)
+//   { "week_start": "YYYY-MM-DD", "regenerate": true } regenerate it in place (reason 重新回顧); never retried
 
 const JST_OFFSET_MS = 9 * 3600 * 1000;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -33,7 +35,10 @@ function lastWeekStartJst(): string {
 type Result = { plan_id: string; review_id?: string; adjustments?: number; asks?: number; skipped?: boolean; error?: string };
 
 export const handler = async (event: { week_start?: string; regenerate?: boolean } = {}) => {
-  if (event.week_start !== undefined && !DATE_RE.test(event.week_start)) throw new Error("week_start must be YYYY-MM-DD");
+  if (event.week_start !== undefined) {
+    if (!DATE_RE.test(event.week_start)) throw new Error("week_start must be YYYY-MM-DD");
+    if (new Date(`${event.week_start}T00:00:00Z`).getUTCDay() !== 1) throw new Error("week_start must be a Monday");
+  }
   const weekStart = event.week_start ?? lastWeekStartJst();
   const regenerate = event.week_start !== undefined && event.regenerate === true;
 
@@ -45,8 +50,8 @@ export const handler = async (event: { week_start?: string; regenerate?: boolean
 
   const results: Result[] = [];
 
-  // One plan failing (model error, timeout) must not throw out of the handler: that
-  // would be a retry, and a retry would hit the other plan's fresh review.
+  // One plan failing (model error, timeout) must not stop the others; the failures are
+  // collected and thrown together below so the retry only redoes those plans.
   for (const plan of plans) {
     try {
       const existing = await queryOne<WeeklyReviewRow>(
@@ -65,6 +70,14 @@ export const handler = async (event: { week_start?: string; regenerate?: boolean
       console.error(`weekly review failed for plan ${plan.id} (${plan.display_name}) week ${weekStart}`, err);
       results.push({ plan_id: plan.id, error: err instanceof Error ? err.message.slice(0, 300) : String(err) });
     }
+  }
+
+  // Scheduled / backfill: a failed plan has no review row (the run is one transaction),
+  // so a retry generates it and skips the rest. A manual regenerate is not retried —
+  // a second regeneration would cancel the proposals the first one just made.
+  const failed = results.filter((r) => r.error);
+  if (failed.length && !regenerate) {
+    throw new Error(`weekly review failed for ${failed.length} of ${plans.length} plan(s) week ${weekStart}: ${failed.map((r) => `${r.plan_id}: ${r.error}`).join("; ")}`);
   }
 
   return { week_start: weekStart, reviews: results };

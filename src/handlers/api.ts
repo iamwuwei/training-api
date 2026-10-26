@@ -4,7 +4,7 @@ import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyResultV2 }
 import { isDbWaking, query, queryOne, withTransaction } from "../lib/db";
 import { type CheckinMeta, type MismatchAskMeta, mismatchReason, postMismatchAsk, resetCheckin, undoPick } from "../lib/checkin";
 import { COACH_NAME, MAX_MESSAGE_CHARS, postCoachMessage } from "../lib/coach";
-import { shortDate, sportName } from "../lib/labels";
+import { shortDate, sportName, weeklyAskQuestion } from "../lib/labels";
 import { applyChange, applyProposal, postProposalApplied } from "../lib/proposals";
 import { deauthorize } from "../lib/strava";
 import { postRoutineDone } from "../lib/strength";
@@ -314,6 +314,14 @@ async function getPlan(userId: string) {
     `select id from coach_messages where user_id = $1 and meta->>'state' = 'open' and kind in ('checkin', 'ask') limit 1`,
     [userId],
   );
+  // The newest open question decides the waiting line's wording (feel vs mismatch); a
+  // check-in alone gives null.
+  const openAsk = openCheckin
+    ? await queryOne<{ kind: string | null }>(
+        `select meta->>'kind' as kind from coach_messages where user_id = $1 and kind = 'ask' and meta->>'state' = 'open' order by created_at desc limit 1`,
+        [userId],
+      )
+    : undefined;
 
   const routines = await query<SessionRoutineRow>(
     `select r.* from session_routines r join planned_sessions ps on ps.id = r.session_id
@@ -329,6 +337,7 @@ async function getPlan(userId: string) {
   return json<PlanResponse>(200, {
     coach_unread: Number(unread?.n ?? 0),
     coach_checkin_open: Boolean(openCheckin),
+    coach_ask_kind: openAsk ? (openAsk.kind === "mismatch" ? "mismatch" : "feel") : null,
     plan,
     weeks: weeks.map(({ week_no, week_start, week_end, phase, focus }) => ({ week_no, week_start, week_end, phase, focus })),
     sessions: sessions.map(toApiSession),
@@ -457,7 +466,7 @@ async function putSession(userId: string, activityId: string, raw: string) {
           where user_id = $1 and kind = 'ask' and activity_id = $2 and meta->>'state' = 'open'`,
         [userId, activityId],
       );
-      await postMismatchAsk(userId, { activity_id: activityId, session_id: session.id, reason, checkin_id: null, pick_id: null }, session.scheduled_date, session);
+      await postMismatchAsk(userId, { from: "report", activity_id: activityId, session_id: session.id, reason, checkin_id: null, pick_id: null }, session.scheduled_date, session);
     } else if (dropped.length > 0 || !hasManual) {
       await requeue(userId, activity.strava_activity_id, "session reassigned");
     }
@@ -763,6 +772,7 @@ function toApiCoachMessage(m: CoachMessageRow, proposals?: Map<string, ProposalR
       ? {
           state: meta.state === "open" ? "open" : "answered",
           kind: meta.kind === "mismatch" ? "mismatch" : "feel",
+          from: askFrom(meta),
           activity_id: String(meta.activity_id ?? ""),
           session_id: String(meta.session_id ?? ""),
           reason: typeof meta.reason === "string" ? meta.reason : null,
@@ -775,10 +785,23 @@ function toApiCoachMessage(m: CoachMessageRow, proposals?: Map<string, ProposalR
   };
 }
 
+/**
+ * Where an ask's pick came from. A feel question only follows a check-in chip; a
+ * mismatch question says so in `from` — older ones (before the field) came from a
+ * chip when they carry a checkin_id, from the report page otherwise.
+ */
+function askFrom(meta: Record<string, unknown>): "checkin" | "report" {
+  if (meta.kind !== "mismatch") return "checkin";
+  if (meta.from === "checkin" || meta.from === "report") return meta.from;
+  return meta.checkin_id ? "checkin" : "report";
+}
+
 function toApiWeeklyMeta(meta: Partial<WeeklyMessageMeta>): ApiCoachMessage["weekly"] {
   return {
     week_start: meta.week_start ?? "",
-    asks: Array.isArray(meta.asks) ? meta.asks.map((a) => ({ session_id: a.session_id, label: a.label, date: a.date, state: a.state ?? "open" })) : [],
+    asks: Array.isArray(meta.asks)
+      ? meta.asks.map((a) => ({ session_id: a.session_id, label: a.label, date: a.date, question: weeklyAskQuestion(a.date, a.label), state: a.state ?? "open" }))
+      : [],
     updated: meta.updated && typeof meta.updated.at === "string" ? { at: meta.updated.at, reason: meta.updated.reason ?? "" } : null,
     cancelled: Array.isArray(meta.cancelled) ? meta.cancelled : [],
   };
@@ -886,7 +909,7 @@ async function postCheckinPick(userId: string, checkinId: string, raw: string) {
   const session = await queryOne<PlannedSessionRow>("select *, to_char(scheduled_date, 'YYYY-MM-DD') as scheduled_date from planned_sessions where id = $1", [sessionId]);
   const reason = activity && session ? mismatchReason(activity, session) : null;
   if (reason && session) {
-    await postMismatchAsk(userId, { activity_id: activityId, session_id: sessionId, reason, checkin_id: checkin.id, pick_id: pick.id }, session.scheduled_date, session);
+    await postMismatchAsk(userId, { from: "checkin", activity_id: activityId, session_id: sessionId, reason, checkin_id: checkin.id, pick_id: pick.id }, session.scheduled_date, session);
     await query("update coach_messages set status = 'sent' where id = $1", [pick.id]);
   } else {
     await queueCoachAsk(userId, pick.id);

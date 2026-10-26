@@ -71,14 +71,15 @@ async function rerunWeekly(job: WeeklyRerunJob): Promise<void> {
     [job.weekly_review_id, job.user_id],
   );
   if (!w) return;
-  if (w.updated_at && new Date(w.updated_at).getTime() >= Date.parse(job.requested_at)) return; // already done
+  if (w.updated_at && new Date(w.updated_at).getTime() >= Date.parse(job.requested_at)) return; // already done (checked again under the lock)
   const plan = await queryOne<PlanRow & { display_name: string }>(
     `select p.*, to_char(p.race_date, 'YYYY-MM-DD') as race_date, u.display_name from plans p join users u on u.id = p.user_id where p.id = $1`,
     [w.plan_id],
   );
   if (!plan) return;
   try {
-    const r = await runWeeklyReview(plan, w.week_start, w, job.reason);
+    const r = await runWeeklyReview(plan, w.week_start, w, job.reason, { requestedAt: job.requested_at });
+    if (r.skipped) return;
     console.log(`weekly review ${r.review_id} regenerated (${job.reason}): ${r.adjustments} adjustments, ${r.asks} asks`);
   } catch (err) {
     console.error(`weekly rerun failed for review ${job.weekly_review_id}`, err); // not requeued (same failure again); the next activity tries again

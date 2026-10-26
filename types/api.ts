@@ -139,6 +139,13 @@ export interface PlanResponse {
   coach_unread: number;
   /** Woo is waiting on the athlete: an open check-in (which activity?) or an open question (how did it feel?). The today page points to /coach. */
   coach_checkin_open: boolean;
+  /**
+   * What the newest open `ask` is about, for the waiting line: `feel` = how did it feel
+   * (today page "Woo 在等你回感受"), `mismatch` = is this really that session (report page
+   * "Woo 在問這趟是不是"). null when no ask is open — including when only a check-in is
+   * open (`coach_checkin_open` still true).
+   */
+  coach_ask_kind: "feel" | "mismatch" | null;
   plan: ApiPlan;
   weeks: ApiWeek[];
   sessions: ApiSession[];    // not superseded, ordered by date
@@ -351,8 +358,12 @@ export interface ApiCoachMessage {
    * Woo's sentence, the chips are 是／不是 (POST /coach/messages { answer_to, confirm_match }).
    * 不是 after a chip resets the check-in; after a report-page pick it only unassigns the
    * activity (no new check-in). state `answered` covers both answered and closed.
+   * `from`: where the pick came from — `checkin` (a chip in the thread; 不是 → a fresh
+   * check-in follows, chip text "不是，重選") or `report` (PUT /activities/{id}/session;
+   * 不是 → only unassigned, the athlete picks again on the report page, chip text
+   * "不是這堂"). A `feel` ask is always `checkin`.
    */
-  ask: { state: "open" | "answered"; kind: "feel" | "mismatch"; activity_id: string; session_id: string; reason: string | null } | null;
+  ask: { state: "open" | "answered"; kind: "feel" | "mismatch"; from: "checkin" | "report"; activity_id: string; session_id: string; reason: string | null } | null;
   /** kind weekly: the review's open questions, the "updated" line and the cancelled proposals. */
   weekly: ApiWeeklyMeta | null;
   /** A proposal card attached to a coach chat reply (see POST /proposals/{id}/apply). */
@@ -378,8 +389,14 @@ export interface ApiWeeklyMeta {
 
 export interface ApiWeeklyAsk {
   session_id: string;
-  label: string;   // "長跑 16 km"
+  label: string;   // "Long 16 km"
   date: string;    // 'YYYY-MM-DD'
+  /**
+   * Woo's question for the quote block, built by the api from date + label:
+   * "10/25 的 Long 16 km 我沒看到紀錄，是沒跑，還是還沒同步？". The review text itself
+   * does not repeat it (the prompt tells Woo to only write what he can see).
+   */
+  question: string;
   state: "open" | "synced" | "skipped";
 }
 

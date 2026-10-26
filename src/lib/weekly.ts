@@ -33,8 +33,20 @@ export interface WeeklyRunResult {
   review_id: string;
   adjustments: number;
   asks: number;
-  /** Nothing was generated: another run wrote this week's review while this one waited for the lock. */
+  /** Nothing was generated: another run already did this one's work while it waited for the lock (see `RerunGuard`). */
   skipped?: boolean;
+}
+
+/**
+ * Why the caller wants a rerun, re-checked once the lock is held: the run that held it
+ * before may have done the same work already, and a second model call would only
+ * cancel the proposals it just made.
+ */
+export interface RerunGuard {
+  /** The activity that arrived: skip when the review (as it is now) already lists it. */
+  activityId?: string;
+  /** The weekly_rerun job's requested_at: skip when the review was updated at or after it. */
+  requestedAt?: string;
 }
 
 type Plan = PlanRow & { display_name: string };
@@ -44,25 +56,26 @@ type Plan = PlanRow & { display_name: string };
  * review of the week starting `weekStart` for `plan`. Posts / updates the thread
  * message, then rewrites the next two weeks' briefs. Serialised per (plan, week).
  */
-export async function runWeeklyReview(plan: Plan, weekStart: string, existing?: WeeklyReviewRow, reason?: string): Promise<WeeklyRunResult> {
+export async function runWeeklyReview(plan: Plan, weekStart: string, existing?: WeeklyReviewRow, reason?: string, guard: RerunGuard = {}): Promise<WeeklyRunResult> {
   const weekEnd = addDays(weekStart, 6);
-  const r = await withTransaction(async (q) => {
+  const r = await withTransaction(async (q): Promise<Generated | { review_id: string; skipped: true }> => {
     await q("select pg_advisory_xact_lock(hashtext($1))", [`${plan.id}:${weekStart}`]);
     // What is there now that the lock is ours (the caller's `existing` may predate another run).
     const [current] = await q<WeeklyReviewRow>(`${WEEKLY_REVIEW_SELECT} where plan_id = $1 and week_start = $2 order by created_at desc limit 1`, [plan.id, weekStart]);
-    if (current && !existing && !reason) {
-      console.log(`weekly review ${current.id} for plan ${plan.id} week ${weekStart} was written meanwhile; not generating it again`);
-      return { review_id: current.id, adjustments: 0, asks: 0, skipped: true, first: false, activities: [] as string[] };
+    const alreadyDone = current && alreadyDoneBy(current, existing, reason, guard);
+    if (current && alreadyDone) {
+      console.log(`weekly review ${current.id} for plan ${plan.id} week ${weekStart}: ${alreadyDone}; not running again`);
+      return { review_id: current.id, skipped: true };
     }
     return generate(q, plan, weekStart, weekEnd, current, current ? reason ?? "重新回顧" : undefined);
   });
-  if (r.skipped) return r;
-  await rewriteBriefs(plan, weekEnd);
+  if ("skipped" in r) return { review_id: r.review_id, adjustments: 0, asks: 0, skipped: true };
 
   // First generation only: an activity that arrived while the model was writing could
   // not trigger a rerun (the row did not exist yet for the worker to find). Bring it in
   // now — unless something about it is still in flight (an open check-in for its day,
   // an open question, a pending answer): that flow reruns the review when it settles.
+  // The briefs are written once, by the rerun, when it happens.
   if (r.first) {
     const missed = await query<{ id: string; date: string; sport_type: string | null; label: string | null }>(
       `select a.id, to_char(a.start_time at time zone 'Asia/Tokyo', 'YYYY-MM-DD') as date, a.sport_type, ps.label
@@ -83,11 +96,26 @@ export async function runWeeklyReview(plan: Plan, weekStart: string, existing?: 
       const why = `${shortDate(m.date)} 的 ${m.label ?? sportName(m.sport_type)} 進來了`;
       console.log(`weekly review ${r.review_id}: ${missed.length} activity(ies) arrived during generation, regenerating (${why})`);
       const row = await queryOne<WeeklyReviewRow>(`${WEEKLY_REVIEW_SELECT} where id = $1`, [r.review_id]);
-      return runWeeklyReview(plan, weekStart, row, why);
+      return runWeeklyReview(plan, weekStart, row, why, { activityId: m.id });
     }
   }
+  await rewriteBriefs(plan, weekEnd);
   return { review_id: r.review_id, adjustments: r.adjustments, asks: r.asks };
 }
+
+/**
+ * With the lock held: is there nothing left for this run to do? A reason string
+ * (for the log) when the review `current` already covers what the caller asked for.
+ */
+function alreadyDoneBy(current: WeeklyReviewRow, existing: WeeklyReviewRow | undefined, reason: string | undefined, guard: RerunGuard): string | null {
+  if (!existing && !reason) return "written meanwhile";
+  const stored = (current.adjustments ?? null) as StoredAdjustments | null;
+  if (guard.activityId && stored?.activities?.includes(guard.activityId)) return `already saw activity ${guard.activityId}`;
+  if (guard.requestedAt && current.updated_at && new Date(current.updated_at).getTime() >= Date.parse(guard.requestedAt)) return `updated after the rerun was requested (${guard.requestedAt})`;
+  return null;
+}
+
+type Generated = WeeklyRunResult & { first: boolean; activities: string[] };
 
 /** The read-model-write of one run, on the locked transaction `q`. */
 async function generate(
@@ -97,7 +125,7 @@ async function generate(
   weekEnd: string,
   existing: WeeklyReviewRow | undefined,
   reason: string | undefined,
-): Promise<WeeklyRunResult & { first: boolean; activities: string[] }> {
+): Promise<Generated> {
   const upcomingEnd = addDays(weekStart, 27); // next three weeks are adjustable
 
   const sessions = await q<PlannedSessionRow>(SESSIONS_SELECT, [plan.id, weekStart, weekEnd]);
@@ -248,7 +276,8 @@ export async function maybeRerunWeeklyReview(userId: string, activityId: string,
   if (!w) return false;
   try {
     const { plan, ...row } = w;
-    const r = await runWeeklyReview(plan, w.week_start, row, reason);
+    const r = await runWeeklyReview(plan, w.week_start, row, reason, { activityId });
+    if (r.skipped) return false; // another run brought this activity in while we waited for the lock
     console.log(`weekly review ${r.review_id} regenerated (${reason}): ${r.adjustments} adjustments, ${r.asks} asks`);
     return true;
   } catch (err) {
