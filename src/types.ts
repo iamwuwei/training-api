@@ -1,8 +1,8 @@
 // Internal row + Strava types. Keep in sync with sql/schema.sql.
 // Public API request/response types live in ../types/api.ts.
 
-import type { MatchStatus, SessionType, Verdict } from "../types/api";
-export type { MatchStatus, SessionType, Verdict };
+import type { MatchStatus, ProposalField, SessionType, Verdict } from "../types/api";
+export type { MatchStatus, ProposalField, SessionType, Verdict };
 
 export interface UserRow {
   id: string;
@@ -60,6 +60,7 @@ export interface PlannedSessionRow {
   target_hr_min: number | null;
   target_hr_max: number | null;
   brief: string | null;
+  skipped_at: Date | null;
   version: number;
   superseded: boolean;
 }
@@ -177,6 +178,42 @@ export interface WeeklyReviewRow {
   summary: string | null;
   adjustments: unknown;
   created_at: Date;
+  updated_at: Date | null;
+  update_reason: string | null;
+}
+
+/** A chat proposal card (table proposals). items/basis/flags are jsonb. */
+export interface ProposalRow {
+  id: string;
+  user_id: string;
+  source: "weekly" | "chat";
+  message_id: string | null;
+  items: ProposalItem[];
+  why: string | null;
+  basis: string[];
+  flags: string[];
+  status: "pending" | "applied" | "dismissed";
+  created_at: Date;
+  decided_at: Date | null;
+}
+
+export interface ProposalItem {
+  session_id: string;
+  field: ProposalField;
+  old: string | number | null;
+  new: string | number | null;
+  label: string | null;
+  date: string | null;
+  applied_session_id?: string;
+}
+
+/** SQS message asking the worker to regenerate one weekly review (an ask was answered 沒跑). */
+export interface WeeklyRerunJob {
+  type: "weekly_rerun";
+  user_id: string;
+  weekly_review_id: string;
+  reason: string;        // "你說 10/25 沒跑"
+  requested_at: string;  // ISO; a redelivery after the rerun already happened is skipped
 }
 
 // ---- Strava ---------------------------------------------------------------
@@ -262,7 +299,7 @@ export interface WeeklyReviewResult {
 
 /** What weekly_reviews.adjustments holds: the proposals plus what the athlete did with each. */
 export interface StoredAdjustment extends WeeklyAdjustment {
-  status: "pending" | "applied" | "dismissed";
+  status: "pending" | "applied" | "dismissed" | "superseded"; // superseded: cancelled by a regeneration
   decided_at?: string;         // ISO
   applied_session_id?: string; // the new planned_sessions row after apply
 }
@@ -270,4 +307,16 @@ export interface StoredAdjustments {
   model: string;
   hints?: string[];
   items: StoredAdjustment[];
+  /** Activities (ids) the review saw; one arriving later triggers a regeneration. */
+  activities?: string[];
+}
+
+/** coach_messages.meta of a weekly message. */
+export interface WeeklyMessageMeta {
+  week_start: string;
+  proposals: number;
+  asks?: { session_id: string; label: string; date: string; state: "open" | "synced" | "skipped" }[];
+  updated?: { at: string; reason: string };
+  cancelled?: string[];
+  backfilled?: boolean;
 }

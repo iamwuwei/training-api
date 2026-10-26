@@ -1,15 +1,18 @@
-import { randomUUID } from "node:crypto";
-import { writeBriefs } from "../lib/briefs";
-import { weeklyReview } from "../lib/claude";
-import { postCoachMessage } from "../lib/coach";
-import { historyBetween, loadPlanWeeks } from "../lib/context";
 import { query, queryOne } from "../lib/db";
-import type { PlanRow, PlannedSessionRow, StoredAdjustments } from "../types";
+import { runWeeklyReview, WEEKLY_REVIEW_SELECT } from "../lib/weekly";
+import type { PlanRow, WeeklyReviewRow } from "../types";
 
-// EventBridge Scheduler fires this every Sunday 21:00 Asia/Tokyo.
-// Optional manual invoke: { "week_start": "YYYY-MM-DD" } (a Monday) to backfill.
+// EventBridge Scheduler fires this every Monday 04:00 Asia/Tokyo for the week that
+// just ended (Monday〜Sunday). A week that already has a review is skipped: the
+// Scheduler / Lambda retries after a timeout must not regenerate (and cancel the
+// proposals of) a review written a minute ago. Because of that skip a retry is safe,
+// so a plan that failed (model 529, database still waking) makes the handler throw
+// at the end and the retry picks up only the plans without a review. Manual invokes:
+//   { "week_start": "YYYY-MM-DD" }                     backfill that week (a Monday); skipped if it has a review
+//   { "week_start": "YYYY-MM-DD", "regenerate": true } regenerate it in place (reason 重新回顧); never retried
 
 const JST_OFFSET_MS = 9 * 3600 * 1000;
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 function isoDate(d: Date): string {
   return d.toISOString().slice(0, 10);
@@ -21,18 +24,23 @@ function addDays(iso: string, n: number): string {
   return isoDate(d);
 }
 
-/** Monday of the week containing "now" in JST. */
-function currentWeekStartJst(): string {
-  const nowJst = new Date(Date.now() + JST_OFFSET_MS);
-  const dow = nowJst.getUTCDay(); // 0 = Sunday
+/** Monday of the last completed week: the week that contains "yesterday" in JST. */
+function lastWeekStartJst(): string {
+  const yesterdayJst = new Date(Date.now() + JST_OFFSET_MS - 86_400_000);
+  const dow = yesterdayJst.getUTCDay(); // 0 = Sunday
   const back = dow === 0 ? 6 : dow - 1;
-  return addDays(isoDate(nowJst), -back);
+  return addDays(isoDate(yesterdayJst), -back);
 }
 
-export const handler = async (event: { week_start?: string } = {}) => {
-  const weekStart = event.week_start ?? currentWeekStartJst();
-  const weekEnd = addDays(weekStart, 6);
-  const upcomingEnd = addDays(weekStart, 27); // next three weeks are adjustable
+type Result = { plan_id: string; review_id?: string; adjustments?: number; asks?: number; skipped?: boolean; error?: string };
+
+export const handler = async (event: { week_start?: string; regenerate?: boolean } = {}) => {
+  if (event.week_start !== undefined) {
+    if (!DATE_RE.test(event.week_start)) throw new Error("week_start must be YYYY-MM-DD");
+    if (new Date(`${event.week_start}T00:00:00Z`).getUTCDay() !== 1) throw new Error("week_start must be a Monday");
+  }
+  const weekStart = event.week_start ?? lastWeekStartJst();
+  const regenerate = event.week_start !== undefined && event.regenerate === true;
 
   const plans = await query<PlanRow & { display_name: string }>(
     `select p.*, to_char(p.race_date, 'YYYY-MM-DD') as race_date, u.display_name
@@ -40,67 +48,36 @@ export const handler = async (event: { week_start?: string } = {}) => {
       where p.status = 'active'`,
   );
 
-  const results: { plan_id: string; review_id: string; adjustments: number }[] = [];
+  const results: Result[] = [];
 
+  // One plan failing (model error, timeout) must not stop the others; the failures are
+  // collected and thrown together below so the retry only redoes those plans.
   for (const plan of plans) {
-    const sessions = await query<PlannedSessionRow>(
-      `select *, to_char(scheduled_date, 'YYYY-MM-DD') as scheduled_date
-         from planned_sessions
-        where plan_id = $1 and superseded = false and scheduled_date between $2 and $3
-        order by planned_sessions.scheduled_date`,
-      [plan.id, weekStart, weekEnd],
-    );
-    const upcoming = await query<PlannedSessionRow>(
-      `select *, to_char(scheduled_date, 'YYYY-MM-DD') as scheduled_date
-         from planned_sessions
-        where plan_id = $1 and superseded = false and scheduled_date between $2 and $3
-        order by planned_sessions.scheduled_date`,
-      [plan.id, addDays(weekEnd, 1), upcomingEnd],
-    );
-    const activities = await historyBetween(plan.user_id, weekStart, weekEnd);
-    const hints = (await query<{ adjust_hint: string }>(
-      `select r.adjust_hint from reviews r join activities a on a.id = r.activity_id
-        where a.user_id = $1 and r.adjust_hint is not null
-          and (a.start_time at time zone 'Asia/Tokyo')::date between $2 and $3
-        order by a.start_time`,
-      [plan.user_id, weekStart, weekEnd],
-    )).map((r) => r.adjust_hint);
-    const previous = await queryOne<{ summary: string | null }>(
-      "select summary from weekly_reviews where plan_id = $1 and week_start < $2 order by week_start desc limit 1",
-      [plan.id, weekStart],
-    );
-    const weeks = await loadPlanWeeks(plan.id);
-
-    const review = await weeklyReview({
-      plan, weeks, weekStart, weekEnd, sessions, activities, hints,
-      previousSummary: previous?.summary ?? null, upcoming,
-    });
-
-    // Proposals only: each adjustment waits for the athlete to apply or dismiss it
-    // in the app (POST /weekly/{id}/adjustments/{index}).
-    const stored: StoredAdjustments = {
-      model: review.model,
-      hints,
-      items: review.adjustments.map((a) => ({ ...a, status: "pending" })),
-    };
-    const id = randomUUID();
-    await query(
-      `insert into weekly_reviews (id, plan_id, week_start, summary, adjustments)
-       values ($1, $2, $3, $4, $5)`,
-      [id, plan.id, weekStart, review.summary, JSON.stringify(stored)],
-    );
-    await postCoachMessage({
-      user_id: plan.user_id, role: "coach", kind: "weekly", text: review.summary, weekly_review_id: id,
-      meta: { week_start: weekStart, proposals: review.adjustments.length },
-    });
-    // Woo's one line per session for the next two weeks, rewritten with this week in mind.
     try {
-      await writeBriefs(plan.user_id, addDays(weekEnd, 1), addDays(weekEnd, 14), true);
+      const existing = await queryOne<WeeklyReviewRow>(
+        `${WEEKLY_REVIEW_SELECT} where plan_id = $1 and week_start = $2 order by created_at desc limit 1`,
+        [plan.id, weekStart],
+      );
+      if (existing && !regenerate) {
+        console.log(`weekly review for plan ${plan.id} (${plan.display_name}) week ${weekStart} already exists (${existing.id}), skipping`);
+        results.push({ plan_id: plan.id, review_id: existing.id, skipped: true });
+        continue;
+      }
+      const r = await runWeeklyReview(plan, weekStart, existing, existing ? "重新回顧" : undefined);
+      results.push({ plan_id: plan.id, ...r });
+      console.log(`weekly review ${r.review_id} for plan ${plan.id} (${plan.display_name}) week ${weekStart}${existing ? " (regenerated)" : ""}: ${r.adjustments} adjustments, ${r.asks} asks`);
     } catch (err) {
-      console.error(`briefs after weekly review failed for plan ${plan.id}`, err);
+      console.error(`weekly review failed for plan ${plan.id} (${plan.display_name}) week ${weekStart}`, err);
+      results.push({ plan_id: plan.id, error: err instanceof Error ? err.message.slice(0, 300) : String(err) });
     }
-    results.push({ plan_id: plan.id, review_id: id, adjustments: review.adjustments.length });
-    console.log(`weekly review ${id} for plan ${plan.id} (${plan.display_name}) week ${weekStart}: ${review.adjustments.length} adjustments`);
+  }
+
+  // Scheduled / backfill: a failed plan has no review row (the run is one transaction),
+  // so a retry generates it and skips the rest. A manual regenerate is not retried —
+  // a second regeneration would cancel the proposals the first one just made.
+  const failed = results.filter((r) => r.error);
+  if (failed.length && !regenerate) {
+    throw new Error(`weekly review failed for ${failed.length} of ${plans.length} plan(s) week ${weekStart}: ${failed.map((r) => `${r.plan_id}: ${r.error}`).join("; ")}`);
   }
 
   return { week_start: weekStart, reviews: results };

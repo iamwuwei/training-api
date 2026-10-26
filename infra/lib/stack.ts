@@ -113,7 +113,9 @@ export class TrainingApiStack extends cdk.Stack {
 
     const oauth = fn("oauth", { environment: stravaEnv });
 
-    const weekly = fn("weekly", { environment: claudeEnv });
+    // Two plans × (weekly model call + briefs model call) does not fit in 60 s; a
+    // timeout would make the Scheduler retry and regenerate reviews it just wrote.
+    const weekly = fn("weekly", { timeout: cdk.Duration.minutes(5), environment: claudeEnv });
 
     // training-api-prod, same name as the HTTP API. HTTP API cuts requests at
     // 30 s, so give up on a cold Aurora at 20 s and answer 503 instead.
@@ -126,13 +128,13 @@ export class TrainingApiStack extends cdk.Stack {
     });
     queue.grantSendMessages(api); // re-review after a manual session assignment
 
-    // ---- schedule: every Sunday 21:00 Asia/Tokyo -----------------------------
+    // ---- schedule: every Monday 04:00 Asia/Tokyo (the week that just ended) ----
     new scheduler.Schedule(this, "WeeklyReviewSchedule", {
       scheduleName: name("weekly-review"),
       schedule: scheduler.ScheduleExpression.cron({
         minute: "0",
-        hour: "21",
-        weekDay: "SUN",
+        hour: "4",
+        weekDay: "MON",
         timeZone: cdk.TimeZone.ASIA_TOKYO,
       }),
       target: new LambdaInvoke(weekly, { input: scheduler.ScheduleTargetInput.fromObject({}) }),
@@ -210,6 +212,9 @@ export class TrainingApiStack extends cdk.Stack {
       ["/activities/{id}/rereview", [apigw.HttpMethod.POST]],
       ["/weekly", [apigw.HttpMethod.GET]],
       ["/weekly/{id}/adjustments/{index}", [apigw.HttpMethod.POST]],
+      ["/weekly/{id}/asks/{session_id}", [apigw.HttpMethod.POST]],
+      ["/proposals/{id}/apply", [apigw.HttpMethod.POST]],
+      ["/proposals/{id}/dismiss", [apigw.HttpMethod.POST]],
       ["/coach", [apigw.HttpMethod.GET]],
       ["/coach/seen", [apigw.HttpMethod.PUT]],
       ["/coach/checkins/{id}/pick", [apigw.HttpMethod.POST]],
