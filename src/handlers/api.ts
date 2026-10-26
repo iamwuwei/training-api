@@ -3,7 +3,7 @@ import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyResultV2 } from "aws-lambda";
 import { isDbWaking, query, queryOne, withTransaction } from "../lib/db";
 import { type CheckinMeta, type MismatchAskMeta, mismatchReason, postMismatchAsk, resetCheckin, undoPick } from "../lib/checkin";
-import { COACH_NAME, MAX_MESSAGE_CHARS, postCoachMessage } from "../lib/coach";
+import { COACH_NAME, MAX_MESSAGE_CHARS, postCoachMessage, REPLY_FAILED } from "../lib/coach";
 import { shortDate, sportName, weeklyAskQuestion } from "../lib/labels";
 import { applyChange, applyProposal, changeConflict, postProposalApplied } from "../lib/proposals";
 import { deauthorize } from "../lib/strava";
@@ -210,9 +210,6 @@ type ActivityJoined = Omit<ActivityRow, "raw"> & {
   r_created_at: Date | null;
 };
 
-/** What the app shows for a failed model call; the provider's wording (which can name the model) stays in the logs / the row. */
-const MODEL_FAILED = "這次分析沒成功，再試一次";
-
 function toApiReview(r: Pick<ReviewRow, "verdict" | "comment" | "reminders" | "source" | "model" | "adjust_hint" | "created_at">): ApiReview {
   const failed = r.source === "claude" && r.verdict === null;
   return {
@@ -223,7 +220,7 @@ function toApiReview(r: Pick<ReviewRow, "verdict" | "comment" | "reminders" | "s
     model: r.model,
     adjust_hint: r.adjust_hint ?? null,
     failed,
-    error: failed ? MODEL_FAILED : null,
+    error: failed ? REPLY_FAILED : null, // one fixed line for every failed model call; the provider's wording stays in the logs / the row
     created_at: new Date(r.created_at).toISOString(),
   };
 }
@@ -810,7 +807,7 @@ function toApiCoachMessage(m: CoachMessageRow, proposals?: Map<string, ProposalR
     weekly: m.kind === "weekly" ? toApiWeeklyMeta(meta as unknown as Partial<WeeklyMessageMeta>) : null,
     proposal: proposal ? toApiProposal(proposal) : null,
     // Rows written before the worker stored the fixed line still hold the provider's wording: never shown.
-    error: typeof meta.error === "string" && meta.error ? MODEL_FAILED : null,
+    error: typeof meta.error === "string" && meta.error ? REPLY_FAILED : null,
     created_at: new Date(m.created_at).toISOString(),
   };
 }

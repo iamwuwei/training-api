@@ -25,6 +25,11 @@ const todayJst = () => new Date(Date.now() + 9 * 3600 * 1000).toISOString().slic
 type Job = StravaWebhookEvent | CoachReplyJob | CoachAskJob | RoutineJob | BriefsJob;
 
 async function handleJob(body: Job): Promise<void> {
+  if ("type" in body && (body as { type: string }).type === "weekly_rerun") {
+    // Queued by an api deployed before reruns moved to the weekly Lambda; only possible right after that deploy.
+    console.warn("weekly_rerun job is legacy (reruns go to the weekly Lambda now), dropped:", JSON.stringify(body));
+    return;
+  }
   if ("type" in body && body.type === "coach_reply") {
     await answerCoachMessage(body.user_id, body.message_id, todayJst());
     return;
