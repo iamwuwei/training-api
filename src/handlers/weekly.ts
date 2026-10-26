@@ -1,6 +1,7 @@
 import { query, queryOne } from "../lib/db";
-import { runWeeklyReview, WEEKLY_REVIEW_SELECT } from "../lib/weekly";
-import type { PlanRow, WeeklyReviewRow } from "../types";
+import { isValidDate } from "../lib/labels";
+import { rerunWeekly, runWeeklyReview, WEEKLY_REVIEW_SELECT } from "../lib/weekly";
+import type { PlanRow, WeeklyRerunRequest, WeeklyReviewRow } from "../types";
 
 // EventBridge Scheduler fires this every Monday 04:00 Asia/Tokyo for the week that
 // just ended (Monday〜Sunday). A week that already has a review is skipped: the
@@ -10,9 +11,12 @@ import type { PlanRow, WeeklyReviewRow } from "../types";
 // at the end and the retry picks up only the plans without a review. Manual invokes:
 //   { "week_start": "YYYY-MM-DD" }                     backfill that week (a Monday); skipped if it has a review
 //   { "week_start": "YYYY-MM-DD", "regenerate": true } regenerate it in place (reason 重新回顧); never retried
+// The api and the worker invoke it asynchronously with
+//   { "rerun": { user_id, weekly_review_id, reason, requested_at, activity_id? } }
+// to regenerate one review in place (the athlete said 沒跑, an activity arrived late);
+// a Lambda retry of that after the rerun happened is skipped (see rerunWeekly).
 
 const JST_OFFSET_MS = 9 * 3600 * 1000;
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 function isoDate(d: Date): string {
   return d.toISOString().slice(0, 10);
@@ -34,9 +38,16 @@ function lastWeekStartJst(): string {
 
 type Result = { plan_id: string; review_id?: string; adjustments?: number; asks?: number; skipped?: boolean; error?: string };
 
-export const handler = async (event: { week_start?: string; regenerate?: boolean } = {}) => {
+export type WeeklyEvent = { week_start?: string; regenerate?: boolean; rerun?: WeeklyRerunRequest };
+
+export const handler = async (event: WeeklyEvent = {}) => {
+  if (event.rerun) {
+    const r = await rerunWeekly(event.rerun);
+    return { rerun: event.rerun.weekly_review_id, ...(r ?? { ignored: true }) };
+  }
+
   if (event.week_start !== undefined) {
-    if (!DATE_RE.test(event.week_start)) throw new Error("week_start must be YYYY-MM-DD");
+    if (!isValidDate(event.week_start)) throw new Error("week_start must be a real date, YYYY-MM-DD");
     if (new Date(`${event.week_start}T00:00:00Z`).getUTCDay() !== 1) throw new Error("week_start must be a Monday");
   }
   const weekStart = event.week_start ?? lastWeekStartJst();

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { formatAdjustmentValue } from "./claude";
 import { postCoachMessage } from "./coach";
 import { type Querier, query, withTransaction } from "./db";
-import { FIELD_NAMES, RUN_SPORTS, sessionLabel, shortDate } from "./labels";
+import { FIELD_NAMES, isValidDate, RUN_SPORTS, sessionLabel, shortDate } from "./labels";
 import type { PlanWeekRow, PlannedSessionRow, ProposalField, ProposalItem, ProposalRow } from "../types";
 
 // Woo's proposals: one card = one or more changes applied together. The weekly
@@ -14,7 +14,6 @@ import type { PlanWeekRow, PlannedSessionRow, ProposalField, ProposalItem, Propo
 export const PROPOSAL_FIELDS = new Set<string>(["type", "target_distance_m", "target_pace_sec_km", "scheduled_date", "note", "skip"] satisfies ProposalField[]);
 /** What a session may be turned into: never `race` (the race day is not Woo's to make or move). */
 const PROPOSAL_TYPES = new Set(["easy", "long", "tempo", "interval", "rest"]);
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 const addDays = (iso: string, n: number) => new Date(Date.parse(`${iso}T00:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10);
 const km = (m: number) => Math.round(m / 100) / 10;
@@ -33,11 +32,25 @@ export function validateChangeValue(field: string, value: string | number | null
     case "type": return typeof value === "string" && PROPOSAL_TYPES.has(value) ? null : "type must be easy, long, tempo, interval or rest";
     case "target_distance_m": return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100_000 ? null : "target_distance_m must be metres";
     case "target_pace_sec_km": return typeof value === "number" && Number.isFinite(value) && value >= 120 && value <= 1200 ? null : "target_pace_sec_km must be seconds per km";
-    case "scheduled_date": return typeof value === "string" && DATE_RE.test(value) ? null : "scheduled_date must be YYYY-MM-DD";
+    case "scheduled_date": return typeof value === "string" && isValidDate(value) ? null : "scheduled_date must be YYYY-MM-DD";
     case "note": return value === null || (typeof value === "string" && value.length <= 500) ? null : "note too long";
     case "skip": return null;
     default: return "unsupported field";
   }
+}
+
+/**
+ * Why `field = value` must not be applied to `old` (a string, 409 material), or null.
+ * Both apply routes (a chat card, a weekly review's proposal) go through here: the
+ * value fits the field, the race day is neither changed nor made, nothing lands on it.
+ */
+export function changeConflict(old: Pick<PlannedSessionRow, "type"> & { race_date: string | null }, field: string, value: string | number | null): string | null {
+  if (old.type === "race") return "the race day cannot be changed";
+  const bad = validateChangeValue(field, value);
+  if (bad) return bad;
+  if (field === "type" && value === "race") return "a session cannot become the race";
+  if (field === "scheduled_date" && old.race_date && value === old.race_date) return "a session cannot be moved onto the race day";
+  return null;
 }
 
 /**
@@ -104,10 +117,9 @@ export async function applyProposal(p: ProposalRow): Promise<ProposalItem[] | st
         [currentId, p.user_id],
       );
       if (!old) throw new ProposalConflict("that session was already changed; dismiss this proposal");
-      if (old.type === "race") throw new ProposalConflict("the race day cannot be changed");
-      // Checked again here (not only in buildProposal): nothing becomes a race or lands on the race day.
-      if (item.field === "type" && item.new === "race") throw new ProposalConflict("a session cannot become the race");
-      if (item.field === "scheduled_date" && item.new === old.race_date) throw new ProposalConflict("a session cannot be moved onto the race day");
+      // Checked again here (not only in buildProposal): the value still fits, nothing becomes a race or lands on the race day.
+      const conflict = changeConflict(old, item.field, item.new);
+      if (conflict) throw new ProposalConflict(conflict);
       const { race_date: _raceDate, ...oldRow } = old;
       const id = await applyChange(q, oldRow, item.field, item.new);
       latest.set(item.session_id, id);

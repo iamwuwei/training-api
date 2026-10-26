@@ -190,6 +190,7 @@ function avgHr(sps: StravaSplit[]): number | null {
   const withHr = sps.filter((sp) => sp.average_heartrate != null);
   if (!withHr.length) return null;
   const t = withHr.reduce((s, sp) => s + sp.moving_time, 0);
+  if (!(t > 0)) return null; // no moving time to weight by: no NaN into the prompt
   return Math.round(withHr.reduce((s, sp) => s + sp.average_heartrate! * sp.moving_time, 0) / t);
 }
 
