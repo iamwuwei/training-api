@@ -66,8 +66,9 @@ export interface CheckinMeta {
 /**
  * Called by the worker for a newly inserted, unassigned activity. Posts (or
  * refreshes) Woo's check-in for that day; silent when nothing on the plan fits.
+ * Returns whether a check-in is now waiting for the athlete.
  */
-export async function maybeCheckin(userId: string, a: ActivityLite, localDate: string): Promise<void> {
+export async function maybeCheckin(userId: string, a: ActivityLite, localDate: string): Promise<boolean> {
   const today = await queryOne<PlannedSessionRow & { done: boolean }>(
     `select ps.*, to_char(ps.scheduled_date, 'YYYY-MM-DD') as scheduled_date,
             exists (select 1 from activities x where x.session_id = ps.id and x.match_status <> 'ignored') as done
@@ -76,13 +77,13 @@ export async function maybeCheckin(userId: string, a: ActivityLite, localDate: s
       limit 1`,
     [userId, localDate],
   );
-  if (!today) return;
+  if (!today) return false;
 
   let meta: CheckinMeta;
   let text: string;
 
   if (!isRestDay(today)) {
-    if (today.done || !kindMatches(a, today)) return;
+    if (today.done || !kindMatches(a, today)) return false;
     // Every unassigned activity of the day of the right kind is a candidate; the
     // newest is Woo's guess (first chip).
     const rows = await query<ActivityLite>(
@@ -92,7 +93,7 @@ export async function maybeCheckin(userId: string, a: ActivityLite, localDate: s
       [userId, localDate],
     );
     const acts = rows.filter((x) => kindMatches(x, today));
-    if (!acts.length) return;
+    if (!acts.length) return false;
     const label = sessionLabel(today);
     const content = today.content && today.content !== label ? `：${today.content}` : "";
     text = acts.length === 1
@@ -107,7 +108,7 @@ export async function maybeCheckin(userId: string, a: ActivityLite, localDate: s
          from plan_weeks where plan_id = $1 and $2 between week_start and week_end`,
       [today.plan_id, localDate],
     );
-    if (!week) return;
+    if (!week) return false;
     const open = (await query<PlannedSessionRow>(
       `select ps.*, to_char(ps.scheduled_date, 'YYYY-MM-DD') as scheduled_date
          from planned_sessions ps
@@ -116,7 +117,7 @@ export async function maybeCheckin(userId: string, a: ActivityLite, localDate: s
         order by abs(ps.scheduled_date - $4::date), ps.scheduled_date`,
       [today.plan_id, week.week_start, week.week_end, localDate],
     )).filter((s) => kindMatches(a, s));
-    if (!open.length) return;
+    if (!open.length) return false;
     text = `今天是休息日，Strava 剛進來 ${activityLabel(a)}。要算這週的哪一堂，還是不算？`;
     meta = { state: "open", mode: "session", date: localDate, session_id: null, session_label: null,
       candidates: open.map((s) => ({ session_id: s.id, label: `${s.scheduled_date.slice(5).replace("-", "/")} ${sessionLabel(s)}` })) };
@@ -130,9 +131,84 @@ export async function maybeCheckin(userId: string, a: ActivityLite, localDate: s
   );
   if (existing) {
     await query("update coach_messages set text = $2, meta = $3, created_at = now() where id = $1", [existing.id, text, JSON.stringify(meta)]);
-    return;
+    return true;
   }
   await postCoachMessage({ user_id: userId, role: "coach", kind: "checkin", text, meta: meta as unknown as Record<string, unknown>, activity_id: a.id });
+  return true;
+}
+
+// ---- a pick that looks wrong ---------------------------------------------------------
+
+const SHORT_RUN_RATIO = 0.5;   // a run under half the session's distance
+const SHORT_OTHER_MIN = 20;    // a non-run under 20 minutes
+
+/**
+ * Why the pick looks wrong, as Woo's sentence ("這趟 64 分鐘、心拍 99，看起來像走路，不像
+ * 16 km 的長跑"), or null when it looks fine. Template only; no model.
+ */
+export function mismatchReason(a: ActivityLite, s: PlannedSessionRow): string | null {
+  const minutes = Math.round(a.moving_time_sec / 60);
+  const hr = a.avg_hr != null ? `、心拍 ${a.avg_hr}` : "";
+  const what = sessionLabel(s);
+  if (!isRunSport(a.sport_type)) {
+    if (!isStrength(s)) return `這趟 ${minutes} 分鐘${hr}，看起來像${sportName(a.sport_type)}，不像 ${what}`;
+    if (minutes < SHORT_OTHER_MIN) return `這趟只有 ${minutes} 分鐘${hr}，不像一堂${what}`;
+    return null;
+  }
+  if (s.target_distance_m && a.distance_m < s.target_distance_m * SHORT_RUN_RATIO) {
+    return `這趟 ${(a.distance_m / 1000).toFixed(1)} km、${minutes} 分鐘${hr}，離 ${what} 差很多`;
+  }
+  return null;
+}
+
+export interface MismatchAskMeta {
+  state: "open" | "answered" | "closed";
+  kind: "mismatch";
+  activity_id: string;
+  session_id: string;
+  reason: string;
+  checkin_id: string; // the check-in the pick came from (reset target for 不是)
+  pick_id: string;    // the athlete's pick message (coach_ask target for 是)
+}
+
+/** Post Woo's "真的是這趟嗎？" instead of the feel question. */
+export async function postMismatchAsk(userId: string, meta: Omit<MismatchAskMeta, "state" | "kind">, date: string, s: PlannedSessionRow): Promise<CoachMessageRow> {
+  const day = date.slice(5).replace("-", "/");
+  const text = `${meta.reason}。真的要算成 ${day} 的${s.label ?? s.type}嗎？`;
+  return postCoachMessage({
+    user_id: userId, role: "coach", kind: "ask", text, activity_id: meta.activity_id,
+    meta: { state: "open", kind: "mismatch", ...meta } satisfies MismatchAskMeta,
+  });
+}
+
+/**
+ * 選錯了 / 重新選 / 不是這趟: undo the pick (or the dismissal) and ask the same question
+ * again. The old check-in goes to `reset`; the new open one is returned. A string
+ * error when the check-in is not in a resettable state.
+ */
+export async function resetCheckin(userId: string, checkin: CoachMessageRow): Promise<CoachMessageRow | string> {
+  const meta = (checkin.meta ?? {}) as unknown as CheckinMeta;
+  if (meta.state === "open") return "check-in is still open";
+  if (meta.state === "reset") return "check-in was already reset";
+
+  if (meta.state === "picked" && meta.picked) {
+    const { activity_id, session_id } = meta.picked;
+    await query("update activities set session_id = null, match_status = 'unplanned' where id = $1 and session_id = $2", [activity_id, session_id]);
+    await query("delete from reviews where activity_id = $1 and source = 'claude'", [activity_id]);
+    // Woo's open question about that activity (feel or mismatch) is closed; the athlete's pending messages settled.
+    await query(
+      `update coach_messages set meta = coalesce(meta, '{}'::jsonb) || '{"state":"closed"}'::jsonb
+        where user_id = $1 and kind = 'ask' and activity_id = $2 and meta->>'state' = 'open'`,
+      [userId, activity_id],
+    );
+    await query("update coach_messages set status = 'sent' where user_id = $1 and role = 'athlete' and status = 'pending' and activity_id = $2", [userId, activity_id]);
+  }
+  await query("update coach_messages set meta = $2 where id = $1", [checkin.id, JSON.stringify({ ...meta, state: "reset" })]);
+  const fresh: CheckinMeta = { ...meta, state: "open", picked: null };
+  const text = meta.mode === "activity"
+    ? `好，那是哪一個？${meta.session_label ? `今天的課是 ${meta.session_label}。` : ""}`
+    : "好，那要算這週的哪一堂？";
+  return postCoachMessage({ user_id: userId, role: "coach", kind: "checkin", text, meta: fresh as unknown as Record<string, unknown>, activity_id: checkin.activity_id });
 }
 
 // ---- the follow-up question --------------------------------------------------
@@ -187,7 +263,7 @@ export async function askAboutActivity(userId: string, pickMessageId: string): P
   }
   await postCoachMessage({
     user_id: userId, role: "coach", kind: "ask", text, activity_id: activity.id,
-    meta: { state: "open", activity_id: activity.id, session_id: session.id },
+    meta: { state: "open", kind: "feel", activity_id: activity.id, session_id: session.id },
   });
   await query("update coach_messages set status = 'sent' where id = $1", [pick.id]);
 }
