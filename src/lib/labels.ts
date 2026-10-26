@@ -24,6 +24,14 @@ export function sessionLabel(s: Pick<PlannedSessionRow, "label" | "type" | "targ
 /** "10/25" from 'YYYY-MM-DD'. */
 export const shortDate = (iso: string) => iso.slice(5).replace("-", "/");
 
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+/** A real calendar date as 'YYYY-MM-DD' ("2026-02-30" and "2026-13-01" are not), so bad input never reaches Postgres. */
+export function isValidDate(s: string): boolean {
+  if (!DATE_RE.test(s)) return false;
+  const d = new Date(`${s}T00:00:00Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
+}
+
 /**
  * Woo's question about a key session with no record, for the weekly message's quote
  * block: "10/25 的 Long 16 km 我沒看到紀錄，是沒跑，還是還沒同步？". A space between

@@ -93,7 +93,8 @@ export interface ApiSplit {
 /**
  * Coach side (Claude or manual): the verdict on this activity.
  * `failed` = Claude could not review it (API error, refusal …): verdict is null,
- * `error` says why; POST …/rereview tries again. Nothing at all (activity.review
+ * `error` is a fixed line to show ("這次分析沒成功，再試一次"; the provider's wording
+ * stays in the logs); POST …/rereview tries again. Nothing at all (activity.review
  * null) with a session assigned = still being analysed.
  */
 export interface ApiReview {
@@ -368,7 +369,7 @@ export interface ApiCoachMessage {
   weekly: ApiWeeklyMeta | null;
   /** A proposal card attached to a coach chat reply (see POST /proposals/{id}/apply). */
   proposal: ApiProposal | null;
-  error: string | null;              // failed: why
+  error: string | null;              // failed: a fixed line to show (the provider's wording stays in the logs)
   created_at: string;
 }
 
@@ -536,6 +537,7 @@ export interface PostCoachMessageResponse {
  * 403  token valid but no users row for it
  * 503  Aurora is resuming from 0 ACU (first request after ~5 min idle);
  *      `Retry-After` header is set — wait and retry once or twice.
+ * 500  `error` is the fixed line "伺服器錯誤" (details only in the api's logs).
  */
 export interface ErrorResponse {
   error: string;

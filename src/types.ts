@@ -207,13 +207,18 @@ export interface ProposalItem {
   applied_session_id?: string;
 }
 
-/** SQS message asking the worker to regenerate one weekly review (an ask was answered 沒跑). */
-export interface WeeklyRerunJob {
-  type: "weekly_rerun";
+/**
+ * Async invoke of the weekly Lambda (`{ rerun: … }`) asking it to regenerate one weekly
+ * review in place: the athlete answered 沒跑, or an activity of that week arrived after
+ * the review was written. The api and the worker send it (neither runs the model for
+ * a review); a Lambda retry after the rerun already happened is skipped.
+ */
+export interface WeeklyRerunRequest {
   user_id: string;
   weekly_review_id: string;
-  reason: string;        // "你說 10/25 沒跑"
-  requested_at: string;  // ISO; a redelivery after the rerun already happened is skipped
+  reason: string;        // "你說 10/25 沒跑" / "10/25 的 Long 進來了"
+  requested_at: string;  // ISO; the review being updated at or after this means it is done
+  activity_id?: string;  // the activity that arrived; skipped when the review already lists it
 }
 
 // ---- Strava ---------------------------------------------------------------

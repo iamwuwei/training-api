@@ -104,18 +104,22 @@ export class TrainingApiStack extends cdk.Stack {
     });
     queue.grantSendMessages(webhook);
 
+    // Two plans × (weekly model call + briefs model call) does not fit in 60 s; a
+    // timeout would make the Scheduler retry and regenerate reviews it just wrote.
+    // Besides the Monday schedule it is invoked asynchronously (`{ rerun }`) by the api
+    // and the worker to regenerate one review in place; Lambda's default async retry
+    // (2 attempts) is kept — a retry after the rerun happened is a no-op in the handler.
+    const weekly = fn("weekly", { timeout: cdk.Duration.minutes(5), environment: claudeEnv });
+
     const worker = fn("worker", {
       timeout: cdk.Duration.seconds(90),
-      environment: { ...stravaEnv, ...claudeEnv, AUTO_REVIEW: process.env.AUTO_REVIEW ?? "true" },
+      environment: { ...stravaEnv, ...claudeEnv, AUTO_REVIEW: process.env.AUTO_REVIEW ?? "true", WEEKLY_FUNCTION_NAME: weekly.functionName },
       reservedConcurrentExecutions: 2,
     });
     worker.addEventSource(new SqsEventSource(queue, { batchSize: 1 }));
+    weekly.grantInvoke(worker); // a late activity: regenerate the week's review there, not in the worker's 90 s
 
     const oauth = fn("oauth", { environment: stravaEnv });
-
-    // Two plans × (weekly model call + briefs model call) does not fit in 60 s; a
-    // timeout would make the Scheduler retry and regenerate reviews it just wrote.
-    const weekly = fn("weekly", { timeout: cdk.Duration.minutes(5), environment: claudeEnv });
 
     // training-api-prod, same name as the HTTP API. HTTP API cuts requests at
     // 30 s, so give up on a cold Aurora at 20 s and answer 503 instead.
@@ -123,10 +127,12 @@ export class TrainingApiStack extends cdk.Stack {
       functionName: name(),
       environment: {
         QUEUE_URL: queue.queueUrl,
+        WEEKLY_FUNCTION_NAME: weekly.functionName,
         COACH_DAILY_LIMIT: process.env.COACH_DAILY_LIMIT ?? "0", // 0 = no cap (two known athletes)
       },
     });
     queue.grantSendMessages(api); // re-review after a manual session assignment
+    weekly.grantInvoke(api); // 沒跑 / 都不是: regenerate the week's review
 
     // ---- schedule: every Monday 04:00 Asia/Tokyo (the week that just ended) ----
     new scheduler.Schedule(this, "WeeklyReviewSchedule", {

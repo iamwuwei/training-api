@@ -9,26 +9,24 @@ import { loadReviewContext } from "../lib/context";
 import { isDbWaking, query, queryOne } from "../lib/db";
 import { sessionLabel, shortDate, sportName } from "../lib/labels";
 import { getActivity, refreshToken, StravaError } from "../lib/strava";
-import { maybeRerunWeeklyReview, runWeeklyReview, WEEKLY_REVIEW_SELECT } from "../lib/weekly";
-import type { BriefsJob, CoachAskJob, CoachReplyJob, PlanRow, PlannedSessionRow, RoutineJob, StravaConnectionRow, StravaWebhookEvent, WeeklyRerunJob, WeeklyReviewRow } from "../types";
+import { maybeRerunWeeklyReview } from "../lib/weekly";
+import type { BriefsJob, CoachAskJob, CoachReplyJob, PlannedSessionRow, RoutineJob, StravaConnectionRow, StravaWebhookEvent } from "../types";
 
 // Any thrown error => SQS redelivers (visibility 90 s, 3 tries, then DLQ).
 // Aurora resuming from 0 ACU is the usual first failure: wait inside this run
 // and try once more (the Lambda has 90 s) before leaving it to SQS.
+// Weekly reviews are never generated here: a late activity only asks the weekly
+// Lambda (5 min) to regenerate the week's review (maybeRerunWeeklyReview).
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const todayJst = () => new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
 
-type Job = StravaWebhookEvent | CoachReplyJob | CoachAskJob | RoutineJob | BriefsJob | WeeklyRerunJob;
+type Job = StravaWebhookEvent | CoachReplyJob | CoachAskJob | RoutineJob | BriefsJob;
 
 async function handleJob(body: Job): Promise<void> {
   if ("type" in body && body.type === "coach_reply") {
     await answerCoachMessage(body.user_id, body.message_id, todayJst());
-    return;
-  }
-  if ("type" in body && body.type === "weekly_rerun") {
-    await rerunWeekly(body);
     return;
   }
   if ("type" in body && body.type === "coach_ask") {
@@ -63,28 +61,6 @@ export const handler: SQSHandler = async (event) => {
     }
   }
 };
-
-/** The athlete answered 沒跑 to a weekly question: regenerate that review. A redelivery after it ran is skipped. */
-async function rerunWeekly(job: WeeklyRerunJob): Promise<void> {
-  const w = await queryOne<WeeklyReviewRow>(
-    `${WEEKLY_REVIEW_SELECT} where id = $1 and plan_id in (select id from plans where user_id = $2)`,
-    [job.weekly_review_id, job.user_id],
-  );
-  if (!w) return;
-  if (w.updated_at && new Date(w.updated_at).getTime() >= Date.parse(job.requested_at)) return; // already done (checked again under the lock)
-  const plan = await queryOne<PlanRow & { display_name: string }>(
-    `select p.*, to_char(p.race_date, 'YYYY-MM-DD') as race_date, u.display_name from plans p join users u on u.id = p.user_id where p.id = $1`,
-    [w.plan_id],
-  );
-  if (!plan) return;
-  try {
-    const r = await runWeeklyReview(plan, w.week_start, w, job.reason, { requestedAt: job.requested_at });
-    if (r.skipped) return;
-    console.log(`weekly review ${r.review_id} regenerated (${job.reason}): ${r.adjustments} adjustments, ${r.asks} asks`);
-  } catch (err) {
-    console.error(`weekly rerun failed for review ${job.weekly_review_id}`, err); // not requeued (same failure again); the next activity tries again
-  }
-}
 
 async function getFreshConnection(athleteId: number): Promise<StravaConnectionRow | undefined> {
   const conn = await queryOne<StravaConnectionRow>(
@@ -198,8 +174,9 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
     } catch (err) {
       console.error(`check-in failed for activity ${activity.id}`, err); // the athlete can still log it from the today page
     }
-    // Nothing to pick: the week's review (if already written) learns about it now.
-    // With a check-in open, the regeneration waits for the pick and its verdict below.
+    // Nothing to pick: the week's review (if already written) learns about it now (the
+    // weekly Lambda regenerates it). With a check-in open, that waits for the pick and
+    // its verdict below.
     if (!asked) await maybeRerunWeeklyReview(conn.user_id, row.id, localDate, `${day} 的 ${sportName(activity.sport_type ?? activity.type)} 進來了`);
   }
 
@@ -255,7 +232,7 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
             meta: { label, verdict: r.verdict, reminder: r.reminders[0] ?? null, date: localDate },
           });
           await settleAthleteMessages(conn.user_id, row.id); // the answer that triggered this review is replied to
-          // The week's review was written without this activity (late sync): regenerate it in place.
+          // The week's review was written without this activity (late sync): the weekly Lambda regenerates it in place.
           await maybeRerunWeeklyReview(conn.user_id, row.id, localDate, `${day} 的 ${session.label ?? session.type} 進來了`);
         } catch (err) {
           // Not requeued (SQS would only retry the same failure). Recorded so the

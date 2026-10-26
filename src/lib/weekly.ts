@@ -1,19 +1,24 @@
 import { randomUUID } from "node:crypto";
+import { InvokeCommand, LambdaClient } from "@aws-sdk/client-lambda";
 import { writeBriefs } from "./briefs";
 import { weeklyReview } from "./claude";
 import { postCoachMessage } from "./coach";
 import { historyBetween, loadPlanWeeks } from "./context";
 import { type Querier, query, queryOne, withTransaction } from "./db";
 import { sessionLabel, shortDate, sportName } from "./labels";
-import { describeChange } from "./proposals";
-import type { CoachMessageRow, PlanRow, PlannedSessionRow, StoredAdjustment, StoredAdjustments, WeeklyMessageMeta, WeeklyReviewRow } from "../types";
+import { changeConflict, describeChange } from "./proposals";
+import type { CoachMessageRow, PlanRow, PlannedSessionRow, StoredAdjustment, StoredAdjustments, WeeklyMessageMeta, WeeklyRerunRequest, WeeklyReviewRow } from "../types";
 
 // The weekly review, written once by the scheduler (Monday 04:00 JST) and rewritten
 // in place when the week's data changes afterwards: an activity of that week arrives
-// late (the worker), or the athlete answers "沒跑" to one of its questions (the api
-// queues a weekly_rerun). The same weekly_reviews row and the same thread message are
-// updated; pending proposals are cancelled (superseded), applied ones stay and are
-// facts for the new text.
+// late (the worker), or the athlete answers "沒跑" to one of its questions (the api).
+// The same weekly_reviews row and the same thread message are updated; pending
+// proposals are cancelled (superseded), applied ones stay and are facts for the new text.
+//
+// Every run — first generation and reruns — executes in the weekly Lambda (5 min).
+// The api and the worker only ask for a rerun (`requestWeeklyRerun`: an async invoke
+// of that Lambda); the worker's 90 s are for Strava and the verdict, not for a review
+// plus briefs on top.
 //
 // One run per (plan, week) at a time: the whole thing — reads, the model call, the
 // write — runs in one transaction holding an advisory lock, so two activities arriving
@@ -21,6 +26,9 @@ import type { CoachMessageRow, PlanRow, PlannedSessionRow, StoredAdjustment, Sto
 // of two runs overwriting each other.
 
 const KEY_SESSION = /Long|長跑|MP|坡/i;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const lambda = new LambdaClient({});
 
 export const WEEKLY_REVIEW_SELECT = `select id, plan_id, to_char(week_start, 'YYYY-MM-DD') as week_start, summary, adjustments, created_at, updated_at, update_reason from weekly_reviews`;
 
@@ -96,11 +104,57 @@ export async function runWeeklyReview(plan: Plan, weekStart: string, existing?: 
       const why = `${shortDate(m.date)} 的 ${m.label ?? sportName(m.sport_type)} 進來了`;
       console.log(`weekly review ${r.review_id}: ${missed.length} activity(ies) arrived during generation, regenerating (${why})`);
       const row = await queryOne<WeeklyReviewRow>(`${WEEKLY_REVIEW_SELECT} where id = $1`, [r.review_id]);
-      return runWeeklyReview(plan, weekStart, row, why, { activityId: m.id });
+      const rerun = await runWeeklyReview(plan, weekStart, row, why, { activityId: m.id });
+      // The rerun found nothing to do (a requested rerun brought the activity in first and
+      // wrote the briefs): this run still generated the review, so report that, not "skipped".
+      if (!rerun.skipped) return rerun;
+      return { review_id: r.review_id, adjustments: r.adjustments, asks: r.asks };
     }
   }
   await rewriteBriefs(plan, weekEnd);
   return { review_id: r.review_id, adjustments: r.adjustments, asks: r.asks };
+}
+
+/**
+ * Ask the weekly Lambda to regenerate `weekly_review_id` (async invoke; this returns
+ * as soon as the request is accepted). The api (沒跑, 都不是) and the worker (an
+ * activity arrived) use it. False when there is no weekly Lambda configured.
+ */
+export async function requestWeeklyRerun(req: Omit<WeeklyRerunRequest, "requested_at">): Promise<boolean> {
+  const fn = process.env.WEEKLY_FUNCTION_NAME;
+  if (!fn) {
+    console.warn(`WEEKLY_FUNCTION_NAME not set: weekly review ${req.weekly_review_id} not regenerated (${req.reason})`);
+    return false;
+  }
+  const rerun: WeeklyRerunRequest = { ...req, requested_at: new Date().toISOString() };
+  await lambda.send(new InvokeCommand({ FunctionName: fn, InvocationType: "Event", Payload: Buffer.from(JSON.stringify({ rerun })) }));
+  return true;
+}
+
+/**
+ * The weekly Lambda, invoked with `{ rerun }`: regenerate that review in place. Throws
+ * on failure so Lambda's async retry (twice) has another go; a retry after the rerun
+ * already happened is skipped (`requested_at` / `activity_id`, checked under the lock).
+ */
+export async function rerunWeekly(req: WeeklyRerunRequest): Promise<WeeklyRunResult | undefined> {
+  if (!UUID_RE.test(req.user_id) || !UUID_RE.test(req.weekly_review_id) || (req.activity_id !== undefined && !UUID_RE.test(req.activity_id)) || typeof req.reason !== "string" || Number.isNaN(Date.parse(req.requested_at))) {
+    console.error("weekly rerun ignored: malformed request", JSON.stringify(req));
+    return undefined;
+  }
+  const w = await queryOne<WeeklyReviewRow>(
+    `${WEEKLY_REVIEW_SELECT} where id = $1 and plan_id in (select id from plans where user_id = $2)`,
+    [req.weekly_review_id, req.user_id],
+  );
+  if (!w) return undefined;
+  if (w.updated_at && new Date(w.updated_at).getTime() >= Date.parse(req.requested_at)) return { review_id: w.id, adjustments: 0, asks: 0, skipped: true }; // already done (checked again under the lock)
+  const plan = await queryOne<Plan>(
+    `select p.*, to_char(p.race_date, 'YYYY-MM-DD') as race_date, u.display_name from plans p join users u on u.id = p.user_id where p.id = $1`,
+    [w.plan_id],
+  );
+  if (!plan) return undefined;
+  const r = await runWeeklyReview(plan, w.week_start, w, req.reason, { requestedAt: req.requested_at, activityId: req.activity_id });
+  if (!r.skipped) console.log(`weekly review ${r.review_id} regenerated (${req.reason}): ${r.adjustments} adjustments, ${r.asks} asks`);
+  return r;
 }
 
 /**
@@ -167,7 +221,17 @@ async function generate(
     asks, skipped, applied, updateReason: reason ?? null,
   });
 
-  const fresh: StoredAdjustment[] = review.adjustments.map((a) => ({ ...a, status: "pending" }));
+  // The same checks the apply route makes (value fits the field, no race made or moved onto):
+  // a proposal that could never be applied is not shown.
+  const byId = new Map(upcoming.map((s) => [s.id, s]));
+  const fresh: StoredAdjustment[] = review.adjustments
+    .filter((a) => {
+      const s = byId.get(a.session_id);
+      const conflict = s ? changeConflict({ type: s.type, race_date: plan.race_date }, a.field, a.new) : "unknown session";
+      if (conflict) console.warn(`weekly review for plan ${plan.id} week ${weekStart}: proposal dropped (${conflict}): ${JSON.stringify(a)}`);
+      return !conflict;
+    })
+    .map((a) => ({ ...a, status: "pending" }));
   const metaAsks = (state: Map<string, string>) =>
     asks.map(({ session: s, state: st }) => ({ session_id: s.id, label: sessionLabel(s), date: s.scheduled_date, state: state.get(s.id) === "synced" ? "synced" as const : st }));
 
@@ -269,19 +333,17 @@ export async function reviewMissingActivity(userId: string, activityId: string, 
 
 /**
  * Worker: an activity of `localDate` was inserted or got its verdict. If that week's
- * review exists and did not see this activity, regenerate it.
+ * review exists and did not see this activity, ask the weekly Lambda to regenerate it.
  */
 export async function maybeRerunWeeklyReview(userId: string, activityId: string, localDate: string, reason: string): Promise<boolean> {
   const w = await reviewMissingActivity(userId, activityId, localDate);
   if (!w) return false;
   try {
-    const { plan, ...row } = w;
-    const r = await runWeeklyReview(plan, w.week_start, row, reason, { activityId });
-    if (r.skipped) return false; // another run brought this activity in while we waited for the lock
-    console.log(`weekly review ${r.review_id} regenerated (${reason}): ${r.adjustments} adjustments, ${r.asks} asks`);
-    return true;
+    const sent = await requestWeeklyRerun({ user_id: userId, weekly_review_id: w.id, reason, activity_id: activityId });
+    if (sent) console.log(`weekly review ${w.id}: regeneration requested (${reason})`);
+    return sent;
   } catch (err) {
-    console.error(`weekly review rerun failed for user ${userId} (${reason})`, err); // not requeued: the next activity / ask tries again
+    console.error(`weekly review rerun request failed for user ${userId} (${reason})`, err); // the next activity / ask tries again
     return false;
   }
 }
