@@ -16,6 +16,9 @@ import type { CoachMessageRow, PlanRow, PlanWeekRow, PlannedSessionRow, Proposal
 export const COACH_NAME = "Woo";
 export const MAX_MESSAGE_CHARS = 500;
 const REPLY_MAX_TOKENS = 2500; // room for search queries + a 2〜4 sentence reply + a proposal
+const REPLY_MAX_CHARS = 2000;  // the reply as stored / shown; a runaway reply is cut, not refused
+/** What the app shows when the reply failed; the provider's wording (which can name the model) only goes to the log. */
+export const REPLY_FAILED = "這次分析沒成功，再試一次";
 const MAX_SEARCHES = 3;
 const MAX_PAUSE_RESUMES = 2;
 const HISTORY_TURNS = 20;
@@ -304,6 +307,10 @@ export async function answerCoachMessage(userId: string, messageId: string, toda
     const raw = res.content.filter((b): b is Anthropic.TextBlock => b.type === "text").map((b) => b.text).join("").trim();
     const out = parseReply(raw);
     if (!out.text) throw new Error("empty reply");
+    if (out.text.length > REPLY_MAX_CHARS) {
+      console.warn(`coach reply for message ${msg.id} is ${out.text.length} chars, cut to ${REPLY_MAX_CHARS}`);
+      out.text = `${out.text.slice(0, REPLY_MAX_CHARS).trimEnd()}…`;
+    }
 
     const meta: Record<string, unknown> = { model: res.model, searches };
     let proposal: ProposalRow | null = null;
@@ -325,9 +332,10 @@ export async function answerCoachMessage(userId: string, messageId: string, toda
     await query("update coach_messages set status = 'sent' where id = $1", [msg.id]);
     return out.text;
   } catch (err) {
-    const reason = err instanceof Error ? err.message.slice(0, 300) : String(err);
+    // The reason stays in the log: the API's message can carry the model id / request id,
+    // which the app must not show. The row gets the fixed line the app displays.
     console.error(`coach reply failed for message ${msg.id}`, err);
-    await query("update coach_messages set status = 'failed', meta = coalesce(meta, '{}'::jsonb) || $2::jsonb where id = $1", [msg.id, JSON.stringify({ error: reason })]);
+    await query("update coach_messages set status = 'failed', meta = coalesce(meta, '{}'::jsonb) || $2::jsonb where id = $1", [msg.id, JSON.stringify({ error: REPLY_FAILED })]);
     return null;
   }
 }
