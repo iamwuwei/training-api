@@ -221,6 +221,8 @@ export class TrainingApiStack extends cdk.Stack {
       ["/weekly/{id}/asks/{session_id}", [apigw.HttpMethod.POST]],
       ["/proposals/{id}/apply", [apigw.HttpMethod.POST]],
       ["/proposals/{id}/dismiss", [apigw.HttpMethod.POST]],
+      ["/constraints/{id}/accept", [apigw.HttpMethod.POST]],
+      ["/constraints/{id}/dismiss", [apigw.HttpMethod.POST]],
       ["/coach", [apigw.HttpMethod.GET]],
       ["/coach/seen", [apigw.HttpMethod.PUT]],
       ["/coach/checkins/{id}/pick", [apigw.HttpMethod.POST]],
