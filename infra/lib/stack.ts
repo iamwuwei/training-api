@@ -120,8 +120,10 @@ export class TrainingApiStack extends cdk.Stack {
     // left to Lambda's defaults: 2 retries (3 runs at most) and an event is dropped after
     // 1 hour, throttled or not; a retry after the rerun happened is a no-op in the handler.
     // At most 2 runs at once: every run is a model call plus an open transaction.
+    // 10 minutes: per plan a review is at most 180 s, the one missed-activity rerun another 180 s,
+    // briefs 45 s (no SDK retries, every call has its own timeout); plans run one after the other.
     const weekly = fn("weekly", {
-      timeout: cdk.Duration.minutes(5),
+      timeout: cdk.Duration.minutes(10),
       environment: claudeEnv,
       retryAttempts: 2,
       maxEventAge: cdk.Duration.hours(1),

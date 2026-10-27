@@ -77,6 +77,14 @@ export function changeConflict(old: Pick<PlannedSessionRow, "type"> & { race_dat
   return null;
 }
 
+/** The label a session gets when its type is changed (the old label named the old type). */
+const LABEL_FOR_TYPE: Record<string, string> = { easy: "Easy", long: "Long", tempo: "Tempo", interval: "Interval", rest: "休息" };
+
+/** A pace midpoint as the allowed range ± 15 s and the text that shows it ("7:30〜8:00"). */
+function paceRange(p: number): { min: number; max: number; text: string } {
+  return { min: p - 15, max: p + 15, text: `${mmss(p - 15)}〜${mmss(p + 15)}` };
+}
+
 /**
  * Write the next version of `old` with one field changed (or the session turned into
  * a rest day for `skip`) and supersede `old`; activities follow. Returns the new row id.
@@ -98,11 +106,36 @@ export async function applyChange(q: Querier, old: PlannedSessionRow, field: Pro
     next.target_hr_max = null;
   } else {
     next[field] = value;
-    if (field === "target_pace_sec_km" && typeof value === "number" && old.target_pace_sec_km) {
-      // Keep the allowed range the same width around the new midpoint.
-      const d = value - old.target_pace_sec_km;
-      if (old.target_pace_min_sec_km != null) next.target_pace_min_sec_km = old.target_pace_min_sec_km + d;
-      if (old.target_pace_max_sec_km != null) next.target_pace_max_sec_km = old.target_pace_max_sec_km + d;
+    if (field === "type" && typeof value === "string" && value !== old.type) {
+      // The target text, the pace range and the heart-rate band described the old type ("MP 6:40〜6:50"
+      // must not stay on a session that is now Easy): clear them, name the session for its new type.
+      // A pace set afterwards on the same card gets a range of its own (below).
+      next.label = LABEL_FOR_TYPE[value] ?? old.label;
+      next.target = null;
+      next.target_pace_sec_km = null;
+      next.target_pace_min_sec_km = null;
+      next.target_pace_max_sec_km = null;
+      next.target_hr_min = null;
+      next.target_hr_max = null;
+      if (value === "rest") {
+        next.target_distance_m = null;
+        next.content = `休息（原 ${sessionLabel(old)}）`;
+      } else {
+        next.content = `${next.label}${old.target_distance_m ? ` ${km(old.target_distance_m)} km` : ""}`;
+      }
+    }
+    if (field === "target_pace_sec_km" && typeof value === "number") {
+      if (old.target_pace_sec_km) {
+        // Keep the allowed range the same width around the new midpoint.
+        const d = value - old.target_pace_sec_km;
+        if (old.target_pace_min_sec_km != null) next.target_pace_min_sec_km = old.target_pace_min_sec_km + d;
+        if (old.target_pace_max_sec_km != null) next.target_pace_max_sec_km = old.target_pace_max_sec_km + d;
+      } else {
+        const r = paceRange(value);
+        next.target_pace_min_sec_km = r.min;
+        next.target_pace_max_sec_km = r.max;
+        next.target = r.text;
+      }
     }
     if (field === "scheduled_date" && typeof value === "string") {
       const [w] = await q<{ week_no: number; phase: string | null }>(
@@ -553,15 +586,19 @@ export async function applyProposal(p: ProposalRow, today: string): Promise<Appl
       return { ok: false, status: 409, error: "plan_changed", changed };
     }
 
-    // Apply in the order written. Two changes to the same session chain: the second
-    // works on the version the first wrote.
+    // Apply in the order written, except that a type change goes before the other changes (it
+    // clears the pace and heart-rate targets of the old type; a pace the same card sets afterwards
+    // must survive). Two changes to the same session chain: the second works on the version the
+    // first wrote. `items` keeps the card's own order.
     const latest = new Map<string, string>(); // proposed session id -> current version id
-    const items: ProposalItem[] = [];
-    for (const item of p.items) {
+    const items: ProposalItem[] = new Array(p.items.length);
+    const order = p.items.map((_, i) => i).sort((a, b) => Number(p.items[b].field === "type") - Number(p.items[a].field === "type") || a - b);
+    for (const i of order) {
+      const item = p.items[i];
       const op = item.op ?? "change";
       if (op === "add") {
         const id = await insertSession(q, plan.id, item.new_session!);
-        items.push({ ...item, applied_session_id: id });
+        items[i] = { ...item, applied_session_id: id };
         continue;
       }
       const currentId = latest.get(item.session_id as string) ?? (item.session_id as string);
@@ -572,13 +609,15 @@ export async function applyProposal(p: ProposalRow, today: string): Promise<Appl
       if (!old) throw new Error(`session ${currentId} vanished inside the transaction`); // locked above: cannot happen
       if (op === "remove") {
         await q("update planned_sessions set superseded = true where id = $1", [old.id]);
-        items.push({ ...item });
+        items[i] = { ...item };
         continue;
       }
       const id = await applyChange(q, old, item.field as ProposalField, item.new);
       latest.set(item.session_id as string, id);
-      items.push({ ...item, applied_session_id: id });
+      items[i] = { ...item, applied_session_id: id };
     }
+    // Several changes to one session: every row points at the version that came out last.
+    for (const it of items) if (it.applied_session_id && it.session_id && latest.has(it.session_id)) it.applied_session_id = latest.get(it.session_id);
     for (const w of p.weeks ?? []) {
       await q("update plan_weeks set phase = coalesce($3, phase), focus = coalesce($4, focus) where plan_id = $1 and week_no = $2", [plan.id, w.week_no, w.phase, w.focus]);
       if (w.phase) await q("update planned_sessions set phase = $3 where plan_id = $1 and week_no = $2 and superseded = false", [plan.id, w.week_no, w.phase]);

@@ -22,6 +22,14 @@ const REPLY_MAX_CHARS = 2000;  // the reply as stored / shown; a runaway reply i
 export const REPLY_FAILED = "這次分析沒成功，再試一次";
 const MAX_SEARCHES = 3;
 const MAX_PAUSE_RESUMES = 2;
+/**
+ * One budget for every request of a reply (structured, the plain fallback, pause_turn resumes):
+ * the worker has 180 s, 15 s stay for the database and the write. Each request gets what is
+ * left, never more; with less than CHAT_MIN_REQUEST_MS left the reply fails (the message is
+ * marked failed — the user asks again) instead of starting a request the Lambda cannot finish.
+ */
+const CHAT_BUDGET_MS = 165_000;
+const CHAT_MIN_REQUEST_MS = 10_000;
 const HISTORY_TURNS = 20;
 
 /** Append one message to the athlete's thread (`q`: inside a caller's transaction). */
@@ -217,10 +225,17 @@ export async function answerCoachMessage(userId: string, messageId: string, toda
 
   const msgMeta = (msg.meta ?? {}) as { quote?: string; re_propose?: string };
   const quote = msgMeta.quote ?? null;
+  const deadline = Date.now() + CHAT_BUDGET_MS;
   try {
     const ctx = await loadCoachContext(userId, today, msgMeta.re_propose);
     const system = coachSystem(ctx, today, quote);
-    const client = anthropicClient(150_000);
+    const client = anthropicClient(CHAT_BUDGET_MS);
+    // Every request: no SDK retry, and a timeout of what is left of the shared budget.
+    const send = (params: Anthropic.MessageCreateParamsNonStreaming) => {
+      const left = deadline - Date.now();
+      if (left < CHAT_MIN_REQUEST_MS) throw new Error(`out of time for another request (${Math.round(left / 1000)} s left of ${CHAT_BUDGET_MS / 1000} s)`);
+      return client.messages.create(params, { timeout: left, maxRetries: 0 });
+    };
     const messages = await threadFor(userId, msg);
     const tools = [{
       type: "web_search_20260209" as const,
@@ -237,18 +252,18 @@ export async function answerCoachMessage(userId: string, messageId: string, toda
     let request: typeof structured | typeof plain = formatRejected ? plain : structured;
     let res: Anthropic.Message;
     try {
-      res = await client.messages.create({ ...request, messages });
+      res = await send({ ...request, messages });
     } catch (err) {
       if (request === plain || !isFormatRejected(err)) throw err;
       formatRejected = true;
       console.warn("structured output with web_search rejected, retrying as text + JSON:", JSON.stringify((err as InstanceType<typeof Anthropic.APIError>).error));
       request = plain;
-      res = await client.messages.create({ ...request, messages });
+      res = await send({ ...request, messages });
     }
     // The server-side search loop can pause; resend with the partial turn appended to resume.
     for (let i = 0; res.stop_reason === "pause_turn" && i < MAX_PAUSE_RESUMES; i++) {
       messages.push({ role: "assistant", content: res.content });
-      res = await client.messages.create({ ...request, messages });
+      res = await send({ ...request, messages });
     }
     if (res.stop_reason === "refusal") throw new Error(`refused: ${JSON.stringify(res.stop_details)}`);
     const searches = res.content.filter((b) => b.type === "server_tool_use").length;

@@ -48,7 +48,7 @@ export async function writeBriefs(userId: string, from: string, to: string, forc
   const user = sessions.map((s) =>
     `- ${s.scheduled_date} id=${s.id} [${s.label ?? s.type}] ${s.content ?? ""}${s.target ? `，目標 ${s.target}` : ""}${s.phase ? `，${s.phase}` : ""}${s.phase_focus ? `（本週重點：${s.phase_focus}）` : ""}${s.note ? `\n  備註：${s.note}` : ""}`,
   ).join("\n");
-  const client = anthropicClient();
+  const client = anthropicClient(45_000);
   const res = await client.messages.create({
     model: coachModel(), max_tokens: 2000, system: BRIEF_SYSTEM,
     output_config: { effort: "low" as const, format: { type: "json_schema", schema: BRIEF_SCHEMA } },

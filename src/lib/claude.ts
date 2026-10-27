@@ -22,17 +22,21 @@ export const DEFAULT_WEEKLY_MODEL = "claude-sonnet-5-5";
 export const DEFAULT_COACH_MODEL = "claude-sonnet-5-5";
 
 /**
- * SDK-level retries (HTTP 429 / 5xx / connection errors, with backoff) are written out
- * instead of left to the SDK's default of 2: one retry, so a call is at most two requests.
- * A request is cut after `timeoutMs` (the SDK's default is 10 minutes, longer than any
- * Lambda here). Every model call in the project goes through this.
+ * No SDK retries (the SDK's default is 2): `timeout` is per request and a retry also fires
+ * on a timeout, so one retry would double the time a call may take and break the Lambda's
+ * own limit — a Lambda that is killed is redelivered by SQS and every redelivery pays for
+ * the model again. A failed call is handled by its caller (a `failed` message, a skipped
+ * rerun), never retried here. `timeoutMs` is the whole call, and every caller picks one
+ * that fits in what is left of its Lambda: worker 180 s (chat: one shared 165 s budget,
+ * see coach.ts; verdict 100 s; briefs 45 s; other 60 s), weekly 600 s (180 s per review).
+ * Every model call in the project goes through this.
  */
-export const MODEL_MAX_RETRIES = 1;
+export const MODEL_MAX_RETRIES = 0;
 export function anthropicClient(timeoutMs = 60_000): Anthropic {
   return new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY, maxRetries: MODEL_MAX_RETRIES, timeout: timeoutMs });
 }
 
-function client(timeoutMs = 120_000) {
+function client(timeoutMs = 100_000) {
   return anthropicClient(timeoutMs);
 }
 
@@ -61,7 +65,7 @@ function extractJson<T>(text: string): T {
 }
 
 /** `system` as blocks lets a caller put a cache breakpoint behind the part that stays the same between calls. */
-async function ask<T>(modelId: string, system: string | Anthropic.TextBlockParam[], user: string, schema: Record<string, unknown>, maxTokens = 4096, timeoutMs = 120_000): Promise<{ data: T; model: string }> {
+async function ask<T>(modelId: string, system: string | Anthropic.TextBlockParam[], user: string, schema: Record<string, unknown>, maxTokens = 4096, timeoutMs = 100_000): Promise<{ data: T; model: string }> {
   const response = await client(timeoutMs).messages.create({
     model: modelId,
     max_tokens: maxTokens,
@@ -410,7 +414,7 @@ export async function weeklyReview(input: WeeklyReviewInput): Promise<WeeklyRevi
     { type: "text", text: WEEKLY_SYSTEM },
     { type: "text", text: `---\n${input.briefing}`, cache_control: { type: "ephemeral" } },
   ];
-  const { data, model: used } = await ask<Partial<WeeklyReviewResult>>(weeklyModel(), system, buildWeeklyPrompt(input), WEEKLY_SCHEMA, 8192, 240_000);
+  const { data, model: used } = await ask<Partial<WeeklyReviewResult>>(weeklyModel(), system, buildWeeklyPrompt(input), WEEKLY_SCHEMA, 8192, 180_000);
   // A key session without a record: ask, do not propose (the proposals come once it is settled).
   const proposals = input.asks?.length ? [] : Array.isArray(data.proposals) ? data.proposals.filter((c) => !!c && typeof c === "object") : [];
   return {

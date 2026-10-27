@@ -16,7 +16,7 @@ import type { CoachMessageRow, PlanRow, PlannedSessionRow, ProposalRow, StoredAd
 // The same weekly_reviews row and the same thread message are updated; pending
 // proposals are cancelled (superseded), applied ones stay and are facts for the new text.
 //
-// Every run — first generation and reruns — executes in the weekly Lambda (5 min).
+// Every run — first generation and reruns — executes in the weekly Lambda (10 min).
 // The api and the worker only ask for a rerun (`requestWeeklyRerun`: an async invoke
 // of that Lambda); the worker's 90 s are for Strava and the verdict, not for a review
 // plus briefs on top.
