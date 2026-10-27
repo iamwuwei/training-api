@@ -4,12 +4,13 @@ import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyResultV2 }
 import { isDbWaking, query, queryOne, withTransaction } from "../lib/db";
 import { type CheckinMeta, type MismatchAskMeta, mismatchReason, postMismatchAsk, resetCheckin, undoPick } from "../lib/checkin";
 import { COACH_NAME, MAX_MESSAGE_CHARS, postCoachMessage, REPLY_FAILED } from "../lib/coach";
+import { constraintsByIds, loadActiveConstraints } from "../lib/constraints";
 import { shortDate, sportName, weeklyAskQuestion } from "../lib/labels";
 import { applyChange, applyProposal, changeConflict, postProposalApplied } from "../lib/proposals";
 import { deauthorize } from "../lib/strava";
 import { postRoutineDone } from "../lib/strength";
 import { requestWeeklyRerun, reviewMissingActivity, WEEKLY_REVIEW_SELECT } from "../lib/weekly";
-import type { ActivityRow, BriefsJob, CoachAskJob, CoachMessageRow, CoachReplyJob, PlanRow, PlanWeekRow, PlannedSessionRow, ProposalRow, ReviewRow, RoutineJob, SessionRoutineRow, StoredAdjustments, StravaConnectionRow, UserRow, WeeklyMessageMeta, WeeklyReviewRow } from "../types";
+import type { ActivityRow, BriefsJob, CoachAskJob, CoachMessageRow, CoachReplyJob, ConstraintRow, PlanRow, PlanWeekRow, PlannedSessionRow, ProposalRow, ReviewRow, RoutineJob, SessionRoutineRow, StoredAdjustments, StravaConnectionRow, UserRow, WeeklyMessageMeta, WeeklyReviewRow } from "../types";
 import type {
   ActivitiesResponse,
   ApiActivity,
@@ -45,8 +46,11 @@ import type {
   PostRoutineResponse,
   PutRoutineRequest,
   PutRoutineResponse,
+  ApiConstraint,
   ApiProposal,
   ApiSession,
+  PlanChangedResponse,
+  PostConstraintResponse,
   PostProposalResponse,
   PostWeeklyAskRequest,
   PostWeeklyAskResponse,
@@ -68,7 +72,8 @@ import type {
 //   GET /weekly                      weekly coach reviews with their adjustment proposals
 //   POST /weekly/{id}/adjustments/{index}   apply or dismiss one proposal
 //   POST /weekly/{id}/asks/{session_id}     answer the review's question about a session without a record (synced / skipped)
-//   POST /proposals/{id}/apply|dismiss      a chat proposal card: apply all its changes at once, or dismiss
+//   POST /proposals/{id}/apply|dismiss      a proposal card (chat or weekly review): apply all of it at once (409 plan_changed when a session moved under it), or dismiss
+//   POST /constraints/{id}/accept|dismiss   Woo's 記下來 card: remember it / not; dismiss also deletes an active one (settings)
 //   GET /coach                       the coach's thread (weekly reviews, verdicts, chat)
 //   POST /coach/messages             say something to the coach; the worker answers (answer_to / confirm_match for Woo's questions)
 //   PUT /coach/seen                  the thread was opened; clears coach_unread on GET /plan
@@ -83,7 +88,7 @@ const VERDICTS = new Set<string>(["達成", "達成但有提醒", "未達成"]);
 
 const sqs = new SQSClient({});
 
-const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | PutSessionResponse | PutMemoResponse | RereviewResponse | WeeklyResponse | PostAdjustmentResponse | CoachResponse | PostCoachMessageResponse | PutCoachSeenResponse | PostCheckinPickResponse | PostCheckinResetResponse | PostRoutineResponse | PutRoutineResponse | PostWeeklyAskResponse | PostProposalResponse | ErrorResponse>(
+const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | PutSessionResponse | PutMemoResponse | RereviewResponse | WeeklyResponse | PostAdjustmentResponse | CoachResponse | PostCoachMessageResponse | PutCoachSeenResponse | PostCheckinPickResponse | PostCheckinResetResponse | PostRoutineResponse | PutRoutineResponse | PostWeeklyAskResponse | PostProposalResponse | PostConstraintResponse | PlanChangedResponse | ErrorResponse>(
   statusCode: number,
   body: T,
 ): APIGatewayProxyResultV2 => ({
@@ -171,6 +176,8 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
   if (method === "POST" && askRoute) return postWeeklyAsk(user.id, askRoute[1], askRoute[2], raw);
   const proposal = /^\/proposals\/([^/]+)\/(apply|dismiss)$/.exec(path);
   if (method === "POST" && proposal) return postProposalDecision(user.id, proposal[1], proposal[2] as "apply" | "dismiss");
+  const constraint = /^\/constraints\/([^/]+)\/(accept|dismiss)$/.exec(path);
+  if (method === "POST" && constraint) return postConstraintDecision(user.id, constraint[1], constraint[2] as "accept" | "dismiss");
 
   return json(404, { error: "not found" });
 }
@@ -326,6 +333,7 @@ async function getPlan(userId: string) {
       where r.user_id = $1 and ps.plan_id = $2 order by ps.scheduled_date`,
     [userId, plan.id],
   );
+  const constraints = await loadActiveConstraints(userId);
 
   // Woo's one line per upcoming session: ask the worker for the missing ones (next 14 days).
   const today = todayJst();
@@ -342,6 +350,7 @@ async function getPlan(userId: string) {
     activities: activities.map(toApiActivity),
     unassigned: unassigned.map(toApiActivity),
     routines: routines.map(toApiRoutine),
+    constraints: constraints.map(toApiConstraint),
   });
 }
 
@@ -734,10 +743,12 @@ async function postWeeklyAsk(userId: string, weeklyId: string, sessionId: string
     await requestWeeklyRerun({ user_id: userId, weekly_review_id: weeklyId, reason: `你說 ${shortDate(ask.date)} 沒跑` });
   }
   const [fresh] = await query<CoachMessageRow>("select * from coach_messages where id = $1", [m.id]);
-  return json<PostWeeklyAskResponse>(200, { message: toApiCoachMessage(fresh) });
+  return json<PostWeeklyAskResponse>(200, { message: toApiCoachMessage(fresh, await cardsFor(userId, [fresh])) });
 }
 
-// ---- chat proposals ---------------------------------------------------------------
+// ---- proposal cards ---------------------------------------------------------------
+
+const iso = (d: Date | string) => new Date(d).toISOString();
 
 function toApiProposal(p: ProposalRow): ApiProposal {
   return {
@@ -745,41 +756,95 @@ function toApiProposal(p: ProposalRow): ApiProposal {
     source: p.source,
     message_id: p.message_id,
     changes: (Array.isArray(p.items) ? p.items : []).map((i) => ({
-      session_id: i.session_id, field: i.field, old: i.old, new: i.new,
-      label: i.label ?? null, date: i.date ?? null, applied_session_id: i.applied_session_id ?? null,
+      op: i.op ?? "change",
+      session_id: i.session_id ?? null,
+      ...(i.field ? { field: i.field } : {}),
+      old: i.old ?? null,
+      new: i.new ?? null,
+      label: i.label ?? null,
+      date: i.date ?? null,
+      ...(i.new_session ? { new_session: i.new_session } : {}),
+      reason: i.reason ?? null,
+      flags: Array.isArray(i.flags) ? i.flags : [],
+      applied_session_id: i.applied_session_id ?? null,
     })),
+    weeks: Array.isArray(p.weeks) ? p.weeks : [],
     why: p.why,
     basis: Array.isArray(p.basis) ? p.basis : [],
+    basis_text: p.basis_text ?? "",
+    impact: p.impact ?? { keep: "", change: "", risk: "" },
     flags: Array.isArray(p.flags) ? p.flags : [],
+    group_id: p.group_id ?? null,
+    option: p.option ?? null,
     status: p.status,
-    created_at: new Date(p.created_at).toISOString(),
-    decided_at: p.decided_at ? new Date(p.decided_at).toISOString() : null,
+    stale_reason: p.stale_reason ?? null,
+    created_at: iso(p.created_at),
+    decided_at: p.decided_at ? iso(p.decided_at) : null,
   };
 }
 
-/** Apply every change of the card in one transaction (Woo confirms in the thread), or dismiss it. */
+/** Apply every row of the card in one transaction (Woo confirms in the thread), or dismiss it. */
 async function postProposalDecision(userId: string, proposalId: string, action: "apply" | "dismiss") {
   if (!UUID_RE.test(proposalId)) return json(400, { error: "invalid proposal id" });
   const p = await queryOne<ProposalRow>("select * from proposals where id = $1 and user_id = $2", [proposalId, userId]);
   if (!p) return json(404, { error: "proposal not found" });
-  if (p.status !== "pending") return json(409, { error: `already ${p.status}` });
+  // A stale card can still be dismissed (算了); nothing else leaves a decided card.
+  if (p.status !== "pending" && !(action === "dismiss" && p.status === "stale")) return json(409, { error: `already ${p.status}` });
 
+  let superseded: string[] = [];
   if (action === "apply") {
-    const result = await applyProposal(p);
-    if (typeof result === "string") return json(409, { error: result });
-    await postProposalApplied(userId, result);
+    const result = await applyProposal(p, todayJst());
+    if (!result.ok) {
+      return result.changed
+        ? json<PlanChangedResponse>(result.status, { error: "plan_changed", changed: result.changed })
+        : json(result.status, { error: result.error });
+    }
+    superseded = result.superseded;
+    await postProposalApplied(userId, result.items, p.weeks ?? []);
   } else {
-    await query("update proposals set status = 'dismissed', decided_at = now() where id = $1 and status = 'pending'", [p.id]);
+    await query("update proposals set status = 'dismissed', decided_at = now() where id = $1 and user_id = $2 and status in ('pending', 'stale')", [p.id, userId]);
   }
   const [fresh] = await query<ProposalRow>("select * from proposals where id = $1", [p.id]);
-  return json<PostProposalResponse>(200, { proposal: toApiProposal(fresh) });
+  return json<PostProposalResponse>(200, { proposal: toApiProposal(fresh), superseded });
+}
+
+// ---- constraints (what Woo remembers) -------------------------------------------------
+
+function toApiConstraint(c: ConstraintRow): ApiConstraint {
+  return {
+    id: c.id, text: c.text, start_date: c.start_date, end_date: c.end_date, kind: c.kind, weekday: c.weekday,
+    source_message_id: c.source_message_id, status: c.status, created_at: iso(c.created_at),
+  };
+}
+
+/** accept: proposed → active. dismiss: proposed or active → dismissed (the settings page's 刪除 is the second). */
+async function postConstraintDecision(userId: string, id: string, action: "accept" | "dismiss") {
+  if (!UUID_RE.test(id)) return json(400, { error: "invalid constraint id" });
+  const [mine] = await constraintsByIds(userId, [id]);
+  if (!mine) return json(404, { error: "constraint not found" });
+  const [row] = action === "accept"
+    ? await query<{ id: string }>("update constraints set status = 'active', decided_at = now() where id = $1 and user_id = $2 and status = 'proposed' returning id", [id, userId])
+    : await query<{ id: string }>("update constraints set status = 'dismissed', decided_at = now() where id = $1 and user_id = $2 and status in ('proposed', 'active') returning id", [id, userId]);
+  if (!row) return json(409, { error: `already ${mine.status}` });
+  const [fresh] = await constraintsByIds(userId, [id]);
+  return json<PostConstraintResponse>(200, { constraint: toApiConstraint(fresh) });
 }
 
 // ---- the coach's thread ----------------------------------------------------------
 
-function toApiCoachMessage(m: CoachMessageRow, proposals?: Map<string, ProposalRow>): ApiCoachMessage {
+/** The cards a message points at, loaded together (see cardsFor). */
+interface Cards { proposals: Map<string, ProposalRow>; constraints: Map<string, ConstraintRow> }
+
+/** proposal_ids (A/B, weekly), or the single proposal_id of messages written before coach-replan. */
+function proposalIds(meta: Record<string, unknown>): string[] {
+  if (Array.isArray(meta.proposal_ids)) return meta.proposal_ids.filter((id): id is string => typeof id === "string");
+  return typeof meta.proposal_id === "string" ? [meta.proposal_id] : [];
+}
+
+function toApiCoachMessage(m: CoachMessageRow, cards?: Cards): ApiCoachMessage {
   const meta = (m.meta ?? {}) as Record<string, unknown>;
-  const proposal = typeof meta.proposal_id === "string" ? proposals?.get(meta.proposal_id) : undefined;
+  const proposal = proposalIds(meta).map((id) => cards?.proposals.get(id)).find((p): p is ProposalRow => !!p);
+  const constraint = typeof meta.constraint_id === "string" ? cards?.constraints.get(meta.constraint_id) : undefined;
   return {
     id: m.id,
     role: m.role,
@@ -806,6 +871,8 @@ function toApiCoachMessage(m: CoachMessageRow, proposals?: Map<string, ProposalR
       : null,
     weekly: m.kind === "weekly" ? toApiWeeklyMeta(meta as unknown as Partial<WeeklyMessageMeta>) : null,
     proposal: proposal ? toApiProposal(proposal) : null,
+    constraint: constraint ? toApiConstraint(constraint) : null,
+    proposal_rejected: meta.proposal_rejected === true,
     // Rows written before the worker stored the fixed line still hold the provider's wording: never shown.
     error: typeof meta.error === "string" && meta.error ? REPLY_FAILED : null,
     created_at: new Date(m.created_at).toISOString(),
@@ -834,12 +901,13 @@ function toApiWeeklyMeta(meta: Partial<WeeklyMessageMeta>): ApiCoachMessage["wee
   };
 }
 
-/** The proposal cards attached to these messages, keyed by proposal id. */
-async function proposalsFor(userId: string, messages: CoachMessageRow[]): Promise<Map<string, ProposalRow>> {
-  const ids = messages.map((m) => (m.meta as { proposal_id?: unknown } | null)?.proposal_id).filter((id): id is string => typeof id === "string" && UUID_RE.test(id));
-  if (!ids.length) return new Map();
-  const rows = await query<ProposalRow>("select * from proposals where user_id = $1 and id = any($2::uuid[])", [userId, ids]);
-  return new Map(rows.map((p) => [p.id, p]));
+/** The proposal cards and the 記下來 constraints attached to these messages, keyed by id. */
+async function cardsFor(userId: string, messages: CoachMessageRow[]): Promise<Cards> {
+  const ids = messages.flatMap((m) => proposalIds((m.meta ?? {}) as Record<string, unknown>)).filter((id) => UUID_RE.test(id));
+  const cids = messages.map((m) => (m.meta as { constraint_id?: unknown } | null)?.constraint_id).filter((id): id is string => typeof id === "string" && UUID_RE.test(id));
+  const rows = ids.length ? await query<ProposalRow>("select * from proposals where user_id = $1 and id = any($2::uuid[])", [userId, ids]) : [];
+  const cs = await constraintsByIds(userId, cids);
+  return { proposals: new Map(rows.map((p) => [p.id, p])), constraints: new Map(cs.map((c) => [c.id, c])) };
 }
 
 function toApiCheckin(meta: CheckinMeta): ApiCheckin {
@@ -870,8 +938,8 @@ async function getCoach(userId: string) {
     "select * from coach_messages where user_id = $1 order by created_at desc limit 100",
     [userId],
   );
-  const proposals = await proposalsFor(userId, rows);
-  return json<CoachResponse>(200, { coach: { name: COACH_NAME }, messages: rows.reverse().map((m) => toApiCoachMessage(m, proposals)) });
+  const cards = await cardsFor(userId, rows);
+  return json<CoachResponse>(200, { coach: { name: COACH_NAME }, messages: rows.reverse().map((m) => toApiCoachMessage(m, cards)) });
 }
 
 /** The athlete opened the thread: everything posted so far counts as seen. */
@@ -1144,6 +1212,16 @@ async function postCoach(userId: string, raw: string) {
     return json<PostCoachMessageResponse>(202, { message: toApiCoachMessage(m) });
   }
 
+  // 請 Woo 重看: the stale card goes into Woo's briefing (the worker reads it from the message's meta).
+  let reProposeId: string | null = null;
+  if (body.re_propose !== undefined && body.re_propose !== null) {
+    if (typeof body.re_propose !== "string" || !UUID_RE.test(body.re_propose)) return json(400, { error: "invalid re_propose" });
+    const stale = await queryOne<{ status: string }>("select status from proposals where id = $1 and user_id = $2", [body.re_propose, userId]);
+    if (!stale) return json(404, { error: "proposal not found" });
+    if (stale.status !== "stale") return json(409, { error: `proposal is ${stale.status}, not stale` });
+    reProposeId = body.re_propose;
+  }
+
   let quote: string | null = null;
   if (body.activity_id) {
     if (!UUID_RE.test(body.activity_id)) return json(400, { error: "invalid activity id" });
@@ -1160,7 +1238,7 @@ async function postCoach(userId: string, raw: string) {
 
   const m = await postCoachMessage({
     user_id: userId, role: "athlete", kind: "chat", text, status: "pending",
-    activity_id: body.activity_id ?? null, meta: quote ? { quote } : null,
+    activity_id: body.activity_id ?? null, meta: quote || reProposeId ? { ...(quote ? { quote } : {}), ...(reProposeId ? { re_propose: reProposeId } : {}) } : null,
   });
   if (process.env.QUEUE_URL) {
     await sqs.send(new SendMessageCommand({

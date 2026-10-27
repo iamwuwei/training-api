@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { coachModel } from "./claude";
+import { anthropicClient, coachModel } from "./claude";
 import { COACH_NAME, postCoachMessage } from "./coach";
 import { query, queryOne } from "./db";
 import type { PlannedSessionRow, RoutineItem, SessionRoutineRow } from "../types";
@@ -84,7 +84,7 @@ export async function writeRoutine(userId: string, routineId: string): Promise<v
       around.length ? `接下來幾天：${around.map((s) => `${s.scheduled_date.slice(5)} ${s.label ?? s.type} ${s.content ?? ""}`).join("；")}` : "",
       last ? `上一次（${new Date(last.created_at).toISOString().slice(0, 10)}，${last.place === "home" ? "在家" : "健身房"}）：${last.items.map((i) => `${i.name}${i.done ? "" : "（沒做）"}`).join("、")}${last.rpe ? `，RPE ${last.rpe}` : ""}${last.note ? `，他說：${last.note}` : ""}` : "上一次：沒有紀錄，這是第一份。",
     ].filter(Boolean).join("\n");
-    const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    const client = anthropicClient();
     const res = await client.messages.create({
       model: coachModel(), max_tokens: 1500, system: ROUTINE_SYSTEM,
       output_config: { effort: "low" as const, format: { type: "json_schema", schema: ROUTINE_SCHEMA } },
