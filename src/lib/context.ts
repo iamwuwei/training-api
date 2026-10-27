@@ -1,4 +1,5 @@
 import type { HistoryItem, ReviewContext } from "./claude";
+import { loadLiveConstraints } from "./constraints";
 import { query, queryOne } from "./db";
 import type { PlanRow, PlanWeekRow, PlannedSessionRow, Verdict } from "../types";
 
@@ -128,5 +129,7 @@ export async function loadReviewContext(
     [userId, activityId],
   );
 
-  return { plan, weeks, thisWeek, recent, sameType, prevReminders: prev?.reminders ?? [] };
+  const constraints = await loadLiveConstraints(userId, date);
+
+  return { plan, weeks, thisWeek, recent, sameType, prevReminders: prev?.reminders ?? [], constraints };
 }

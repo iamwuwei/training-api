@@ -1,13 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { InvokeCommand, LambdaClient } from "@aws-sdk/client-lambda";
 import { writeBriefs } from "./briefs";
-import { weeklyReview } from "./claude";
+import { adjustmentLine, weeklyReview } from "./claude";
+import { buildPlanBriefing, loadPlanBriefing } from "./briefing";
 import { postCoachMessage } from "./coach";
-import { historyBetween, loadPlanWeeks } from "./context";
+import { historyBetween } from "./context";
 import { type Querier, query, queryOne, withTransaction } from "./db";
 import { sessionLabel, shortDate, sportName } from "./labels";
-import { changeConflict, describeChange } from "./proposals";
-import type { CoachMessageRow, PlanRow, PlannedSessionRow, StoredAdjustment, StoredAdjustments, WeeklyMessageMeta, WeeklyRerunRequest, WeeklyReviewRow } from "../types";
+import { type CardDraft, describeCard, describeChange, validateCards } from "./proposals";
+import type { CoachMessageRow, PlanRow, PlannedSessionRow, ProposalRow, StoredAdjustment, StoredAdjustments, WeeklyMessageMeta, WeeklyRerunRequest, WeeklyReviewRow } from "../types";
 
 // The weekly review, written once by the scheduler (Monday 04:00 JST) and rewritten
 // in place when the week's data changes afterwards: an activity of that week arrives
@@ -15,7 +16,7 @@ import type { CoachMessageRow, PlanRow, PlannedSessionRow, StoredAdjustment, Sto
 // The same weekly_reviews row and the same thread message are updated; pending
 // proposals are cancelled (superseded), applied ones stay and are facts for the new text.
 //
-// Every run — first generation and reruns — executes in the weekly Lambda (5 min).
+// Every run — first generation and reruns — executes in the weekly Lambda (10 min).
 // The api and the worker only ask for a rerun (`requestWeeklyRerun`: an async invoke
 // of that Lambda); the worker's 90 s are for Strava and the verdict, not for a review
 // plus briefs on top.
@@ -33,6 +34,7 @@ const lambda = new LambdaClient({});
 export const WEEKLY_REVIEW_SELECT = `select id, plan_id, to_char(week_start, 'YYYY-MM-DD') as week_start, summary, adjustments, created_at, updated_at, update_reason from weekly_reviews`;
 
 const addDays = (iso: string, n: number) => new Date(Date.parse(`${iso}T00:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10);
+const todayJst = () => new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
 const SESSIONS_SELECT = `select *, to_char(scheduled_date, 'YYYY-MM-DD') as scheduled_date from planned_sessions
   where plan_id = $1 and superseded = false and scheduled_date between $2 and $3 order by planned_sessions.scheduled_date`;
 const ACTIVITY_IDS_SELECT = `select id from activities where user_id = $1 and match_status <> 'ignored' and (start_time at time zone 'Asia/Tokyo')::date between $2 and $3`;
@@ -179,6 +181,15 @@ function alreadyDoneBy(current: WeeklyReviewRow, existing: WeeklyReviewRow | und
 
 type Generated = WeeklyRunResult & { first: boolean; activities: string[] };
 
+/** Store a validated card as a pending proposal of the weekly message. */
+async function insertCard(q: Querier, userId: string, messageId: string, d: CardDraft): Promise<void> {
+  await q(
+    `insert into proposals (id, user_id, source, message_id, items, weeks, why, basis, basis_text, impact, flags, group_id, option, status)
+     values ($1, $2, 'weekly', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending')`,
+    [d.id, userId, messageId, JSON.stringify(d.items), JSON.stringify(d.weeks), d.why, JSON.stringify(d.basis), d.basis_text, JSON.stringify(d.impact), JSON.stringify(d.flags), d.group_id, d.option ? JSON.stringify(d.option) : null],
+  );
+}
+
 /** The read-model-write of one run, on the locked transaction `q`. */
 async function generate(
   q: Querier,
@@ -188,10 +199,7 @@ async function generate(
   existing: WeeklyReviewRow | undefined,
   reason: string | undefined,
 ): Promise<Generated> {
-  const upcomingEnd = addDays(weekStart, 27); // next three weeks are adjustable
-
   const sessions = await q<PlannedSessionRow>(SESSIONS_SELECT, [plan.id, weekStart, weekEnd]);
-  const upcoming = await q<PlannedSessionRow>(SESSIONS_SELECT, [plan.id, addDays(weekEnd, 1), upcomingEnd]);
   const activities = await historyBetween(plan.user_id, weekStart, weekEnd);
   const activityIds = (await q<{ id: string }>(ACTIVITY_IDS_SELECT, [plan.user_id, weekStart, weekEnd])).map((r) => r.id);
   const hints = (await q<{ adjust_hint: string }>(
@@ -205,13 +213,15 @@ async function generate(
     "select summary from weekly_reviews where plan_id = $1 and week_start < $2 order by week_start desc limit 1",
     [plan.id, weekStart],
   );
-  const weeks = await loadPlanWeeks(plan.id);
+
+  // The whole plan to the race, every activity so far, the constraints: what the chat gets too.
+  const today = todayJst();
+  const scope = await loadPlanBriefing(plan, today);
+  const briefing = buildPlanBriefing(scope, today);
+  const weeks = scope.weeks;
 
   // Key sessions (Long / MP / 坡跑) with no record: ask, don't conclude.
-  const done = new Set((await q<{ session_id: string }>(
-    "select distinct session_id from activities where user_id = $1 and session_id is not null and match_status <> 'ignored'",
-    [plan.user_id],
-  )).map((r) => r.session_id));
+  const done = new Set(scope.sessions.filter((s) => s.done).map((s) => s.id));
   const message = existing ? (await q<CoachMessageRow>("select * from coach_messages where weekly_review_id = $1 order by created_at limit 1", [existing.id]))[0] : undefined;
   const askStateOf = (m: CoachMessageRow | undefined) => new Map(((m?.meta ?? {}) as Partial<WeeklyMessageMeta>).asks?.map((a) => [a.session_id, a.state]) ?? []);
   const oldAskState = askStateOf(message);
@@ -220,42 +230,54 @@ async function generate(
     .filter((s) => s.type !== "rest" && KEY_SESSION.test(s.label ?? "") && !done.has(s.id) && !s.skipped_at)
     .map((s) => ({ session: s, state: oldAskState.get(s.id) === "synced" ? "synced" as const : "open" as const }));
 
+  // Facts for the new text: what the athlete already applied from the earlier version (old-style proposals and cards).
   const stored = (existing?.adjustments ?? null) as StoredAdjustments | null;
-  const applied = (stored?.items ?? []).filter((a) => a.status === "applied");
+  const appliedCards = message
+    ? await q<ProposalRow>("select * from proposals where message_id = $1 and user_id = $2 and status = 'applied' order by created_at", [message.id, plan.user_id])
+    : [];
+  const applied = [
+    ...(stored?.items ?? []).filter((a) => a.status === "applied").map(adjustmentLine),
+    ...appliedCards.map(describeCard),
+  ];
 
   const review = await weeklyReview({
-    plan, weeks, weekStart, weekEnd, sessions, activities, hints,
-    previousSummary: previous?.summary ?? null, upcoming,
+    plan, weeks, weekStart, weekEnd, briefing, sessions, activities, hints,
+    previousSummary: previous?.summary ?? null,
     asks, skipped, applied, updateReason: reason ?? null,
   });
 
-  // The same checks the apply route makes (value fits the field, no race made or moved onto):
-  // a proposal that could never be applied is not shown.
-  const byId = new Map(upcoming.map((s) => [s.id, s]));
-  const fresh: StoredAdjustment[] = review.adjustments
-    .filter((a) => {
-      const s = byId.get(a.session_id);
-      const conflict = s ? changeConflict({ type: s.type, race_date: plan.race_date }, a.field, a.new) : "unknown session";
-      if (conflict) console.warn(`weekly review for plan ${plan.id} week ${weekStart}: proposal dropped (${conflict}): ${JSON.stringify(a)}`);
-      return !conflict;
-    })
-    .map((a) => ({ ...a, status: "pending" }));
+  // The same checks as a chat card (range, race day, fixed days, basis / impact present, ...):
+  // a card that fails is not stored, the summary still is.
+  let drafts: CardDraft[] = [];
+  let rejected = false;
+  if (review.proposals.length) {
+    const checked = validateCards(scope, review.proposals, today, 1);
+    if (typeof checked === "string") {
+      console.warn(`weekly review for plan ${plan.id} week ${weekStart}: proposals dropped (${checked})`);
+      rejected = true;
+    } else drafts = checked;
+  }
   const metaAsks = (state: Map<string, string>) =>
     asks.map(({ session: s, state: st }) => ({ session_id: s.id, label: sessionLabel(s), date: s.scheduled_date, state: state.get(s.id) === "synced" ? "synced" as const : st }));
 
   if (!existing) {
     const id = randomUUID();
-    const toStore: StoredAdjustments = { model: review.model, hints, items: fresh, activities: activityIds };
-    const meta: WeeklyMessageMeta = { week_start: weekStart, proposals: fresh.length, asks: metaAsks(oldAskState) };
+    const toStore: StoredAdjustments = { model: review.model, hints, items: [], activities: activityIds };
+    const meta: WeeklyMessageMeta = {
+      week_start: weekStart, proposals: drafts.length, asks: metaAsks(oldAskState),
+      ...(drafts.length ? { proposal_ids: drafts.map((d) => d.id) } : {}),
+      ...(rejected ? { proposal_rejected: true } : {}),
+    };
     await q(
       `insert into weekly_reviews (id, plan_id, week_start, summary, adjustments) values ($1, $2, $3, $4, $5)`,
       [id, plan.id, weekStart, review.summary, JSON.stringify(toStore)],
     );
-    await postCoachMessage({
+    const posted = await postCoachMessage({
       user_id: plan.user_id, role: "coach", kind: "weekly", text: review.summary, weekly_review_id: id,
       meta: meta as unknown as Record<string, unknown>,
     }, q);
-    return { review_id: id, adjustments: fresh.length, asks: asks.length, first: true, activities: activityIds };
+    for (const d of drafts) await insertCard(q, plan.user_id, posted.id, d);
+    return { review_id: id, adjustments: drafts.length, asks: asks.length, first: true, activities: activityIds };
   }
 
   // Regeneration. The athlete may have applied / dismissed a proposal or answered a
@@ -277,25 +299,42 @@ async function generate(
       kept.push(item);
     }
   }
-  const toStore: StoredAdjustments = { model: review.model, hints, items: [...kept, ...fresh], activities: activityIds };
+  // The cards of the earlier version: pending ones are cancelled (an apply that got there first wins: its row is no longer pending), applied ones stay.
+  let keptCardIds: string[] = [];
+  if (latestMessage) {
+    const gone = await q<ProposalRow>(
+      "update proposals set status = 'superseded', decided_at = now() where message_id = $1 and user_id = $2 and status = 'pending' returning *",
+      [latestMessage.id, plan.user_id],
+    );
+    for (const c of gone) cancelled.push(describeCard(c));
+    keptCardIds = (await q<{ id: string }>("select id from proposals where message_id = $1 and user_id = $2 and status = 'applied' order by created_at", [latestMessage.id, plan.user_id])).map((r) => r.id);
+  }
+  const toStore: StoredAdjustments = { model: review.model, hints, items: kept, activities: activityIds };
   await q(
     `update weekly_reviews set summary = $2, adjustments = $3, updated_at = now(), update_reason = $4 where id = $1`,
     [existing.id, review.summary, JSON.stringify(toStore), reason ?? null],
   );
+  const { proposal_ids: _oldIds, proposal_rejected: _oldRejected, ...carried } = latestMeta;
   const newMeta: WeeklyMessageMeta = {
-    ...latestMeta,
+    ...carried,
     week_start: weekStart,
-    proposals: fresh.length,
+    proposals: drafts.length,
+    // The message carries one card: the new one, else the latest applied one (a fact; its text is already in the new summary).
+    ...(drafts.length || keptCardIds.length ? { proposal_ids: drafts.length ? drafts.map((d) => d.id) : keptCardIds.slice(-1) } : {}),
+    ...(rejected ? { proposal_rejected: true } : {}),
     asks: metaAsks(askStateOf(latestMessage)),
     updated: { at: now, reason: reason ?? "" },
     cancelled: [...(latestMeta.cancelled ?? []), ...cancelled],
   };
+  let messageId: string;
   if (latestMessage) {
     await q("update coach_messages set text = $2, meta = $3 where id = $1", [latestMessage.id, review.summary, JSON.stringify(newMeta)]);
+    messageId = latestMessage.id;
   } else {
-    await postCoachMessage({ user_id: plan.user_id, role: "coach", kind: "weekly", text: review.summary, weekly_review_id: existing.id, meta: newMeta as unknown as Record<string, unknown> }, q);
+    messageId = (await postCoachMessage({ user_id: plan.user_id, role: "coach", kind: "weekly", text: review.summary, weekly_review_id: existing.id, meta: newMeta as unknown as Record<string, unknown> }, q)).id;
   }
-  return { review_id: existing.id, adjustments: fresh.length, asks: asks.length, first: false, activities: activityIds };
+  for (const d of drafts) await insertCard(q, plan.user_id, messageId, d);
+  return { review_id: existing.id, adjustments: drafts.length, asks: asks.length, first: false, activities: activityIds };
 }
 
 /** Woo's one line per session for the next two weeks, rewritten with this week in mind. */
