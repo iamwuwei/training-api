@@ -269,6 +269,9 @@ function validateCard(b: PlanBriefing, raw: RawCard, today: string): CardDraft |
     const reason = text(c.reason);
     if (reason.length > LIMITS.reason) return `reason longer than ${LIMITS.reason}`;
 
+    // field is "" (none) unless op = change; the schema's enum has "" for that, a stray null reads the same.
+    if (op !== "change" && c.field != null && c.field !== "") return `${op} must not have a field (got ${String(c.field)})`;
+
     if (op === "add") {
       const ns = c.new_session;
       if (!ns || typeof ns !== "object") return "add without new_session";
@@ -307,7 +310,7 @@ function validateCard(b: PlanBriefing, raw: RawCard, today: string): CardDraft |
     }
 
     const field = c.field;
-    if (!isStr(field) || !PROPOSAL_FIELDS.has(field)) return `field ${String(field)}`;
+    if (!isStr(field) || !PROPOSAL_FIELDS.has(field)) return `field ${JSON.stringify(field) ?? "missing"}`; // "" (none) is not a field to change
     if (seen.has(field)) return `session ${id}: ${field} changed twice`;
     const value = field === "skip" ? null : c.new ?? null;
     const bad = validateChangeValue(field, value);
