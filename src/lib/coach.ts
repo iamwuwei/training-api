@@ -212,7 +212,7 @@ async function threadFor(userId: string, upTo: CoachMessageRow): Promise<Anthrop
 }
 
 /** The plain-text form's description of the JSON object (when the API refuses the schema next to web_search). */
-const PLAIN_FORMAT = `回覆格式：先寫回覆文字，最後另起一段只放一個 JSON 物件 {"proposals": [...], "constraint": ...}。proposals 是 0〜2 張卡，每張 {"changes":[{"op":"change|add|remove","session_id":string|null,"field":string|null,"old":...,"new":...,"new_session":{"scheduled_date","type","label","target_distance_m","target_pace_sec_km","note"}|null,"reason":string|null}],"weeks":[{"week_no","phase","focus"}],"why","basis":[...],"basis_text","impact":{"keep","change","risk"},"option_title":string|null,"recommended":boolean}；constraint 是 {"text","start_date","end_date","kind","weekday"} 或 null。沒有卡就是 []。`;
+const PLAIN_FORMAT = `回覆格式：先寫回覆文字，最後另起一段只放一個 JSON 物件 {"proposals": [...], "constraint": ...}。沒有的字串欄位（reason、note、phase、focus、option_title）給空字串 ""。proposals 是 0〜2 張卡，每張 {"changes":[{"op":"change|add|remove","session_id":string|null,"field":string|null,"old":...,"new":...,"new_session":{"scheduled_date","type","label","target_distance_m","target_pace_sec_km","note"}|null,"reason":string}],"weeks":[{"week_no","phase","focus"}],"why","basis":[...],"basis_text","impact":{"keep","change","risk"},"option_title":string,"recommended":boolean}；constraint 是 {"text","start_date","end_date","kind","weekday"} 或 null。沒有卡就是 []。`;
 
 /**
  * Answer one pending athlete message. Writes the coach's reply (or marks the
@@ -256,7 +256,7 @@ export async function answerCoachMessage(userId: string, messageId: string, toda
     } catch (err) {
       if (request === plain || !isFormatRejected(err)) throw err;
       formatRejected = true;
-      console.warn("structured output with web_search rejected, retrying as text + JSON:", JSON.stringify((err as InstanceType<typeof Anthropic.APIError>).error));
+      console.warn("structured output rejected (400), retrying as text + JSON:", (err as InstanceType<typeof Anthropic.APIError>).message);
       request = plain;
       res = await send({ ...request, messages });
     }
@@ -353,10 +353,14 @@ export async function answerCoachMessage(userId: string, messageId: string, toda
 /** Remembered per container: once the API refused the schema + web_search combination, do not try it again. */
 let formatRejected = false;
 
-/** A 400 from the API saying output_config.format cannot be used with this request. */
+/**
+ * A 400 from the API that is about the structured-output request itself: the schema
+ * ("Schema is too complex for compilation"), output_config, the format, the grammar, or the
+ * combination with web_search. Any of those goes to the text + JSON fallback instead of failing the message.
+ */
 function isFormatRejected(err: unknown): boolean {
   if (!(err instanceof Anthropic.APIError) || err.status !== 400) return false;
-  return /output_config|output_format|format/i.test(err.message) && /tool|web_search|not supported|incompatible|cannot/i.test(err.message);
+  return /schema|output_config|output_format|format|too complex|grammar/i.test(err.message);
 }
 
 /** A trailing ```json … ``` fence (the plain form often wraps its JSON in one) is opened. */
