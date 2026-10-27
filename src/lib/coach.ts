@@ -16,7 +16,7 @@ import type { CoachMessageRow, ProposalRow, RawCard, RawConstraint, StoredAdjust
 
 export const COACH_NAME = "Woo";
 export const MAX_MESSAGE_CHARS = 500;
-const REPLY_MAX_TOKENS = 5000; // room for search queries + a reply + up to two full cards (the worker has 90 s)
+const REPLY_MAX_TOKENS = 8000; // room for search queries + a reply + up to two full cards (~2 500 tokens each); the budget below, not this, bounds the time
 const REPLY_MAX_CHARS = 2000;  // the reply as stored / shown; a runaway reply is cut, not refused
 /** What the app shows when the reply failed; the provider's wording (which can name the model) only goes to the log. */
 export const REPLY_FAILED = "這次分析沒成功，再試一次";
