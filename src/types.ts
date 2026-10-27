@@ -182,29 +182,71 @@ export interface WeeklyReviewRow {
   update_reason: string | null;
 }
 
-/** A chat proposal card (table proposals). items/basis/flags are jsonb. */
+/** A proposal card (table proposals; Woo's chat reply or his weekly review). items/weeks/basis/flags/impact/option are jsonb. */
 export interface ProposalRow {
   id: string;
   user_id: string;
   source: "weekly" | "chat";
   message_id: string | null;
   items: ProposalItem[];
+  weeks: ProposalWeek[];
   why: string | null;
   basis: string[];
-  flags: string[];
-  status: "pending" | "applied" | "dismissed";
+  basis_text: string | null; // null on cards from before coach-replan
+  impact: ProposalImpact | null;
+  flags: string[];           // card level: what could not be hung on one row
+  group_id: string | null;
+  option: ProposalOption | null;
+  status: "pending" | "applied" | "dismissed" | "superseded" | "stale";
+  stale_reason: string | null;
   created_at: Date;
   decided_at: Date | null;
 }
 
+export type ProposalOp = "change" | "add" | "remove";
+
+/** A session Woo wants to add (op = add). */
+export interface NewSession {
+  scheduled_date: string; // 'YYYY-MM-DD'
+  type: Exclude<SessionType, "race">;
+  label: string;
+  target_distance_m: number | null;
+  target_pace_sec_km: number | null;
+  note: string | null;
+}
+
+/** One row of a card. `op` missing = change (cards written before coach-replan). */
 export interface ProposalItem {
-  session_id: string;
-  field: ProposalField;
+  op?: ProposalOp;
+  session_id: string | null; // null for add
+  field?: ProposalField;     // change only
   old: string | number | null;
   new: string | number | null;
   label: string | null;
   date: string | null;
+  new_session?: NewSession;  // add only
+  reason?: string | null;
+  flags?: string[];          // computed by the api, hung on this row
   applied_session_id?: string;
+}
+
+export interface ProposalWeek { week_no: number; phase: string | null; focus: string | null }
+export interface ProposalImpact { keep: string; change: string; risk: string }
+export interface ProposalOption { letter: "A" | "B"; title: string; recommended: boolean }
+
+/** A constraint the athlete told Woo about (table constraints). Dates are 'YYYY-MM-DD'. */
+export interface ConstraintRow {
+  id: string;
+  user_id: string;
+  text: string;
+  start_date: string | null;
+  end_date: string | null;
+  kind: "period" | "fixed_day" | "note";
+  weekday: number | null; // fixed_day: 0 = Sunday … 6 = Saturday
+  source_message_id: string | null;
+  status: "proposed" | "active" | "dismissed";
+  created_at: Date;
+  decided_at: Date | null;
 }
 
 /**
@@ -297,9 +339,38 @@ export interface WeeklyAdjustment {
   reason: string;
 }
 
+/** What the model returns for a card, before the api validates it (see lib/proposals.ts validateCards). */
+export interface RawCard {
+  changes: {
+    op?: string;
+    session_id?: string | null;
+    field?: string | null;
+    old?: string | number | null;
+    new?: string | number | null;
+    new_session?: Partial<NewSession> | null;
+    reason?: string | null;
+  }[];
+  weeks?: { week_no?: number; phase?: string | null; focus?: string | null }[];
+  why?: string;
+  basis?: string[];
+  basis_text?: string;
+  impact?: Partial<ProposalImpact>;
+  option_title?: string | null;
+  recommended?: boolean;
+}
+
+/** What the model returns for a "記下來" card, before the api validates it. */
+export interface RawConstraint {
+  text?: string;
+  start_date?: string | null;
+  end_date?: string | null;
+  kind?: string;
+  weekday?: number | null;
+}
+
 export interface WeeklyReviewResult {
   summary: string;
-  adjustments: WeeklyAdjustment[];
+  proposals: RawCard[];
 }
 
 /** What weekly_reviews.adjustments holds: the proposals plus what the athlete did with each. */
@@ -320,6 +391,10 @@ export interface StoredAdjustments {
 export interface WeeklyMessageMeta {
   week_start: string;
   proposals: number;
+  /** The cards of this review (proposals.id), applied ones first; the thread shows these. */
+  proposal_ids?: string[];
+  /** The model's cards failed the format check: none were stored. */
+  proposal_rejected?: boolean;
   asks?: { session_id: string; label: string; date: string; state: "open" | "synced" | "skipped" }[];
   updated?: { at: string; reason: string };
   cancelled?: string[];
