@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { coachModel } from "./claude";
+import { anthropicClient, coachModel } from "./claude";
 import { COACH_NAME, postCoachMessage } from "./coach";
 import { query, queryOne } from "./db";
 import { isRunSport, sessionLabel, shortDate, sportName } from "./labels";
@@ -248,7 +248,7 @@ export async function askAboutActivity(userId: string, pickMessageId: string): P
       `活動：${activityLabel(activity)}${activity.avg_hr != null ? `，平均心拍 ${activity.avg_hr}` : ""}${activity.max_hr != null ? `，最高 ${activity.max_hr}` : ""}`,
       splits ? `每公里：\n${splits}` : "",
     ].filter(Boolean).join("\n");
-    const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    const client = anthropicClient();
     const res = await client.messages.create({
       model: coachModel(), max_tokens: 300, system: ASK_SYSTEM,
       output_config: { effort: "low" as const },

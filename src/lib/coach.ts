@@ -2,7 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { randomUUID } from "node:crypto";
 import { buildPlanBriefing, loadPlanBriefing, type Plan, type PlanBriefing } from "./briefing";
 import { CARD_SCHEMA, CONSTRAINT_SCHEMA, PROPOSAL_RULES } from "./card-schema";
-import { adjustmentLine, appNotes, coachModel } from "./claude";
+import { adjustmentLine, anthropicClient, appNotes, coachModel } from "./claude";
 import { validateConstraint } from "./constraints";
 import { type Querier, query, queryOne, withTransaction } from "./db";
 import { describeCard, describeItem, validateCards } from "./proposals"; // cycle with proposals.ts (postCoachMessage): both only used inside functions
@@ -220,7 +220,7 @@ export async function answerCoachMessage(userId: string, messageId: string, toda
   try {
     const ctx = await loadCoachContext(userId, today, msgMeta.re_propose);
     const system = coachSystem(ctx, today, quote);
-    const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    const client = anthropicClient(150_000);
     const messages = await threadFor(userId, msg);
     const tools = [{
       type: "web_search_20260209" as const,

@@ -50,13 +50,19 @@ export class TrainingApiStack extends cdk.Stack {
       .split(",").map((s) => s.trim()).filter(Boolean);
 
     // ---- queue ----------------------------------------------------------------
+    // Every retry in this stack has a written ceiling (see work/coach-replan/03-實作-api.md,
+    // 「重試上限一覽」): a message is delivered at most 3 times, then parked in the DLQ for
+    // 14 days and expires. Nothing consumes the DLQ and nothing redrives it into the main
+    // queue — a message there stays until someone looks at it by hand.
     const dlq = new sqs.Queue(this, "ActivitiesDlq", {
       queueName: name("activities-dlq"),
       retentionPeriod: cdk.Duration.days(14),
     });
     const queue = new sqs.Queue(this, "ActivitiesQueue", {
       queueName: name("activities"),
-      visibilityTimeout: cdk.Duration.seconds(90),
+      // Must be longer than the worker's timeout (180 s): a reply that is still being written
+      // must not become visible again and get answered twice.
+      visibilityTimeout: cdk.Duration.seconds(200),
       retentionPeriod: cdk.Duration.days(4),
       deadLetterQueue: { queue: dlq, maxReceiveCount: 3 },
     });
@@ -96,7 +102,10 @@ export class TrainingApiStack extends cdk.Stack {
       });
     };
 
+    // The three HTTP-facing functions are invoked synchronously (API Gateway); Lambda does not
+    // retry those, and retryAttempts: 0 says so (it only concerns async invokes, which they never get).
     const webhook = fn("webhook", {
+      retryAttempts: 0,
       environment: {
         STRAVA_VERIFY_TOKEN: required("STRAVA_VERIFY_TOKEN"),
         QUEUE_URL: queue.queueUrl,
@@ -107,24 +116,37 @@ export class TrainingApiStack extends cdk.Stack {
     // Two plans × (weekly model call + briefs model call) does not fit in 60 s; a
     // timeout would make the Scheduler retry and regenerate reviews it just wrote.
     // Besides the Monday schedule it is invoked asynchronously (`{ rerun }`) by the api
-    // and the worker to regenerate one review in place; Lambda's default async retry
-    // (2 attempts) is kept — a retry after the rerun happened is a no-op in the handler.
-    const weekly = fn("weekly", { timeout: cdk.Duration.minutes(5), environment: claudeEnv });
+    // and the worker to regenerate one review in place. Async retries are written out, not
+    // left to Lambda's defaults: 2 retries (3 runs at most) and an event is dropped after
+    // 1 hour, throttled or not; a retry after the rerun happened is a no-op in the handler.
+    // At most 2 runs at once: every run is a model call plus an open transaction.
+    const weekly = fn("weekly", {
+      timeout: cdk.Duration.minutes(5),
+      environment: claudeEnv,
+      retryAttempts: 2,
+      maxEventAge: cdk.Duration.hours(1),
+      reservedConcurrentExecutions: 2,
+    });
 
+    // 180 s: a chat reply with two full cards plus up to three web searches does not fit in 90 s.
     const worker = fn("worker", {
-      timeout: cdk.Duration.seconds(90),
+      timeout: cdk.Duration.seconds(180),
       environment: { ...stravaEnv, ...claudeEnv, AUTO_REVIEW: process.env.AUTO_REVIEW ?? "true", WEEKLY_FUNCTION_NAME: weekly.functionName },
       reservedConcurrentExecutions: 2,
     });
-    worker.addEventSource(new SqsEventSource(queue, { batchSize: 1 }));
+    // maxConcurrency matches the reserved concurrency (2): without it the poller keeps handing
+    // messages to a function that is full, they get throttled and every throttle counts as a
+    // receive towards the DLQ's maxReceiveCount.
+    worker.addEventSource(new SqsEventSource(queue, { batchSize: 1, maxConcurrency: 2 }));
     weekly.grantInvoke(worker); // a late activity: regenerate the week's review there, not in the worker's 90 s
 
-    const oauth = fn("oauth", { environment: stravaEnv });
+    const oauth = fn("oauth", { environment: stravaEnv, retryAttempts: 0 });
 
     // training-api-prod, same name as the HTTP API. HTTP API cuts requests at
     // 30 s, so give up on a cold Aurora at 20 s and answer 503 instead.
     const api = fn("api", {
       functionName: name(),
+      retryAttempts: 0,
       environment: {
         QUEUE_URL: queue.queueUrl,
         WEEKLY_FUNCTION_NAME: weekly.functionName,
@@ -143,7 +165,14 @@ export class TrainingApiStack extends cdk.Stack {
         weekDay: "MON",
         timeZone: cdk.TimeZone.ASIA_TOKYO,
       }),
-      target: new LambdaInvoke(weekly, { input: scheduler.ScheduleTargetInput.fromObject({}) }),
+      // The Scheduler's own retry policy (default: 185 attempts over 24 h) is cut to 3 attempts
+      // within an hour. It covers failures to deliver the invoke; the function failing after
+      // it started is Lambda's async retry above (2 more runs, each skipping weeks already reviewed).
+      target: new LambdaInvoke(weekly, {
+        input: scheduler.ScheduleTargetInput.fromObject({}),
+        retryAttempts: 3,
+        maxEventAge: cdk.Duration.hours(1),
+      }),
     });
 
     // ---- Cognito: closed user pool (admin creates the two users) -------------
