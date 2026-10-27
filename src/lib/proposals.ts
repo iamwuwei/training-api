@@ -269,8 +269,9 @@ function validateCard(b: PlanBriefing, raw: RawCard, today: string): CardDraft |
     const reason = text(c.reason);
     if (reason.length > LIMITS.reason) return `reason longer than ${LIMITS.reason}`;
 
-    // field is "" (none) unless op = change; the schema's enum has "" for that, a stray null reads the same.
-    if (op !== "change" && c.field != null && c.field !== "") return `${op} must not have a field (got ${String(c.field)})`;
+    // field is "" (none) unless op = change. Structured output must pick one enum value, so the model may well put
+    // one on an add / remove; it means nothing there (both branches below never read it): ignored, not a reason to drop the card.
+    if (op !== "change" && c.field != null && c.field !== "") console.warn(`${op} came with field ${JSON.stringify(c.field)}, ignored`);
 
     if (op === "add") {
       const ns = c.new_session;
