@@ -843,7 +843,7 @@ function proposalIds(meta: Record<string, unknown>): string[] {
 
 function toApiCoachMessage(m: CoachMessageRow, cards?: Cards): ApiCoachMessage {
   const meta = (m.meta ?? {}) as Record<string, unknown>;
-  const proposals = proposalIds(meta).map((id) => cards?.proposals.get(id)).filter((p): p is ProposalRow => !!p).map(toApiProposal);
+  const proposal = proposalIds(meta).map((id) => cards?.proposals.get(id)).find((p): p is ProposalRow => !!p);
   const constraint = typeof meta.constraint_id === "string" ? cards?.constraints.get(meta.constraint_id) : undefined;
   return {
     id: m.id,
@@ -870,8 +870,7 @@ function toApiCoachMessage(m: CoachMessageRow, cards?: Cards): ApiCoachMessage {
         }
       : null,
     weekly: m.kind === "weekly" ? toApiWeeklyMeta(meta as unknown as Partial<WeeklyMessageMeta>) : null,
-    proposal: proposals[0] ?? null,
-    proposals,
+    proposal: proposal ? toApiProposal(proposal) : null,
     constraint: constraint ? toApiConstraint(constraint) : null,
     proposal_rejected: meta.proposal_rejected === true,
     // Rows written before the worker stored the fixed line still hold the provider's wording: never shown.

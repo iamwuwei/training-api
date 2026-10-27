@@ -391,7 +391,7 @@ export interface StoredAdjustments {
 export interface WeeklyMessageMeta {
   week_start: string;
   proposals: number;
-  /** The cards of this review (proposals.id), applied ones first; the thread shows these. */
+  /** The card this message carries (proposals.id; one). */
   proposal_ids?: string[];
   /** The model's cards failed the format check: none were stored. */
   proposal_rejected?: boolean;

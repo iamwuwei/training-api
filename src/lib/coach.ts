@@ -292,21 +292,29 @@ export async function answerCoachMessage(userId: string, messageId: string, toda
         );
         if (!dup.length) constraintId = randomUUID();
       }
-      if (drafts.length) {
-        meta.proposal_ids = drafts.map((d) => d.id);
-        meta.proposal_text = drafts.map((d) => `${d.option ? `${d.option.letter}：${d.option.title}（` : ""}${d.items.slice(0, 6).map(describeItem).join("、")}${d.items.length > 6 ? ` 等共 ${d.items.length} 項` : ""}${d.option ? "）" : ""}`).join(" ／ ");
+      // One message per card: an A/B pair is two consecutive coach messages (the second with an empty
+      // text, drawn as one reply), each carrying its card; the constraint rides on the first.
+      const cardText = (d: (typeof drafts)[number]) => `${d.option ? `${d.option.letter}：${d.option.title}（` : ""}${d.items.slice(0, 6).map(describeItem).join("、")}${d.items.length > 6 ? ` 等共 ${d.items.length} 項` : ""}${d.option ? "）" : ""}`;
+      if (drafts[0]) {
+        meta.proposal_ids = [drafts[0].id];
+        meta.proposal_text = cardText(drafts[0]);
       }
       if (constraintId && constraint) {
         meta.constraint_id = constraintId;
         meta.constraint_text = constraint.text;
       }
+      const insertCard = (d: (typeof drafts)[number], messageId: string) => q(
+        `insert into proposals (id, user_id, source, message_id, items, weeks, why, basis, basis_text, impact, flags, group_id, option, status)
+         values ($1, $2, 'chat', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending')`,
+        [d.id, userId, messageId, JSON.stringify(d.items), JSON.stringify(d.weeks), d.why, JSON.stringify(d.basis), d.basis_text, JSON.stringify(d.impact), JSON.stringify(d.flags), d.group_id, d.option ? JSON.stringify(d.option) : null],
+      );
       const reply = await postCoachMessage({ user_id: userId, role: "coach", kind: "chat", text: out.text, meta }, q);
-      for (const d of drafts) {
-        await q(
-          `insert into proposals (id, user_id, source, message_id, items, weeks, why, basis, basis_text, impact, flags, group_id, option, status)
-           values ($1, $2, 'chat', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending')`,
-          [d.id, userId, reply.id, JSON.stringify(d.items), JSON.stringify(d.weeks), d.why, JSON.stringify(d.basis), d.basis_text, JSON.stringify(d.impact), JSON.stringify(d.flags), d.group_id, d.option ? JSON.stringify(d.option) : null],
-        );
+      if (drafts[0]) await insertCard(drafts[0], reply.id);
+      if (drafts[1]) {
+        const second = await postCoachMessage({ user_id: userId, role: "coach", kind: "chat", text: "", meta: { proposal_ids: [drafts[1].id], proposal_text: cardText(drafts[1]) } }, q);
+        // Same transaction = same now(): keep the order of the two explicit.
+        await q("update coach_messages set created_at = $2::timestamptz + interval '1 millisecond' where id = $1", [second.id, reply.created_at]);
+        await insertCard(drafts[1], second.id);
       }
       if (constraintId && constraint) {
         await q(

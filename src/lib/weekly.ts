@@ -251,7 +251,7 @@ async function generate(
   let drafts: CardDraft[] = [];
   let rejected = false;
   if (review.proposals.length) {
-    const checked = validateCards(scope, review.proposals, today);
+    const checked = validateCards(scope, review.proposals, today, 1);
     if (typeof checked === "string") {
       console.warn(`weekly review for plan ${plan.id} week ${weekStart}: proposals dropped (${checked})`);
       rejected = true;
@@ -319,7 +319,8 @@ async function generate(
     ...carried,
     week_start: weekStart,
     proposals: drafts.length,
-    ...(keptCardIds.length || drafts.length ? { proposal_ids: [...keptCardIds, ...drafts.map((d) => d.id)] } : {}),
+    // The message carries one card: the new one, else the latest applied one (a fact; its text is already in the new summary).
+    ...(drafts.length || keptCardIds.length ? { proposal_ids: drafts.length ? drafts.map((d) => d.id) : keptCardIds.slice(-1) } : {}),
     ...(rejected ? { proposal_rejected: true } : {}),
     asks: metaAsks(askStateOf(latestMessage)),
     updated: { at: now, reason: reason ?? "" },

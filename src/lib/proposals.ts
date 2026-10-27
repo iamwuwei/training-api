@@ -188,15 +188,15 @@ export function touchedWeekNos(weeks: PlanWeekRow[], items: ProposalItem[]): Set
 }
 
 /**
- * The model's 1–2 cards (one, or an A/B pair) checked against the plan. A string says
+ * The model's 1–2 cards (one, or an A/B pair; a weekly review passes `maxCards` 1) checked against the plan. A string says
  * why the whole reply's cards are dropped (the text is kept either way). Everything the
  * design lists is checked here: basis_text and impact present, add / remove with a
  * reason, weeks only for weeks the changes touch, every session in the athlete's own
  * plan and still changeable, dates from today to the day before the race, nothing on
  * the race day, no move off a day the athlete said is fixed, and the length limits.
  */
-export function validateCards(b: PlanBriefing, raws: RawCard[], today: string): CardDraft[] | string {
-  if (!Array.isArray(raws) || raws.length < 1 || raws.length > 2) return `expected 1 or 2 cards, got ${Array.isArray(raws) ? raws.length : "none"}`;
+export function validateCards(b: PlanBriefing, raws: RawCard[], today: string, maxCards = 2): CardDraft[] | string {
+  if (!Array.isArray(raws) || raws.length < 1 || raws.length > maxCards) return `expected 1 to ${maxCards} cards, got ${Array.isArray(raws) ? raws.length : "none"}`;
   const drafts: CardDraft[] = [];
   for (const [i, raw] of raws.entries()) {
     const d = validateCard(b, raw, today);

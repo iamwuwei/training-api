@@ -374,16 +374,13 @@ export interface ApiCoachMessage {
   /** kind weekly: the review's open questions, the "updated" line and the cancelled proposals. */
   weekly: ApiWeeklyMeta | null;
   /**
-   * The first proposal card attached to this message (a coach chat reply, or a weekly review):
-   * `proposals[0]`, kept so older clients keep working. See POST /proposals/{id}/apply.
+   * The proposal card attached to this message (a coach chat reply, or a weekly review). An A/B
+   * pair is two consecutive coach messages, each with its own card (same `group_id`, `option.letter`
+   * A then B); the second one's `text` is "" — draw the pair as one reply. New weekly reviews carry
+   * their card here too (their `adjustments` are empty; reviews from before keep theirs in GET /weekly).
+   * See POST /proposals/{id}/apply.
    */
   proposal: ApiProposal | null;
-  /**
-   * Every card of this message, in display order: none, one, or an A/B pair (same `group_id`,
-   * `option.letter` A then B). A weekly message carries its cards here too (new reviews have no
-   * `adjustments`; reviews from before keep theirs in GET /weekly).
-   */
-  proposals: ApiProposal[];
   /**
    * Woo's "記下來：…" card for this message (a constraint with status `proposed`; the athlete
    * accepts or dismisses it separately from the proposal cards), or null. After the decision
@@ -391,9 +388,9 @@ export interface ApiCoachMessage {
    */
   constraint: ApiConstraint | null;
   /**
-   * The model's cards failed the api's format check (empty basis / impact, an add or remove
-   * without a reason, a date out of range, ...) and none were stored: show one grey line
-   * "Woo 的提案沒過格式檢查，再問他一次". The reply text itself is fine.
+   * Woo 的提案沒過格式檢查: his cards failed the api's check (empty basis / impact, an add or remove
+   * without a reason, a date out of range, ...) and none were stored. Show one grey line
+   * "Woo 的提案沒過格式檢查，再問他一次"; the reply text itself is fine.
    */
   proposal_rejected: boolean;
   error: string | null;              // failed: a fixed line to show (the provider's wording stays in the logs)
