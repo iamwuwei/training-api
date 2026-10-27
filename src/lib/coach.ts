@@ -16,7 +16,7 @@ import type { CoachMessageRow, ProposalRow, RawCard, RawConstraint, StoredAdjust
 
 export const COACH_NAME = "Woo";
 export const MAX_MESSAGE_CHARS = 500;
-const REPLY_MAX_TOKENS = 8000; // room for search queries + a reply + up to two full cards (~2 500 tokens each); the budget below, not this, bounds the time
+const REPLY_MAX_TOKENS = 16000; // thinking counts in: thinking (a few thousand) + search queries + a reply + up to two full cards (~2 500 tokens each) did not fit in 8000; the 165 s budget below, not this, bounds the time
 const REPLY_MAX_CHARS = 2000;  // the reply as stored / shown; a runaway reply is cut, not refused
 /** What the app shows when the reply failed; the provider's wording (which can name the model) only goes to the log. */
 export const REPLY_FAILED = "這次分析沒成功，再試一次";
@@ -212,7 +212,7 @@ async function threadFor(userId: string, upTo: CoachMessageRow): Promise<Anthrop
 }
 
 /** The plain-text form's description of the JSON object (when the API refuses the schema next to web_search). */
-const PLAIN_FORMAT = `回覆格式：先寫回覆文字，最後另起一段只放一個 JSON 物件 {"proposals": [...], "constraint": ...}。沒有的字串欄位（reason、note、phase、focus、option_title）給空字串 ""。proposals 是 0〜2 張卡，每張 {"changes":[{"op":"change|add|remove","session_id":string|null,"field":string|null,"old":...,"new":...,"new_session":{"scheduled_date","type","label","target_distance_m","target_pace_sec_km","note"}|null,"reason":string}],"weeks":[{"week_no","phase","focus"}],"why","basis":[...],"basis_text","impact":{"keep","change","risk"},"option_title":string,"recommended":boolean}；constraint 是 {"text","start_date","end_date","kind","weekday"} 或 null。沒有卡就是 []。`;
+const PLAIN_FORMAT = `回覆格式：先寫回覆文字，最後另起一段只放一個 JSON 物件 {"proposals": [...], "constraint": ...}。沒有的字串欄位（field、reason、note、phase、focus、option_title）給空字串 ""。proposals 是 0〜2 張卡，每張 {"changes":[{"op":"change|add|remove","session_id":string|null,"field":string（add／remove 給 ""）,"old":...,"new":...,"new_session":{"scheduled_date","type","label","target_distance_m","target_pace_sec_km","note"}|null,"reason":string}],"weeks":[{"week_no","phase","focus"}],"why","basis":[...],"basis_text","impact":{"keep","change","risk"},"option_title":string,"recommended":boolean}；constraint 是 {"text","start_date","end_date","kind","weekday"} 或 null。沒有卡就是 []。`;
 
 /**
  * Answer one pending athlete message. Writes the coach's reply (or marks the
@@ -231,10 +231,13 @@ export async function answerCoachMessage(userId: string, messageId: string, toda
     const system = coachSystem(ctx, today, quote);
     const client = anthropicClient(CHAT_BUDGET_MS);
     // Every request: no SDK retry, and a timeout of what is left of the shared budget.
-    const send = (params: Anthropic.MessageCreateParamsNonStreaming) => {
+    let outputTokens = 0; // over every request of this reply, for meta
+    const send = async (params: Anthropic.MessageCreateParamsNonStreaming) => {
       const left = deadline - Date.now();
       if (left < CHAT_MIN_REQUEST_MS) throw new Error(`out of time for another request (${Math.round(left / 1000)} s left of ${CHAT_BUDGET_MS / 1000} s)`);
-      return client.messages.create(params, { timeout: left, maxRetries: 0 });
+      const r = await client.messages.create(params, { timeout: left, maxRetries: 0 });
+      outputTokens += r.usage?.output_tokens ?? 0;
+      return r;
     };
     const messages = await threadFor(userId, msg);
     const tools = [{
@@ -251,14 +254,17 @@ export async function answerCoachMessage(userId: string, messageId: string, toda
     const plain = { model: coachModel(), max_tokens: REPLY_MAX_TOKENS, system: [...system, { type: "text" as const, text: PLAIN_FORMAT }], tools, output_config: { effort: "medium" as const } };
     let request: typeof structured | typeof plain = formatRejected ? plain : structured;
     let res: Anthropic.Message;
+    let structuredError: string | null = null; // the 400 that sent this reply to the plain form (meta)
     try {
       res = await send({ ...request, messages });
     } catch (err) {
       if (request === plain || !isFormatRejected(err)) throw err;
-      formatRejected = true;
-      console.warn("structured output rejected (400), retrying as text + JSON:", (err as InstanceType<typeof Anthropic.APIError>).message);
+      const detail = (err as InstanceType<typeof Anthropic.APIError>).message;
+      console.warn("structured output rejected (400), retrying as text + JSON:", detail);
+      structuredError = withoutRequestId(detail);
       request = plain;
       res = await send({ ...request, messages });
+      formatRejected = true; // only once the plain request went through: a 400 that was not about the format must not turn structured output off
     }
     // The server-side search loop can pause; resend with the partial turn appended to resume.
     for (let i = 0; res.stop_reason === "pause_turn" && i < MAX_PAUSE_RESUMES; i++) {
@@ -277,7 +283,15 @@ export async function answerCoachMessage(userId: string, messageId: string, toda
       out.text = `${out.text.slice(0, REPLY_MAX_CHARS).trimEnd()}…`;
     }
 
-    const meta: Record<string, unknown> = { model: res.model, searches };
+    const meta: Record<string, unknown> = {
+      model: res.model, searches,
+      // Why a reply came without a card is read from here (select meta from coach_messages), not from CloudWatch.
+      reply_format: request === plain ? "plain" : "structured",
+      stop_reason: res.stop_reason,
+      output_tokens: outputTokens,
+      proposals_in_reply: out.proposals.length,
+      ...(structuredError ? { structured_error: structuredError } : {}),
+    };
     // The cards: all or nothing (an A/B pair with one half is worse than none). The text stays either way.
     let drafts: Exclude<ReturnType<typeof validateCards>, string> = [];
     if (out.proposals.length && ctx) {
@@ -287,6 +301,14 @@ export async function answerCoachMessage(userId: string, messageId: string, toda
         meta.proposal_rejected = true;
       } else drafts = checked;
     } else if (out.proposals.length) meta.proposal_rejected = true;
+    else {
+      // No card parsed. That is fine when Woo meant none; not when the reply points at a card that is not there.
+      const why = missingCardReason(out.text, res.stop_reason);
+      if (why) {
+        console.warn(`no card for message ${msg.id} (${meta.reply_format}, stop_reason ${res.stop_reason}): ${why}; raw tail: ${raw.slice(-300)}`);
+        meta.proposal_rejected = true;
+      }
+    }
     let constraint: ReturnType<typeof validateConstraint> | null = null;
     if (out.constraint && ctx) {
       const checked = validateConstraint(out.constraint, today);
@@ -350,7 +372,7 @@ export async function answerCoachMessage(userId: string, messageId: string, toda
   }
 }
 
-/** Remembered per container: once the API refused the schema + web_search combination, do not try it again. */
+/** Remembered per container: once the API refused the structured request and the plain one then went through, do not try structured again. */
 let formatRejected = false;
 
 /**
@@ -363,28 +385,80 @@ function isFormatRejected(err: unknown): boolean {
   return /schema|output_config|output_format|format|too complex|grammar/i.test(err.message);
 }
 
-/** A trailing ```json … ``` fence (the plain form often wraps its JSON in one) is opened. */
-const TRAILING_FENCE = /```(?:json)?[ \t]*\r?\n?([^`]*?)\s*```\s*$/;
+/** The API's error text without the request id (the id goes nowhere but the log). */
+function withoutRequestId(message: string): string {
+  return message.replace(/,?\s*"request_id"\s*:\s*"[^"]*"/g, "").replace(/\breq_[A-Za-z0-9]+/g, "").slice(0, 600);
+}
 
 /**
- * The reply as {text, proposals, constraint}: the whole text is the JSON object
- * (structured output), or prose followed by one JSON object (the fallback, fenced or
- * not), or plain prose. A singular `proposal` (the shape before coach-replan) is read as one card.
+ * Why a reply that parsed to no card should still be flagged (proposal_rejected: the app says the card did
+ * not make it), or null when "no card" is believable. `text` is what is left of the reply after the JSON
+ * was taken out; stop_reason is the last request's.
+ */
+export function missingCardReason(text: string, stopReason: string | null): string | null {
+  if (text.includes("{") || text.includes("```")) return "reply still holds a { or a code fence (JSON that did not parse)";
+  if (stopReason === "max_tokens") return "stop_reason max_tokens (cut off before the card)";
+  if (/卡片|提案|採用整張/.test(text)) return "reply talks about a card but none came with it";
+  return null;
+}
+
+type Loose = { text?: unknown; proposals?: unknown; proposal?: unknown; constraint?: unknown };
+const asJson = (s: string): Loose | null => {
+  try { const v = JSON.parse(s); return v && typeof v === "object" && !Array.isArray(v) ? v as Loose : null; } catch { return null; }
+};
+/** The reply's own JSON, not some object inside it (a card's impact, the constraint): it has proposals / proposal / constraint. */
+const isReplyJson = (v: Loose | null): boolean => !!v && ("proposals" in v || "proposal" in v || "constraint" in v);
+
+/** Every top-level balanced {...} block of `s` (braces inside strings do not count; an unbalanced { is skipped). */
+function balancedBlocks(s: string): { start: number; end: number }[] {
+  const blocks: { start: number; end: number }[] = [];
+  let from = 0;
+  while (from < s.length) {
+    const start = s.indexOf("{", from);
+    if (start < 0) break;
+    let depth = 0, inStr = false, esc = false, end = -1;
+    for (let i = start; i < s.length; i++) {
+      const ch = s[i];
+      if (inStr) { if (esc) esc = false; else if (ch === "\\") esc = true; else if (ch === '"') inStr = false; continue; }
+      if (ch === '"') inStr = true;
+      else if (ch === "{") depth++;
+      else if (ch === "}" && --depth === 0) { end = i; break; }
+    }
+    if (end < 0) { from = start + 1; continue; }
+    blocks.push({ start, end: end + 1 });
+    from = end + 1;
+  }
+  return blocks;
+}
+
+/**
+ * The reply as {text, proposals, constraint}. Never throws; what it cannot read comes back as prose
+ * with no cards (the caller flags that, see missingCardReason). In the order tried:
+ *  1. the whole text is the JSON object (structured output);
+ *  2. a ``` fence anywhere in the text holds the reply's JSON (the last such fence wins), the rest is the prose;
+ *  3. the last balanced {...} block anywhere in the text that is the reply's JSON, the rest is the prose.
+ * A singular `proposal` (the shape before coach-replan) is read as one card.
  */
 export function parseReply(raw: string): ReplyOutput {
-  type Loose = { text?: unknown; proposals?: unknown; proposal?: unknown; constraint?: unknown };
-  const asJson = (s: string): Loose | null => {
-    try { const v = JSON.parse(s); return v && typeof v === "object" ? v as Loose : null; } catch { return null; }
-  };
   const cards = (v: Loose): RawCard[] => (Array.isArray(v.proposals) ? v.proposals : v.proposal && typeof v.proposal === "object" ? [v.proposal] : []).filter((c): c is RawCard => !!c && typeof c === "object");
   const constraint = (v: Loose): RawConstraint | null => (v.constraint && typeof v.constraint === "object" ? v.constraint as RawConstraint : null);
-  const text = raw.replace(TRAILING_FENCE, "$1").trimEnd();
-  const whole = asJson(text);
+  const trimmed = raw.trim();
+  const join = (before: string, after: string) => [before.trim(), after.trim()].filter(Boolean).join("\n\n");
+  const result = (v: Loose, prose: string): ReplyOutput => ({ text: prose || (typeof v.text === "string" ? v.text.trim() : ""), proposals: cards(v), constraint: constraint(v) });
+
+  const whole = asJson(trimmed);
   if (whole && typeof whole.text === "string") return { text: whole.text.trim(), proposals: cards(whole), constraint: constraint(whole) };
-  const start = text.lastIndexOf("\n{");
-  if (start >= 0 && text.endsWith("}")) {
-    const tail = asJson(text.slice(start + 1).trim());
-    if (tail) return { text: text.slice(0, start).trim(), proposals: cards(tail), constraint: constraint(tail) };
+
+  const fences = [...trimmed.matchAll(/```[ \t]*[A-Za-z]*[ \t]*\r?\n?([\s\S]*?)```/g)];
+  for (const f of fences.reverse()) {
+    const body = f[1].trim();
+    const v = asJson(body) ?? (() => { const b = balancedBlocks(body).pop(); return b ? asJson(body.slice(b.start, b.end)) : null; })();
+    if (v && (isReplyJson(v) || typeof v.text === "string")) return result(v, join(trimmed.slice(0, f.index), trimmed.slice((f.index ?? 0) + f[0].length)));
+  }
+
+  for (const b of balancedBlocks(trimmed).reverse()) {
+    const v = asJson(trimmed.slice(b.start, b.end));
+    if (v && isReplyJson(v)) return result(v, join(trimmed.slice(0, b.start), trimmed.slice(b.end)));
   }
   return { text: raw, proposals: [], constraint: null };
 }
