@@ -4,12 +4,12 @@ import { writeBriefs } from "./briefs";
 import { adjustmentLine, weeklyReview } from "./claude";
 import { buildPlanBriefing, loadPlanBriefing } from "./briefing";
 import { postCoachMessage } from "./coach";
-import { historyBetween } from "./context";
+import { historyBetween, loadPlanWeeks } from "./context";
 import { type Querier, query, queryOne, withTransaction } from "./db";
 import { sessionLabel, shortDate, sportName } from "./labels";
 import { type CoachStage, clearReviewStage, stageWriterByReview } from "./stage";
 import { type CardDraft, describeCard, describeChange, validateCards } from "./proposals";
-import type { CoachMessageRow, PlanRow, PlannedSessionRow, ProposalRow, StoredAdjustment, StoredAdjustments, WeeklyMessageMeta, WeeklyRerunRequest, WeeklyReviewRow } from "../types";
+import type { CoachMessageRow, PlanRow, PlannedSessionRow, ProposalRow, SessionType, StoredAdjustment, StoredAdjustments, WeeklyMessageMeta, WeeklyRerunRequest, WeeklyReviewRow } from "../types";
 
 // The weekly review, written once by the scheduler (Monday 04:00 JST) and rewritten
 // in place when the week's data changes afterwards: an activity of that week arrives
@@ -36,8 +36,18 @@ export const WEEKLY_REVIEW_SELECT = `select id, plan_id, to_char(week_start, 'YY
 
 const addDays = (iso: string, n: number) => new Date(Date.parse(`${iso}T00:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10);
 const todayJst = () => new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+// The sessions booked in this week ($4 = its week_no): the ones on its calendar days that are not booked in another week,
+// plus the make-up sessions booked here wherever their date is. A make-up session booked elsewhere shows in that week's review.
 const SESSIONS_SELECT = `select *, to_char(scheduled_date, 'YYYY-MM-DD') as scheduled_date from planned_sessions
-  where plan_id = $1 and superseded = false and scheduled_date between $2 and $3 order by planned_sessions.scheduled_date`;
+  where plan_id = $1 and superseded = false
+    and ((scheduled_date between $2 and $3 and (counts_in_week_no is null or counts_in_week_no = $4::int)) or counts_in_week_no = $4::int)
+  order by planned_sessions.scheduled_date`;
+// The moved rows of this week's days (the make-up session is the new row): for the "booked in another week = not run" line.
+const MOVED_SELECT = `select ps.id, to_char(ps.scheduled_date, 'YYYY-MM-DD') as scheduled_date, ps.label, ps.type, ps.target_distance_m,
+         to_char(nw.scheduled_date, 'YYYY-MM-DD') as moved_to_date, nw.counts_in_week_no as moved_to_counts
+    from planned_sessions ps join planned_sessions nw on nw.id = ps.moved_to_session_id
+   where ps.plan_id = $1 and ps.superseded = true and ps.scheduled_date between $2 and $3 order by ps.scheduled_date`;
+const MOVED_FROM_SELECT = `select to_char(scheduled_date, 'YYYY-MM-DD') as scheduled_date from planned_sessions where id = $1`;
 const ACTIVITY_IDS_SELECT = `select id from activities where user_id = $1 and match_status <> 'ignored' and (start_time at time zone 'Asia/Tokyo')::date between $2 and $3`;
 
 export interface WeeklyRunResult {
@@ -219,7 +229,11 @@ async function generate(
   reason: string | undefined,
   stage?: (s: CoachStage) => Promise<void>,
 ): Promise<Generated> {
-  const sessions = await q<PlannedSessionRow>(SESSIONS_SELECT, [plan.id, weekStart, weekEnd]);
+  // The plan week this review week is: the one that has any day of it (plan_weeks are not all Monday to Sunday: the first can start
+  // on a Thursday, the last ones end early), the earliest when two do.
+  const thisWeekNo = (await loadPlanWeeks(plan.id)).find((w) => w.week_end >= weekStart && w.week_start <= weekEnd)?.week_no ?? null;
+  const sessions = await q<PlannedSessionRow>(SESSIONS_SELECT, [plan.id, weekStart, weekEnd, thisWeekNo]);
+  const movedRows = await q<{ id: string; scheduled_date: string; label: string | null; type: SessionType; target_distance_m: number | null; moved_to_date: string; moved_to_counts: number | null }>(MOVED_SELECT, [plan.id, weekStart, weekEnd]);
   const activities = await historyBetween(plan.user_id, weekStart, weekEnd);
   const activityIds = (await q<{ id: string }>(ACTIVITY_IDS_SELECT, [plan.user_id, weekStart, weekEnd])).map((r) => r.id);
   const hints = (await q<{ adjust_hint: string }>(
@@ -248,7 +262,8 @@ async function generate(
   const oldAskState = askStateOf(message);
   const skipped = sessions.filter((s) => s.skipped_at);
   const asks = sessions
-    .filter((s) => s.type !== "rest" && KEY_SESSION.test(s.label ?? "") && !done.has(s.id) && !s.skipped_at)
+    // A make-up booked in this week that is still ahead (its date is today or later) is waiting to be run, not missing.
+    .filter((s) => s.type !== "rest" && KEY_SESSION.test(s.label ?? "") && !done.has(s.id) && !s.skipped_at && s.scheduled_date < today)
     .map((s) => ({ session: s, state: oldAskState.get(s.id) === "synced" ? "synced" as const : "open" as const }));
 
   // Facts for the new text: what the athlete already applied from the earlier version (old-style proposals and cards).
@@ -261,11 +276,22 @@ async function generate(
     ...appliedCards.map(describeCard),
   ];
 
+  // 補課 of this week: make-up sessions booked here (any date), and this week's moved sessions whose make-up is booked in another week.
+  const booked: { from: string; to: string; label: string; countsHere: boolean; countsWeek: number | null; done: boolean }[] = [];
+  for (const s of sessions.filter((x) => x.moved_from_session_id)) {
+    const [from] = await q<{ scheduled_date: string }>(MOVED_FROM_SELECT, [s.moved_from_session_id]);
+    booked.push({ from: from?.scheduled_date ?? s.scheduled_date, to: s.scheduled_date, label: sessionLabel(s), countsHere: true, countsWeek: thisWeekNo, done: done.has(s.id) });
+  }
+  for (const m of movedRows.filter((x) => x.moved_to_counts != null && x.moved_to_counts !== thisWeekNo)) {
+    booked.push({ from: m.scheduled_date, to: m.moved_to_date, label: sessionLabel(m), countsHere: false, countsWeek: m.moved_to_counts, done: false });
+  }
+  const makeups = booked.filter((m) => m.countsHere).map(({ from, to, label, done: d }) => ({ from, to, label, done: d }));
+
   await stage?.("thinking");
   const review = await weeklyReview({
     plan, weeks, weekStart, weekEnd, briefing, sessions, activities, hints,
     previousSummary: previous?.summary ?? null,
-    asks, skipped, applied, updateReason: reason ?? null,
+    asks, skipped, applied, updateReason: reason ?? null, makeups: booked,
   });
 
   // The same checks as a chat card (range, race day, fixed days, basis / impact present, ...):
@@ -286,7 +312,7 @@ async function generate(
     const id = randomUUID();
     const toStore: StoredAdjustments = { model: review.model, hints, items: [], activities: activityIds };
     const meta: WeeklyMessageMeta = {
-      week_start: weekStart, proposals: drafts.length, asks: metaAsks(oldAskState),
+      week_start: weekStart, proposals: drafts.length, asks: metaAsks(oldAskState), makeups,
       ...(drafts.length ? { proposal_ids: drafts.map((d) => d.id) } : {}),
       ...(rejected ? { proposal_rejected: true } : {}),
     };
@@ -347,6 +373,7 @@ async function generate(
     ...(drafts.length || keptCardIds.length ? { proposal_ids: drafts.length ? drafts.map((d) => d.id) : keptCardIds.slice(-1) } : {}),
     ...(rejected ? { proposal_rejected: true } : {}),
     asks: metaAsks(askStateOf(latestMessage)),
+    makeups,
     updated: { at: now, reason: reason ?? "" },
     cancelled: [...(latestMeta.cancelled ?? []), ...cancelled],
   };

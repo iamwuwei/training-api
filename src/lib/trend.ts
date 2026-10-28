@@ -1,4 +1,5 @@
 import type { PlannedSessionRow, StravaSplit } from "../types";
+import { isStrength as isStrengthDay } from "./labels";
 import { type Band, fullSplits, focusStats, planFor, sessionBand } from "./splits";
 
 // The three trend numbers the today page shows under 進步 — aerobic pace at the same
@@ -36,10 +37,6 @@ const NAME_BY_LABEL: Record<string, string> = {
   快步: "快步", 走跑Easy: "走跑", 走跑Recovery: "走跑", 走跑Long: "走跑 Long", 走跑: "走跑", 比賽: "比賽", 休息: "休息", 完全休息: "完全休息", 肌力: "肌力",
 };
 const NAME_BY_TYPE: Record<string, string> = { easy: "Easy", long: "Long", tempo: "Tempo", interval: "Interval", race: "比賽", rest: "休息" };
-
-/** A strength day: typed 肌力 / Hyrox, or a rest day whose note opens with 肌力日. */
-const isStrengthDay = (s: Pick<TrendSession, "label" | "type" | "content" | "note">) =>
-  /肌力|重訓|Hyrox/i.test(`${s.label ?? ""} ${s.content ?? ""}`) || (s.type === "rest" && /^肌力/.test((s.note ?? "").trim()));
 
 /** The session's kind name: Easy / Recovery / Long / MP / 坡跑 … */
 export function kindName(s: Pick<TrendSession, "label" | "type" | "content" | "note">): string {

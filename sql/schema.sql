@@ -68,6 +68,16 @@ alter table planned_sessions add column if not exists brief text;               
 alter table planned_sessions add column if not exists skipped_at timestamptz;      -- the athlete said this session was not run (weekly review ask: 沒跑)
 create index if not exists planned_sessions_plan_id_scheduled_date_idx
   on planned_sessions (plan_id, scheduled_date);
+-- coach-adjust-2: 補課. A session that was not run and is moved to today or later keeps its old row as a "moved"
+-- history row (superseded = true, but GET /plan still returns it); moved_to_session_id points at the make-up row,
+-- which points back with moved_from_session_id.
+alter table planned_sessions add column if not exists moved_to_session_id uuid references planned_sessions(id);
+alter table planned_sessions add column if not exists moved_from_session_id uuid references planned_sessions(id);
+-- Which week (plan_weeks.week_no) a make-up row's planned km, count and activities are booked in, decided when the
+-- card is applied: the original week's review not written yet -> the original week; written -> the new date's week.
+-- null on every other row (= the calendar week). The date shown is always scheduled_date; statistics use this.
+alter table planned_sessions add column if not exists counts_in_week_no int;
+create index if not exists planned_sessions_moved_to_idx on planned_sessions (moved_to_session_id) where moved_to_session_id is not null;
 
 create table if not exists activities (
   id uuid primary key,

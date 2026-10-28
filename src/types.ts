@@ -63,6 +63,12 @@ export interface PlannedSessionRow {
   skipped_at: Date | null;
   version: number;
   superseded: boolean;
+  /** 補課: a superseded row whose session was moved forward from a past date; points at the make-up row (see sql/schema.sql). */
+  moved_to_session_id: string | null;
+  /** The make-up row: points back at the row it was moved from. */
+  moved_from_session_id: string | null;
+  /** The week_no a make-up row's numbers are booked in; null on every other row (= the calendar week). */
+  counts_in_week_no: number | null;
 }
 
 export interface ActivityRow {
@@ -233,6 +239,10 @@ export interface ProposalItem {
   reason?: string | null;
   flags?: string[];          // computed by the api, hung on this row
   applied_session_id?: string;
+  /** 補課: a date move of a session whose date was already past when the card was written (set by validateCard, not by the model). */
+  makeup?: boolean;
+  /** After apply, a make-up row: the week its numbers are booked in. */
+  counts_in_week_no?: number | null;
 }
 
 export interface ProposalWeek { week_no: number; phase: string | null; focus: string | null }
@@ -404,4 +414,6 @@ export interface WeeklyMessageMeta {
   updated?: { at: string; reason: string };
   cancelled?: string[];
   backfilled?: boolean;
+  /** Make-up sessions booked in this week when the review was written (coach-adjust-2). */
+  makeups?: { from: string; to: string; label: string; done: boolean }[];
 }

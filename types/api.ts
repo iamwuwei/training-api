@@ -78,6 +78,24 @@ export interface ApiSession {
   skipped_at: string | null;
   version: number;
   superseded: boolean;
+  /**
+   * coach-adjust-2 補課. This row is a "moved" history row (superseded = true, but still returned to the app): the session
+   * was not run and was moved by Woo's card to moved_to_date. Draw it as 已改期 → 10/28; it takes no activity and cannot be
+   * proposed again. null on every other row.
+   */
+  moved_to_session_id: string | null;
+  moved_to_date: string | null;        // 'YYYY-MM-DD'
+  /** This row is the make-up session: it was moved here from moved_from_date. Draw 補 10/27 的課. null otherwise. */
+  moved_from_session_id: string | null;
+  moved_from_date: string | null;      // 'YYYY-MM-DD'
+  /**
+   * The week (plan_weeks.week_no) this row's planned km, session count and attached activities are booked in; the date it is
+   * drawn on is always scheduled_date. A normal session: the week its date is in. A make-up session: decided when the card was
+   * applied (the original week's review not written yet -> the original week; written -> the new date's week). A moved row:
+   * its own week when its make-up session is booked in another week (counts as not run), null when the make-up session
+   * replaces it in the same week. null = not in any week's numbers.
+   */
+  counts_in_week_no: number | null;
 }
 
 export interface ApiSplit {
@@ -152,7 +170,7 @@ export interface PlanResponse {
   coach_ask_kind: "feel" | "mismatch" | null;
   plan: ApiPlan;
   weeks: ApiWeek[];
-  sessions: ApiSession[];    // not superseded, ordered by date
+  sessions: ApiSession[];    // not superseded, plus the moved rows (moved_to_session_id set); ordered by date
   activities: ApiActivity[]; // assigned to one of `sessions`, ordered by start_time
   /**
    * Strava activities (any sport) of the last 45 days that are not assigned to a
@@ -422,9 +440,11 @@ export interface ApiCoachMessage {
    */
   constraint: ApiConstraint | null;
   /**
-   * Woo 的提案沒過格式檢查: his cards failed the api's check (empty basis / impact, an add or remove
-   * without a reason, a date out of range, ...) and none were stored. Show one grey line
-   * "Woo 的提案沒過格式檢查，再問他一次"; the reply text itself is fine.
+   * Woo 的提案沒過格式檢查: this reply had a proposal that failed the api's check (empty basis / impact, an add or
+   * remove without a reason, a date out of range, a type that is not one of the five, ...). Either none was stored,
+   * or one card of an A/B pair failed and the other was kept (then `proposal` is still set: a single card with no
+   * `option`, while Woo's text may still talk about two). Show one grey line "Woo 的提案沒過格式檢查，再問他一次";
+   * the reply text itself is fine.
    */
   proposal_rejected: boolean;
   /**
@@ -452,6 +472,11 @@ export interface ApiWeeklyMeta {
   updated: { at: string; reason: string } | null;
   /** Pending proposals that the regeneration cancelled, one line each: "11/1 距離 18 → 16 km". */
   cancelled: string[];
+  /**
+   * Make-up sessions booked in this week (the original week's review was not written yet when the card was applied), one line
+   * each: "這週有補課：10/27 的 Easy 5 km 補到 10/28（待跑／已完成）". [] on messages from before coach-adjust-2.
+   */
+  makeups: { from: string; to: string; label: string; done: boolean }[];
 }
 
 export interface ApiWeeklyAsk {
@@ -568,6 +593,13 @@ export interface ApiProposalChange {
   /** Computed by the api, hung on this row, shown in amber: "落到第 8 週：那週 42 → 58 km，比上週計畫 28 km 多 107%", "比目前最長多 3.7 km（16.2 → 19.9 km）", "減量週加量", "離比賽只剩 10 天，這天有 26 km 的長跑". */
   flags: string[];
   applied_session_id: string | null; // after apply: the new session row (change / add)
+  /**
+   * 補課: op = change, field = scheduled_date, and the session's date (`date`) was already past when the card was written.
+   * Computed by the api, the model does not fill it. Draw 補課 → 10/28 週二. false on every other row.
+   */
+  makeup: boolean;
+  /** After apply, a make-up row: the week its numbers are booked in (same as ApiSession.counts_in_week_no). null before apply and on other rows. */
+  counts_in_week_no: number | null;
 }
 
 export interface ApiProposalWeek {
@@ -621,11 +653,13 @@ export interface ApiProposal {
 // pending cards of the same `group_id` become `superseded` (ids in `superseded`).
 //   200  { proposal, superseded }
 //   409  { error: "plan_changed", changed: [...] } — a session of the card was changed by another
-//        proposal, completed, or its date has passed since the card was written. The card is now
-//        `stale` (stale_reason says which); show 課表已變, offer 請 Woo 重看 (re_propose) / 算了 (dismiss).
+//        proposal, completed, its date has passed since the card was written (a session that is not a make-up),
+//        or the date a session / make-up is moved to has passed ("10/27 Easy 5 km 要移到的 10/28 已經過了").
+//        The card is now `stale` (stale_reason says which); show 課表已變, offer 請 Woo 重看 (re_propose) / 算了 (dismiss).
 //   409  { error: "already <status>" } — not pending any more (also a stale card).
 //   400  { error } — the card breaks a hard rule: it touches the race day, a date is outside today …
-//        the day before the race, a session moves off a day the athlete said is fixed, or a value is invalid.
+//        the day before the race, a session (not a make-up) moves off a day the athlete said is fixed, a value is
+//        invalid, or two sessions would be on one day ("two sessions on 2026-10-28").
 // dismiss: records dismissed; allowed on pending and stale cards. 409 otherwise.
 
 export interface PostProposalResponse {
@@ -641,7 +675,7 @@ export interface PlanChangedResponse {
     session_id: string;
     label: string | null;  // the session as the card knew it
     date: string | null;   // 'YYYY-MM-DD'
-    why: "changed" | "completed"; // changed: another proposal changed it (or its date has passed); completed: an activity is attached
+    why: "changed" | "completed"; // changed: another proposal changed it, its date (or the date it moves to) has passed; completed: an activity is attached
   }[];
 }
 

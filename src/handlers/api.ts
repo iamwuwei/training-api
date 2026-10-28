@@ -5,7 +5,7 @@ import { isDbWaking, query, queryOne, withTransaction } from "../lib/db";
 import { type CheckinMeta, type MismatchAskMeta, mismatchReason, postMismatchAsk, resetCheckin, undoPick } from "../lib/checkin";
 import { COACH_NAME, MAX_MESSAGE_CHARS, postCoachMessage, REPLY_FAILED } from "../lib/coach";
 import { constraintsByIds, loadActiveConstraints } from "../lib/constraints";
-import { shortDate, sportName, weeklyAskQuestion } from "../lib/labels";
+import { countsWeekNo, shortDate, sportName, weeklyAskQuestion } from "../lib/labels";
 import { applyChange, applyProposal, changeConflict, postProposalApplied } from "../lib/proposals";
 import { deauthorize } from "../lib/strava";
 import { postRoutineDone } from "../lib/strength";
@@ -307,11 +307,16 @@ async function getPlan(userId: string) {
     [plan.id],
   );
 
-  const sessions = await query<PlannedSessionRow>(
-    `select *, to_char(scheduled_date, 'YYYY-MM-DD') as scheduled_date
-       from planned_sessions
-      where plan_id = $1 and superseded = false
-      order by planned_sessions.scheduled_date`,
+  // Not superseded, plus the moved rows (superseded, with a make-up row): `mt` is the make-up row, `mf` the row this one replaced.
+  const sessions = await query<PlannedSessionRow & { moved_to_date: string | null; moved_from_date: string | null; moved_to_counts: number | null }>(
+    `select ps.*, to_char(ps.scheduled_date, 'YYYY-MM-DD') as scheduled_date,
+            to_char(mt.scheduled_date, 'YYYY-MM-DD') as moved_to_date, mt.counts_in_week_no as moved_to_counts,
+            to_char(mf.scheduled_date, 'YYYY-MM-DD') as moved_from_date
+       from planned_sessions ps
+       left join planned_sessions mt on mt.id = ps.moved_to_session_id
+       left join planned_sessions mf on mf.id = ps.moved_from_session_id
+      where ps.plan_id = $1 and (ps.superseded = false or ps.moved_to_session_id is not null)
+      order by ps.scheduled_date, ps.superseded desc`,
     [plan.id],
   );
 
@@ -372,7 +377,7 @@ async function getPlan(userId: string) {
     coach_ask_kind: openAsk ? (openAsk.ask_kind === "mismatch" ? "mismatch" : "feel") : null,
     plan,
     weeks: weeks.map(({ week_no, week_start, week_end, phase, focus }) => ({ week_no, week_start, week_end, phase, focus })),
-    sessions: sessions.map(toApiSession),
+    sessions: sessions.map((s) => toApiSession(s, weeks)),
     activities: activities.map(toApiActivity),
     unassigned: unassigned.map(toApiActivity),
     routines: routines.map(toApiRoutine),
@@ -382,7 +387,19 @@ async function getPlan(userId: string) {
 
 const todayJst = () => new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
 const addDays = (iso: string, n: number) => new Date(Date.parse(`${iso}T00:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10);
-const toApiSession = (s: PlannedSessionRow): ApiSession => ({ ...s, skipped_at: s.skipped_at ? new Date(s.skipped_at).toISOString() : null });
+/** `counts_in_week_no` is computed here (labels.ts countsWeekNo) so the app does not re-derive it; the extra join columns do not leave. */
+const toApiSession = (s: PlannedSessionRow & { moved_to_date?: string | null; moved_from_date?: string | null; moved_to_counts?: number | null }, weeks: PlanWeekRow[]): ApiSession => {
+  const { moved_to_counts, ...row } = s;
+  return {
+    ...row,
+    skipped_at: s.skipped_at ? new Date(s.skipped_at).toISOString() : null,
+    moved_to_session_id: s.moved_to_session_id ?? null,
+    moved_to_date: s.moved_to_date ?? null,
+    moved_from_session_id: s.moved_from_session_id ?? null,
+    moved_from_date: s.moved_from_date ?? null,
+    counts_in_week_no: countsWeekNo({ ...s, moved_to_counts }, weeks),
+  };
+};
 
 // One briefs job per user per 10 minutes from this container; the worker skips sessions that got one meanwhile.
 const briefsAsked = new Map<string, number>();
@@ -865,6 +882,8 @@ function toApiProposal(p: ProposalRow): ApiProposal {
       reason: i.reason ?? null,
       flags: Array.isArray(i.flags) ? i.flags : [],
       applied_session_id: i.applied_session_id ?? null,
+      makeup: i.makeup === true,
+      counts_in_week_no: i.counts_in_week_no ?? null,
     })),
     weeks: Array.isArray(p.weeks) ? p.weeks : [],
     why: p.why,
@@ -998,6 +1017,7 @@ function toApiWeeklyMeta(meta: Partial<WeeklyMessageMeta>): ApiCoachMessage["wee
       : [],
     updated: meta.updated && typeof meta.updated.at === "string" ? { at: meta.updated.at, reason: meta.updated.reason ?? "" } : null,
     cancelled: Array.isArray(meta.cancelled) ? meta.cancelled : [],
+    makeups: Array.isArray(meta.makeups) ? meta.makeups : [],
   };
 }
 
