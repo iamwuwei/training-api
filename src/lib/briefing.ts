@@ -267,7 +267,8 @@ export function pastSessionLines(b: Pick<PlanBriefing, "weeks" | "sessions" | "a
     const recent = s.scheduled_date >= recentFrom;
     const rest = s.type === "rest" && !isStrength(s);
     if (!recent && (s.done || rest || s.type === "race")) continue;
-    const what = rest ? "" : [`${s.content ?? ""}`.trim(), sessionKm(s).trim()].filter(Boolean).join(" ");
+    const content = `${s.content ?? ""}`.trim();
+    const what = rest ? "" : [content, /km/i.test(content) ? "" : sessionKm(s).trim()].filter(Boolean).join(" "); // the content often names the distance already
     let state: string;
     if (s.done) {
       const a = b.activities.find((x) => x.session?.id === s.id);

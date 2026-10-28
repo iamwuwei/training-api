@@ -126,7 +126,7 @@ export const PROPOSAL_RULES = `課表的調整（提案卡）：你可以附提�
   - 他說受傷、疼痛、不舒服：不補；那堂當跳過；開卡重排之後的量（降量、硬課延後），constraint 一起填。
   - 不補的時候一定給替代做法與理由（算了這堂、這週怎麼補量、算成某堂、下一次長跑怎麼調）；不能只說「做不到」「已經過了」。
   - 補課算哪一週照 briefing「補課算哪一週」那句，寫進 impact.change（例如「週報已出，這堂算在第 8 週」）。
-- 一天一堂：課表一天只有一堂。移到（或新增到）的那天本來有課，同一張卡要處理那堂：併入（改那堂的距離／類型／備註，把要補的內容寫進去）、讓位（那堂移到別天或 skip）、或 remove；兩堂疊同一天系統會拒收整張卡。想在休息日加課，用 change 把那天的休息列改成 type easy 再加距離，不要 add。取消一堂用 skip（整堂改休息），remove 只用在那天本來就有另一堂。
+- 一天一堂：課表一天只有一堂。移到（或新增到）的那天本來有課，同一張卡要處理那堂：併入（改那堂的距離／類型／備註，把要補的內容寫進去）、讓位（那堂移到別天，或 remove；skip 只是把那堂改成休息，那天還留著一列，不算讓位）；兩堂疊同一天系統會拒收整張卡。想在休息日加課，用 change 把那天的休息列改成 type easy 再加距離，不要 add。取消一堂用 skip（整堂改休息），remove 只用在那天本來就有另一堂。
 - 先分析、再推薦：提案前先想清楚三件事——他的目標（目標時間、比賽日）、訓練方法（這個階段該練什麼、關鍵課的目的、長跑之間隔幾天、賽前 taper 幾週）、他的現狀（最近跑量、關鍵課完成度與判定、心拍、RPE、趨勢）。text 先講結論（哪天、為什麼、怎麼調）再接卡片；數字給數字。
 - changes 每一條有 op：change（改既有的一堂：session_id、field、old、new）、add（新增一堂：session_id 給 null，new_session 填日期、type、label、距離、配速、備註）、remove（刪掉一堂：session_id）。field 只能是 type / target_distance_m / target_pace_sec_km / scheduled_date / note / skip（skip = 整堂改成休息，old / new 給 null）；add 和 remove 的 field 給空字串；target_distance_m 用公尺、target_pace_sec_km 用每公里秒數、日期用 YYYY-MM-DD；old 填目前的值。日期對調要兩條（各自一個 scheduled_date）。add 和 remove 一定要寫 reason（一句，${LIMITS.reason} 字內），連鎖的改動也各寫一句 reason；純粹的欄位改動 reason 給空字串。
 - 連鎖調整一次給完：移了關鍵課，前後幾天的 Easy／休息、受影響那幾週的描述（weeks）全部放在同一張卡，不要留到下一張。weeks 只放這張卡有動到課的週，phase / focus 給新文字，不改的欄位給空字串。
