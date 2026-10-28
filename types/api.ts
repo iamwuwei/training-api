@@ -365,10 +365,13 @@ export interface PostAdjustmentResponse {
   review: ApiWeeklyReview;
 }
 
-// ---- GET <ApiUrl>/coach ---------------------------------------------------------
-// The coach's thread, oldest first (last 100). Coach messages are posted by the
+// ---- GET <ApiUrl>/coach?limit=10&before=<message id> ----------------------------
+// The coach's thread, oldest first within the page. The newest `limit` messages
+// (default 10, max 100), or with `before` the `limit` messages older than that
+// message (keyset on created_at + id). Coach messages are posted by the
 // system (weekly review, each run's verdict) or written in reply; athlete messages
 // are `pending` until the coach answers, `failed` if the answer could not be made.
+// 400: limit not an integer 1..100, before not a uuid, or not this user's message.
 
 /**
  * Kinds: weekly (coach, Sunday review), review (coach, a run's verdict), chat
@@ -471,6 +474,8 @@ export interface ApiCheckin {
 export interface CoachResponse {
   coach: { name: string };
   messages: ApiCoachMessage[];
+  /** Older messages exist before `messages[0]`: ask again with before = messages[0].id. */
+  has_more: boolean;
 }
 
 // ---- POST <ApiUrl>/coach/messages ----------------------------------------------

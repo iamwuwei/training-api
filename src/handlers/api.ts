@@ -79,7 +79,7 @@ import type {
 //   POST /weekly/{id}/asks/{session_id}     answer the review's question about a session without a record (synced / skipped)
 //   POST /proposals/{id}/apply|dismiss      a proposal card (chat or weekly review): apply all of it at once (409 plan_changed when a session moved under it), or dismiss
 //   POST /constraints/{id}/accept|dismiss   Woo's 記下來 card: remember it / not; dismiss also deletes an active one (settings)
-//   GET /coach                       the coach's thread (weekly reviews, verdicts, chat)
+//   GET /coach?limit&before          the coach's thread (weekly reviews, verdicts, chat), newest `limit` (default 10), or the ones before message `before`; has_more
 //   POST /coach/messages             say something to the coach; the worker answers (answer_to / confirm_match for Woo's questions)
 //   PUT /coach/seen                  the thread was opened; clears coach_unread on GET /plan
 //   POST /coach/checkins/{id}/pick   which activity was today's session (Woo's check-in chips)
@@ -167,7 +167,7 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
   if (method === "POST" && re) return rereview(user.id, re[1]);
 
   if (method === "GET" && path === "/weekly") return getWeekly(user.id);
-  if (method === "GET" && path === "/coach") return getCoach(user.id);
+  if (method === "GET" && path === "/coach") return getCoach(user.id, q);
   if (method === "PUT" && path === "/coach/seen") return putCoachSeen(user.id);
   const pick = /^\/coach\/checkins\/([^/]+)\/pick$/.exec(path);
   if (method === "POST" && pick) return postCheckinPick(user.id, pick[1], raw);
@@ -1016,10 +1016,33 @@ function toApiCheckin(meta: CheckinMeta): ApiCheckin {
   };
 }
 
-async function getCoach(userId: string) {
+const COACH_PAGE_DEFAULT = 10;
+const COACH_PAGE_MAX = 100;
+
+/**
+ * The thread, oldest first within the page: the newest `limit` messages, or with `before` the
+ * `limit` messages older than that one. Keyset on (created_at, id) — created_at alone can tie
+ * (rows of one transaction) — compared inside SQL against the `before` row itself, so the
+ * microseconds Postgres keeps (a JS Date would cut them to milliseconds) are not lost.
+ */
+async function getCoach(userId: string, params: Record<string, string | undefined>) {
+  let limit = COACH_PAGE_DEFAULT;
+  if (params.limit !== undefined) {
+    limit = /^\d{1,3}$/.test(params.limit) ? Number(params.limit) : 0;
+    if (limit < 1 || limit > COACH_PAGE_MAX) return json(400, { error: "invalid limit" });
+  }
+  const before = params.before;
+  if (before !== undefined) {
+    if (!UUID_RE.test(before)) return json(400, { error: "invalid before" });
+    // 400, not 404, for another user's message too: the answer must not tell whether an id exists.
+    const known = await queryOne<{ id: string }>("select id from coach_messages where id = $1 and user_id = $2", [before, userId]);
+    if (!known) return json(400, { error: "unknown before" });
+  }
+
   // Weekly reviews written before the thread existed (or whose post failed) get
   // their message now, dated when the review was written so they sort in place.
-  await query(
+  // Only for the newest page: an older page does not write.
+  if (before === undefined) await query(
     `insert into coach_messages (id, user_id, role, kind, text, meta, weekly_review_id, status, created_at)
      select gen_random_uuid(), p.user_id, 'coach', 'weekly', coalesce(w.summary, ''),
             jsonb_build_object('week_start', to_char(w.week_start, 'YYYY-MM-DD'), 'backfilled', true),
@@ -1029,12 +1052,24 @@ async function getCoach(userId: string) {
         and not exists (select 1 from coach_messages m where m.weekly_review_id = w.id)`,
     [userId],
   );
-  const rows = await query<CoachMessageRow>(
-    "select * from coach_messages where user_id = $1 order by created_at desc limit 100",
-    [userId],
-  );
+  const found = before === undefined
+    ? await query<CoachMessageRow>(
+        "select * from coach_messages where user_id = $1 order by created_at desc, id desc limit $2",
+        [userId, limit + 1],
+      )
+    : await query<CoachMessageRow>(
+        `select * from coach_messages
+          where user_id = $1 and (created_at, id) < (select created_at, id from coach_messages where id = $3 and user_id = $1)
+          order by created_at desc, id desc limit $2`,
+        [userId, limit + 1, before],
+      );
+  const rows = found.slice(0, limit); // the +1 row only says there is more
   const cards = await cardsFor(userId, rows);
-  return json<CoachResponse>(200, { coach: { name: COACH_NAME }, messages: rows.reverse().map((m) => toApiCoachMessage(m, cards)) });
+  return json<CoachResponse>(200, {
+    coach: { name: COACH_NAME },
+    messages: rows.reverse().map((m) => toApiCoachMessage(m, cards)),
+    has_more: found.length > limit,
+  });
 }
 
 /** The athlete opened the thread: everything posted so far counts as seen. */
