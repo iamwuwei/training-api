@@ -53,6 +53,21 @@ export function describeCard(p: Pick<ProposalRow, "items">): string {
   return items.length > 6 ? `${items.slice(0, 6).join("、")} 等共 ${items.length} 項` : items.join("、");
 }
 
+/** Words the model uses for a session type that are not one of the five values; matched case-insensitively, whitespace trimmed. */
+const TYPE_ALIASES: Record<string, string> = {
+  recovery: "easy", recover: "easy", "easy run": "easy",
+  hill: "interval", hills: "interval", "hill repeats": "interval",
+  mp: "tempo", "marathon pace": "tempo", threshold: "tempo", "tempo run": "tempo",
+  "long run": "long",
+  off: "rest", 休息: "rest", "rest day": "rest",
+};
+/** The model's session type as one of easy / long / tempo / interval / rest when it is one or a known alias, else the value as it came (the caller rejects it). */
+export function normalizeType(v: unknown): unknown {
+  if (typeof v !== "string") return v;
+  const k = v.trim().toLowerCase();
+  return PROPOSAL_TYPES.has(k) ? k : TYPE_ALIASES[k] ?? v;
+}
+
 /** A string error when the value does not fit the field, else null. */
 export function validateChangeValue(field: string, value: string | number | null): string | null {
   switch (field) {
@@ -260,32 +275,39 @@ export function touchedWeekNos(weeks: PlanWeekRow[], items: ProposalItem[]): Set
 }
 
 /**
- * The model's 1–2 cards (one, or an A/B pair; a weekly review passes `maxCards` 1) checked against the plan. A string says
- * why the whole reply's cards are dropped (the text is kept either way). Everything the
+ * The model's 1–2 cards (one, or an A/B pair; a weekly review passes `maxCards` 1) checked against the plan. Everything the
  * design lists is checked here: basis_text and impact present, add / remove with a
- * reason, weeks only for weeks the changes touch, every session in the athlete's own
- * plan and still changeable, dates from today to the day before the race, nothing on
- * the race day, no move off a day the athlete said is fixed, and the length limits.
+ * reason, every session in the athlete's own plan and still changeable, dates from today to the
+ * day before the race, nothing on the race day, no move off a day the athlete said is fixed, one session a day, and the
+ * length limits. A pair with one bad card keeps the good one as a single card (no letter, no group); `dropped` says which
+ * card went and why. `error` is set (and `drafts` empty) when nothing is left: the text of the reply is kept either way.
  */
-export function validateCards(b: PlanBriefing, raws: RawCard[], today: string, maxCards = 2): CardDraft[] | string {
-  if (!Array.isArray(raws) || raws.length < 1 || raws.length > maxCards) return `expected 1 to ${maxCards} cards, got ${Array.isArray(raws) ? raws.length : "none"}`;
-  const drafts: CardDraft[] = [];
-  for (const [i, raw] of raws.entries()) {
-    const d = validateCard(b, raw, today);
-    if (typeof d === "string") return `card ${i + 1}: ${d}`;
-    drafts.push(d);
-  }
+export function checkCards(b: PlanBriefing, raws: RawCard[], today: string, maxCards = 2): { drafts: CardDraft[]; dropped: string[]; error: string | null } {
+  if (!Array.isArray(raws) || raws.length < 1 || raws.length > maxCards) return { drafts: [], dropped: [], error: `expected 1 to ${maxCards} cards, got ${Array.isArray(raws) ? raws.length : "none"}` };
+  const checked = raws.map((raw, i) => ({ i, raw, d: validateCard(b, raw, today) }));
+  const bad = checked.filter((c): c is typeof c & { d: string } => typeof c.d === "string");
+  const good = checked.filter((c): c is typeof c & { d: CardDraft } => typeof c.d !== "string");
+  const dropped = bad.map((c) => `card ${c.i + 1}: ${c.d}`);
+  if (!good.length) return { drafts: [], dropped, error: dropped.join("; ") };
+  const drafts = good.map((c) => c.d);
   if (drafts.length === 2) {
     const group = randomUUID();
     for (const [i, d] of drafts.entries()) {
-      const title = text(raws[i].option_title);
-      if (!title) return `card ${i + 1}: option_title is required when there are two cards`;
-      if (title.length > LIMITS.option_title) return `card ${i + 1}: option_title longer than ${LIMITS.option_title}`;
+      // The letter is the api's, by order: a model that wrote "B：不補" into the title does not get "A：B：不補" on screen.
+      const title = text(raws[i].option_title).replace(/^[AaBb]\s*[：:]\s*/, "");
+      if (!title) return { drafts: [], dropped, error: `card ${i + 1}: option_title is required when there are two cards` };
+      if (title.length > LIMITS.option_title) return { drafts: [], dropped, error: `card ${i + 1}: option_title longer than ${LIMITS.option_title}` };
       d.group_id = group;
       d.option = { letter: i === 0 ? "A" : "B", title, recommended: raws[i].recommended === true && !(i === 1 && raws[0].recommended === true) };
     }
   }
-  return drafts;
+  return { drafts, dropped, error: null };
+}
+
+/** `checkCards` as the old shape: the cards, or a string saying why none is left. */
+export function validateCards(b: PlanBriefing, raws: RawCard[], today: string, maxCards = 2): CardDraft[] | string {
+  const r = checkCards(b, raws, today, maxCards);
+  return r.error ?? r.drafts;
 }
 
 function validateCard(b: PlanBriefing, raw: RawCard, today: string): CardDraft | string {
@@ -319,14 +341,15 @@ function validateCard(b: PlanBriefing, raw: RawCard, today: string): CardDraft |
       if (!reason) return "add needs a reason";
       if (!isStr(ns.scheduled_date) || !isValidDate(ns.scheduled_date)) return "new_session.scheduled_date must be YYYY-MM-DD";
       if (!inRange(ns.scheduled_date)) return `new_session.scheduled_date ${ns.scheduled_date} is outside today to the day before the race`;
-      if (!isStr(ns.type) || !PROPOSAL_TYPES.has(ns.type)) return "new_session.type must be easy, long, tempo, interval or rest";
+      const nsType = normalizeType(ns.type);
+      if (!isStr(nsType) || !PROPOSAL_TYPES.has(nsType)) return "new_session.type must be easy, long, tempo, interval or rest";
       const label = text(ns.label);
       if (!label || label.length > LIMITS.session_label) return "new_session.label is empty or too long";
       const dist = ns.target_distance_m ?? null, pace = ns.target_pace_sec_km ?? null, note = ns.note == null ? null : text(ns.note) || null;
       if (dist !== null && validateChangeValue("target_distance_m", dist)) return "new_session.target_distance_m must be metres";
       if (pace !== null && validateChangeValue("target_pace_sec_km", pace)) return "new_session.target_pace_sec_km must be seconds per km";
       if (note !== null && note.length > LIMITS.session_note) return "new_session.note too long";
-      const session: NewSession = { scheduled_date: ns.scheduled_date, type: ns.type as NewSession["type"], label, target_distance_m: dist, target_pace_sec_km: pace, note };
+      const session: NewSession = { scheduled_date: ns.scheduled_date, type: nsType as NewSession["type"], label, target_distance_m: dist, target_pace_sec_km: pace, note };
       items.push({ op, session_id: null, old: null, new: null, label: sessionLabel({ label, type: session.type, target_distance_m: dist }), date: session.scheduled_date, new_session: session, reason, flags: [] });
       continue;
     }
@@ -357,7 +380,7 @@ function validateCard(b: PlanBriefing, raw: RawCard, today: string): CardDraft |
     if (!isStr(field) || !PROPOSAL_FIELDS.has(field)) return `field ${JSON.stringify(field) ?? "missing"}`; // "" (none) is not a field to change
     if (seen.has(field)) return `session ${id}: ${field} changed twice`;
     if (isPast && field !== "scheduled_date" && !seen.has("scheduled_date")) return "a past session can only be changed after it is moved (補課)";
-    const value = field === "skip" ? null : c.new ?? null;
+    const value = field === "skip" ? null : field === "type" ? normalizeType(c.new ?? null) as string | number | null : c.new ?? null;
     const bad = validateChangeValue(field, value);
     if (bad) return bad;
     if (field === "scheduled_date") {
@@ -374,7 +397,8 @@ function validateCard(b: PlanBriefing, raw: RawCard, today: string): CardDraft |
   }
 
   // One session a day: after the card, every date it touches holds at most one row.
-  const crowded = crowdedDay(simulate(b, items).after, items);
+  const sim = simulate(b, items);
+  const crowded = crowdedDay(sim.before, sim.after, items);
   if (crowded) return `two sessions on ${crowded}: the card must change, move, skip or remove the one already there`;
 
   // Week descriptions: only for weeks the changes touch.
@@ -384,7 +408,7 @@ function validateCard(b: PlanBriefing, raw: RawCard, today: string): CardDraft |
   for (const w of raw.weeks ?? []) {
     if (!w || typeof w.week_no !== "number" || !Number.isInteger(w.week_no)) return "weeks[].week_no must be an integer";
     if (!b.weeks.some((x) => x.week_no === w.week_no)) return `week ${w.week_no} is not in the plan`;
-    if (!weekNos.has(w.week_no)) return `week ${w.week_no} has no change on this card`;
+    if (!weekNos.has(w.week_no)) continue; // a week this card does not change: the model listed it for nothing, ignore it (do not drop the card)
     if (weeks.some((x) => x.week_no === w.week_no)) return `week ${w.week_no} listed twice`;
     const phase = text(w.phase) || null, focus = text(w.focus) || null;
     if (!phase && !focus) return `week ${w.week_no} has nothing to change`;
@@ -473,17 +497,24 @@ export function simulate(
   return { before, after, owner };
 }
 
-/** The first date the card touches that ends up with two or more sessions on it, or null. Dates already crowded and untouched do not count. */
-function crowdedDay(after: Map<string, Sim>, items: ProposalItem[]): string | null {
+/**
+ * The first date the card touches that ends up with two or more sessions and more than it had before the card, or null. A day that
+ * was already crowded (a duplicate in the import) only blocks a card that makes it worse, not one that changes a distance on it.
+ */
+function crowdedDay(before: Map<string, { date: string }>, after: Map<string, { date: string }>, items: ProposalItem[]): string | null {
   const dates = new Set<string>();
   for (const it of items) {
     if (it.date) dates.add(it.date);
     if (it.field === "scheduled_date" && isStr(it.new)) dates.add(it.new);
     if (it.new_session) dates.add(it.new_session.scheduled_date);
   }
-  const count = new Map<string, number>();
-  for (const s of after.values()) count.set(s.date, (count.get(s.date) ?? 0) + 1);
-  return [...dates].sort().find((d) => (count.get(d) ?? 0) > 1) ?? null;
+  const count = (m: Map<string, { date: string }>) => {
+    const c = new Map<string, number>();
+    for (const s of m.values()) c.set(s.date, (c.get(s.date) ?? 0) + 1);
+    return c;
+  };
+  const was = count(before), now = count(after);
+  return [...dates].sort().find((d) => (now.get(d) ?? 0) > 1 && (now.get(d) ?? 0) > (was.get(d) ?? 0)) ?? null;
 }
 
 /**
@@ -588,7 +619,7 @@ export interface PlanChanged {
 
 export type ApplyResult =
   | { ok: true; items: ProposalItem[]; superseded: string[] }
-  | { ok: false; status: 400 | 409; error: string; changed?: PlanChanged[] };
+  | { ok: false; status: 400 | 409 | 503; error: string; changed?: PlanChanged[] };
 
 /**
  * Why a card can never be applied as written (400): the race day, the date range, a fixed day, values.
@@ -633,6 +664,7 @@ function hardConflict(
 function crowdedOnLive(items: ProposalItem[], live: { id: string; scheduled_date: string }[]): string | null {
   const present = new Set(live.map((l) => l.id));
   const sim = new Map(live.map((l) => [l.id, { date: l.scheduled_date, type: "easy" as SessionType, label: null, dist: null }]));
+  const was = new Map(sim);
   items.forEach((it, idx) => {
     const op = it.op ?? "change";
     if (op === "add" && it.new_session) { sim.set(`new:${idx}`, { date: it.new_session.scheduled_date, type: it.new_session.type, label: null, dist: null }); return; }
@@ -641,7 +673,7 @@ function crowdedOnLive(items: ProposalItem[], live: { id: string; scheduled_date
     if (op === "remove") sim.delete(it.session_id);
     else if (it.field === "scheduled_date" && typeof it.new === "string") sim.set(it.session_id, { ...cur, date: it.new });
   });
-  return crowdedDay(sim, items.filter((it) => it.op === "add" || (it.session_id && present.has(it.session_id))));
+  return crowdedDay(was, sim, items.filter((it) => it.op === "add" || (it.session_id && present.has(it.session_id))));
 }
 
 /**
@@ -665,7 +697,17 @@ export async function applyProposal(p: ProposalRow, today: string): Promise<Appl
     );
     // One card at a time per plan, taken before any row lock: two cards applied together queue here instead of each holding
     // some rows (or one holding its A/B partner's proposal row) and waiting for the other's.
-    if (plan) await q("select pg_advisory_xact_lock(hashtext($1))", [`plan:${plan.id}`]);
+    if (plan) {
+      // Whoever holds the lock only runs short queries, so a long wait means something is wrong: say "try again" instead of hanging until the Lambda times out.
+      await q("set local lock_timeout = '5s'");
+      try {
+        await q("select pg_advisory_xact_lock(hashtext($1))", [`plan:${plan.id}`]);
+      } catch (err) {
+        if ((err as { code?: string }).code === "55P03") return { ok: false, status: 503, error: "the plan is being changed by another request, try again" }; // lock_timeout; the transaction is rolled back, nothing was written
+        throw err;
+      }
+      await q("set local lock_timeout = 0");
+    }
     const [locked] = await q<{ status: string }>("select status from proposals where id = $1 and user_id = $2 for update", [p.id, p.user_id]);
     if (!locked || locked.status !== "pending") return { ok: false, status: 409, error: `already ${locked?.status ?? "gone"}` };
     if (!plan) return { ok: false, status: 409, error: "no active plan" };

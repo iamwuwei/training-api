@@ -144,12 +144,15 @@ export function changeableSessions(b: Pick<PlanBriefing, "plan" | "sessions">, t
   return b.sessions.filter((s) => s.scheduled_date >= today && s.scheduled_date < b.plan.race_date && !s.done && s.type !== "race");
 }
 
+/** A session that can be missed: a run (easy / long / tempo / interval). Rest days, strength days (a rest-typed session; the checklist is not an activity) and the race cannot. */
+const isRunSession = (s: { type: string }) => s.type === "easy" || s.type === "long" || s.type === "tempo" || s.type === "interval";
+
 /**
- * The past sessions a make-up can move forward: before today, no activity attached, not the race, not a plain rest day
- * (a strength day is a rest-typed session that can be made up). No limit on how long ago.
+ * The past sessions a make-up can move forward: before today, no activity attached, a run. No limit on how long ago.
+ * A strength day ticked off in the checklist has no Strava activity, so it would look missed: it is never offered.
  */
 export function catchUpSessions(b: Pick<PlanBriefing, "sessions">, today: string): SessionWithDone[] {
-  return b.sessions.filter((s) => s.scheduled_date < today && !s.done && s.type !== "race" && (s.type !== "rest" || isStrength(s)));
+  return b.sessions.filter((s) => s.scheduled_date < today && !s.done && isRunSession(s));
 }
 
 function sessionLine(s: SessionWithDone, today: string, raceDate: string): string {
@@ -265,17 +268,17 @@ export function pastSessionLines(b: Pick<PlanBriefing, "weeks" | "sessions" | "a
   for (const s of b.sessions) {
     if (s.scheduled_date >= today) continue;
     const recent = s.scheduled_date >= recentFrom;
-    const rest = s.type === "rest" && !isStrength(s);
+    const rest = !isRunSession(s) && s.type !== "race"; // a rest day or a strength day: nothing to miss
     if (!recent && (s.done || rest || s.type === "race")) continue;
-    const content = `${s.content ?? ""}`.trim();
-    const what = rest ? "" : [content, /km/i.test(content) ? "" : sessionKm(s).trim()].filter(Boolean).join(" "); // the content often names the distance already
+    const content = `${s.content ?? ""}`.replace(/\s+/g, " ").trim();
+    const what = rest && !isStrength(s) ? "" : [content, /km/i.test(content) ? "" : sessionKm(s).trim()].filter(Boolean).join(" "); // the content often names the distance already
     let state: string;
     if (s.done) {
       const a = b.activities.find((x) => x.session?.id === s.id);
       state = `已完成${a ? `（配 ${shortDate(a.date)} 的 ${isRunSport(a.sport_type) ? `${(a.distance_m / 1000).toFixed(1)} km` : sportName(a.sport_type)}）` : ""}`;
     } else if (s.type === "race") state = "比賽日";
+    else if (rest) state = isStrength(s) ? "肌力日（沒有活動紀錄，不補課）" : "休息";
     else if (s.skipped_at) state = `他說沒跑｜id=${s.id}`;
-    else if (rest) state = "休息";
     else state = `漏跑（沒有紀錄）｜id=${s.id}`;
     rows.push({ date: s.scheduled_date, label: s.label ?? s.type, line: head(s.scheduled_date, s.label, s.type, [what, state].filter(Boolean).join("｜")) });
   }
@@ -298,7 +301,7 @@ export function makeupRuleLine(b: Pick<PlanBriefing, "weeks" | "reviewedWeeks">,
   const last = b.weeks.find((w) => w.week_end >= lastStart && w.week_start <= lastEnd);
   const lastText = last ? `（${shortDate(lastStart)}〜${shortDate(lastEnd)}）的回顧${b.reviewedWeeks.has(last.week_no) ? "已產生" : "還沒產生"}` : `（${shortDate(lastStart)}〜${shortDate(lastEnd)}）不在課表裡`;
   const thisText = cur && b.reviewedWeeks.has(cur.week_no) ? "已產生" : "還沒";
-  return `補課算哪一週：原週的週回顧已產生 → 算在補跑那天的那週；還沒產生 → 算在原週。現在：上週${lastText}；本週的${thisText}。`;
+  return `補課算哪一週：原週的週回顧已產生 → 算在補跑那天的那週；還沒產生（含沒有週回顧的週）→ 算在原週。每個已過的週有沒有週回顧，看「每週階段」的標記。現在：上週${lastText}；本週的${thisText}。`;
 }
 
 /** Runs assigned to a session, for the trend numbers. */
@@ -330,7 +333,7 @@ export function buildPlanBriefing(b: PlanBriefing, today: string): string {
     ...(b.constraints.length ? b.constraints.map(constraintLine) : ["（沒有）"]),
     "",
     "## 每週階段",
-    ...b.weeks.map((w) => `- 第 ${w.week_no} 週 ${w.week_start}〜${w.week_end}${w.phase ? ` ${w.phase}` : ""}${w.focus ? `：${w.focus}` : ""}${cur?.week_no === w.week_no ? "　← 本週" : w.week_end < today ? "　（已過）" : ""}`),
+    ...b.weeks.map((w) => `- 第 ${w.week_no} 週 ${w.week_start}〜${w.week_end}${w.phase ? ` ${w.phase}` : ""}${w.focus ? `：${w.focus}` : ""}${cur?.week_no === w.week_no ? "　← 本週" : w.week_end < today ? `　（已過，${b.reviewedWeeks.has(w.week_no) ? "週回顧已產生" : "沒有週回顧"}）` : ""}`),
     "",
     "## 今天到比賽日的逐日課表（每一堂；id 在每行中間；提案只能動今天（含）到比賽日前一天、還沒完成的課）",
     upcoming.length ? upcoming.map((s) => sessionLine(s, today, plan.race_date)).join("\n") : "（沒有了）",

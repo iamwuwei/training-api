@@ -5,7 +5,7 @@ import { CARD_SCHEMA, CONSTRAINT_SCHEMA, NOTE_RULE, PROPOSAL_RULES } from "./car
 import { adjustmentLine, anthropicClient, appNotes, coachModel } from "./claude";
 import { validateConstraint } from "./constraints";
 import { type Querier, query, queryOne, withTransaction } from "./db";
-import { describeCard, describeItem, validateCards } from "./proposals"; // cycle with proposals.ts (postCoachMessage): both only used inside functions
+import { checkCards, describeCard, describeItem } from "./proposals"; // cycle with proposals.ts (postCoachMessage): both only used inside functions
 import { stageWriter } from "./stage";
 import type { CoachMessageRow, ProposalRow, RawCard, RawConstraint, StoredAdjustments, WeeklyReviewRow } from "../types";
 
@@ -322,13 +322,21 @@ export async function answerCoachMessage(userId: string, messageId: string, toda
       res = await send({ ...request, messages });
       formatRejected = true; // only once the plain request went through: a 400 that was not about the format must not turn structured output off
     }
-    // The server-side search loop can pause; resend with the partial turn appended to resume.
+    // web_search uses of the whole reply, counted by block id (a resumed response may carry the blocks of the turn before it).
+    const searchIds = new Set<string>();
+    const countSearches = (r: Anthropic.Message) => { for (const b of r.content) if (b.type === "server_tool_use") searchIds.add(b.id); };
+    countSearches(res);
+    // The server-side search loop can pause; resend with the partial turn appended to resume. `max_uses` is per request, so
+    // a resume gets what is left of MAX_SEARCHES, and none of the tool once they are used up: at most MAX_SEARCHES per reply.
     for (let i = 0; res.stop_reason === "pause_turn" && i < MAX_PAUSE_RESUMES; i++) {
       messages.push({ role: "assistant", content: res.content });
-      res = await send({ ...request, messages });
+      const left = MAX_SEARCHES - searchIds.size;
+      const { tools: _all, ...noTools } = request;
+      res = await send({ ...noTools, ...(left > 0 ? { tools: [{ ...tools[0], max_uses: left }] } : {}), messages });
+      countSearches(res);
     }
     if (res.stop_reason === "refusal") throw new Error(`refused: ${JSON.stringify(res.stop_details)}`);
-    const searches = res.content.filter((b) => b.type === "server_tool_use").length;
+    const searches = searchIds.size;
     const raw = res.content.filter((b): b is Anthropic.TextBlock => b.type === "text").map((b) => b.text).join("").trim();
     const out = parseReply(raw);
     if (!out.text) throw new Error("empty reply");
@@ -349,13 +357,18 @@ export async function answerCoachMessage(userId: string, messageId: string, toda
       ...(structuredError ? { structured_error: structuredError } : {}),
     };
     // The cards: all or nothing (an A/B pair with one half is worse than none). The text stays either way.
-    let drafts: Exclude<ReturnType<typeof validateCards>, string> = [];
+    let drafts: ReturnType<typeof checkCards>["drafts"] = [];
     if (out.proposals.length && ctx) {
-      const checked = validateCards(ctx.briefing, out.proposals, today);
-      if (typeof checked === "string") {
-        console.warn(`proposal dropped for message ${msg.id}: ${checked}`);
+      const checked = checkCards(ctx.briefing, out.proposals, today);
+      // One bad card of an A/B pair does not take the good one with it; meta says which card went and why.
+      if (checked.dropped.length) {
+        console.warn(`proposal dropped for message ${msg.id}: ${checked.dropped.join("; ")}`);
+        meta.proposals_dropped = checked.dropped.map((d) => d.slice(0, 300));
+      }
+      if (checked.error) {
         meta.proposal_rejected = true;
-      } else drafts = checked;
+        meta.proposal_rejected_reason = checked.error.slice(0, 300);
+      } else drafts = checked.drafts;
     } else if (out.proposals.length) meta.proposal_rejected = true;
     else {
       // No card parsed. That is fine when Woo meant none; not when the reply points at a card that is not there.
@@ -447,7 +460,7 @@ function withoutRequestId(message: string): string {
 }
 
 /** The reply's own words say the card is in this reply ("下面這張卡", "卡片在下面", "整張一起看", "按採用"); "我不開提案卡" and "上週的提案" do not. */
-const CLAIMS_CARD = /(下面|底下|下方)(這|那)?張(提案)?卡|卡片?(在|接在|放在)(下面|底下|下方)|整張一起看|按「?採用|採用整張|這張卡(你|可以)?(按|採用)/;
+const CLAIMS_CARD = /(下面|底下|下方)(這|那)?張(提案)?卡|(下面|底下|下方)(的|是)(提案)?卡|卡片?(在|接在|放在|附在)(下面|底下|下方)|附(在|上)(下面|底下|下方)|附了(一|這|那)?張(提案)?卡|整張一起看|(?<!不用|不必|不要|不需要)按[「『]?採用|採用整張|這張卡(你|可以)?(按|採用)/;
 
 /**
  * Why a reply that parsed to no card should still be flagged (proposal_rejected: the app says the card did
