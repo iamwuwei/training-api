@@ -9,6 +9,7 @@ import { loadReviewContext } from "../lib/context";
 import { isDbWaking, query, queryOne } from "../lib/db";
 import { sessionLabel, shortDate, sportName } from "../lib/labels";
 import { getActivity, refreshToken, StravaError } from "../lib/strava";
+import { stageWriterByActivity } from "../lib/stage";
 import { maybeRerunWeeklyReview } from "../lib/weekly";
 import type { BriefsJob, CoachAskJob, CoachReplyJob, PlannedSessionRow, RoutineJob, StravaConnectionRow, StravaWebhookEvent } from "../types";
 
@@ -200,8 +201,12 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
         [row.session_id],
       );
       if (session) {
+        // The athlete's answer waiting for this verdict shows where Woo is (0 rows when there is none: a report-page pick, the today page).
+        const stage = stageWriterByActivity(conn.user_id, row.id);
         try {
+          await stage("reading");
           const context = await loadReviewContext(conn.user_id, session, localDate, row.id);
+          await stage("judging");
           const r = await reviewActivity({
             session,
             activity: {

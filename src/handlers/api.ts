@@ -9,6 +9,7 @@ import { shortDate, sportName, weeklyAskQuestion } from "../lib/labels";
 import { applyChange, applyProposal, changeConflict, postProposalApplied } from "../lib/proposals";
 import { deauthorize } from "../lib/strava";
 import { postRoutineDone } from "../lib/strength";
+import { COACH_STAGES } from "../lib/stage";
 import { requestWeeklyRerun, reviewMissingActivity, WEEKLY_REVIEW_SELECT } from "../lib/weekly";
 import type { ActivityRow, BriefsJob, CoachAskJob, CoachMessageRow, CoachReplyJob, ConstraintRow, PlanRow, PlanWeekRow, PlannedSessionRow, ProposalRow, ReviewRow, RoutineJob, SessionRoutineRow, StoredAdjustments, StravaConnectionRow, UserRow, WeeklyMessageMeta, WeeklyReviewRow } from "../types";
 import type {
@@ -27,6 +28,9 @@ import type {
   PutSessionResponse,
   PutMemoRequest,
   PutMemoResponse,
+  PutDetailsRequest,
+  PutDetailsResponse,
+  DetailOptionsResponse,
   RereviewResponse,
   WeeklyResponse,
   ApiWeeklyReview,
@@ -68,13 +72,15 @@ import type {
 //   PUT /activities/{id}/session     the athlete's pick: which planned session this activity was (+ memo/RPE), or ignore it;
 //                                    a pick that looks wrong gets Woo's 真的是這趟嗎 in the thread instead of a verdict
 //   PUT /activities/{id}/memo        athlete's own note + RPE (re-triggers the Claude review)
+//   PUT /activities/{id}/details     the athlete's own shoe / device / weather (shown over Strava's; no review, no job)
+//   GET /activities/detail-options   shoe / device names this athlete used before, for the editor's suggestions
 //   POST /activities/{id}/rereview   drop the Claude review (failed or stale) and queue a new one
 //   GET /weekly                      weekly coach reviews with their adjustment proposals
 //   POST /weekly/{id}/adjustments/{index}   apply or dismiss one proposal
 //   POST /weekly/{id}/asks/{session_id}     answer the review's question about a session without a record (synced / skipped)
 //   POST /proposals/{id}/apply|dismiss      a proposal card (chat or weekly review): apply all of it at once (409 plan_changed when a session moved under it), or dismiss
 //   POST /constraints/{id}/accept|dismiss   Woo's 記下來 card: remember it / not; dismiss also deletes an active one (settings)
-//   GET /coach                       the coach's thread (weekly reviews, verdicts, chat)
+//   GET /coach?limit&before          the coach's thread (weekly reviews, verdicts, chat), newest `limit` (default 10), or the ones before message `before`; has_more
 //   POST /coach/messages             say something to the coach; the worker answers (answer_to / confirm_match for Woo's questions)
 //   PUT /coach/seen                  the thread was opened; clears coach_unread on GET /plan
 //   POST /coach/checkins/{id}/pick   which activity was today's session (Woo's check-in chips)
@@ -88,7 +94,7 @@ const VERDICTS = new Set<string>(["達成", "達成但有提醒", "未達成"]);
 
 const sqs = new SQSClient({});
 
-const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | PutSessionResponse | PutMemoResponse | RereviewResponse | WeeklyResponse | PostAdjustmentResponse | CoachResponse | PostCoachMessageResponse | PutCoachSeenResponse | PostCheckinPickResponse | PostCheckinResetResponse | PostRoutineResponse | PutRoutineResponse | PostWeeklyAskResponse | PostProposalResponse | PostConstraintResponse | PlanChangedResponse | ErrorResponse>(
+const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | PutSessionResponse | PutMemoResponse | PutDetailsResponse | DetailOptionsResponse | RereviewResponse | WeeklyResponse | PostAdjustmentResponse | CoachResponse | PostCoachMessageResponse | PutCoachSeenResponse | PostCheckinPickResponse | PostCheckinResetResponse | PostRoutineResponse | PutRoutineResponse | PostWeeklyAskResponse | PostProposalResponse | PostConstraintResponse | PlanChangedResponse | ErrorResponse>(
   statusCode: number,
   body: T,
 ): APIGatewayProxyResultV2 => ({
@@ -148,19 +154,21 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
   if (method === "DELETE" && path === "/me/strava") return deleteStrava(user);
   if (method === "GET" && path === "/plan") return getPlan(user.id);
   if (method === "GET" && path === "/activities") return getActivities(user.id, q.status);
+  if (method === "GET" && path === "/activities/detail-options") return getDetailOptions(user.id);
 
   const raw = event.isBase64Encoded ? Buffer.from(event.body ?? "", "base64").toString("utf8") : event.body ?? "";
-  const sub = /^\/activities\/([^/]+)\/(review|session|memo)$/.exec(path);
+  const sub = /^\/activities\/([^/]+)\/(review|session|memo|details)$/.exec(path);
   if (method === "PUT" && sub) {
     if (sub[2] === "review") return putReview(user.id, sub[1], raw);
     if (sub[2] === "session") return putSession(user.id, sub[1], raw);
+    if (sub[2] === "details") return putDetails(user.id, sub[1], raw);
     return putMemo(user.id, sub[1], raw);
   }
   const re = /^\/activities\/([^/]+)\/rereview$/.exec(path);
   if (method === "POST" && re) return rereview(user.id, re[1]);
 
   if (method === "GET" && path === "/weekly") return getWeekly(user.id);
-  if (method === "GET" && path === "/coach") return getCoach(user.id);
+  if (method === "GET" && path === "/coach") return getCoach(user.id, q);
   if (method === "PUT" && path === "/coach/seen") return putCoachSeen(user.id);
   const pick = /^\/coach\/checkins\/([^/]+)\/pick$/.exec(path);
   if (method === "POST" && pick) return postCheckinPick(user.id, pick[1], raw);
@@ -203,7 +211,7 @@ async function getMe(user: UserRow, event: APIGatewayProxyEventV2WithJWTAuthoriz
 const ACTIVITY_SELECT = `
   a.id, a.user_id, a.strava_activity_id, a.session_id, a.sport_type, a.start_time, a.distance_m, a.moving_time_sec,
   a.avg_pace_sec_km, a.avg_hr, a.max_hr, a.avg_watts, a.kcal, a.description, a.device_name, a.gear_id,
-  a.gear_name, a.weather, a.memo, a.rpe, a.memo_updated_at, a.splits, a.match_status,
+  a.gear_name, a.weather, a.gear_name_user, a.device_name_user, a.weather_user, a.details_updated_at, a.memo, a.rpe, a.memo_updated_at, a.splits, a.match_status,
   r.verdict as r_verdict, r.comment as r_comment, r.reminders as r_reminders,
   r.source as r_source, r.model as r_model, r.adjust_hint as r_adjust_hint, r.created_at as r_created_at`;
 
@@ -232,10 +240,28 @@ function toApiReview(r: Pick<ReviewRow, "verdict" | "comment" | "reminders" | "s
   };
 }
 
+/** Shoe / device / weather: the athlete's value over Strava's, and where the shown one came from. */
+function detailOf(user: string | null, strava: string | null): ApiActivity["details"]["gear_name"] {
+  return { source: user != null ? "user" : strava != null ? "strava" : null, strava };
+}
+
 function toApiActivity(a: ActivityJoined): ApiActivity {
-  const { r_verdict, r_comment, r_reminders, r_source, r_model, r_adjust_hint, r_created_at, ...rest } = a;
+  const {
+    r_verdict, r_comment, r_reminders, r_source, r_model, r_adjust_hint, r_created_at,
+    gear_name_user, device_name_user, weather_user, details_updated_at,
+    ...rest
+  } = a;
   return {
     ...rest,
+    gear_name: gear_name_user ?? a.gear_name,
+    device_name: device_name_user ?? a.device_name,
+    weather: weather_user ?? a.weather,
+    details: {
+      gear_name: detailOf(gear_name_user, a.gear_name),
+      device_name: detailOf(device_name_user, a.device_name),
+      weather: detailOf(weather_user, a.weather),
+    },
+    details_updated_at: details_updated_at ? new Date(details_updated_at).toISOString() : null,
     start_time: new Date(a.start_time).toISOString(),
     memo_updated_at: a.memo_updated_at ? new Date(a.memo_updated_at).toISOString() : null,
     splits: (a.splits as ApiActivity["splits"]) ?? null,
@@ -601,6 +627,78 @@ async function putMemo(userId: string, activityId: string, raw: string) {
   return json<PutMemoResponse>(200, { activity: toApiActivity(row) });
 }
 
+const DETAIL_MAX_CHARS = 40;
+/** C0 and C1 controls, zero-width / direction marks (U+200B-200F, 202A-202E, 2066-2069) and the BOM: shown as nothing, so they become a space. */
+const DETAIL_INVISIBLE = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
+const DETAIL_FIELDS = ["gear_name", "device_name", "weather"] as const;
+
+/**
+ * One value of PUT …/details: a string becomes single-line text (control characters and runs of
+ * whitespace -> one space, trimmed); "" / null / nothing left means clear (value null). `error` is the 400 text.
+ */
+function cleanDetail(v: unknown, field: string): { value: string | null } | { error: string } {
+  if (v === null) return { value: null };
+  if (typeof v !== "string") return { error: `${field} must be a string` };
+  const clean = v.replace(DETAIL_INVISIBLE, " ").replace(/\s+/g, " ").trim();
+  if (clean.length > DETAIL_MAX_CHARS) return { error: `${field} too long (${DETAIL_MAX_CHARS} chars)` };
+  return { value: clean || null };
+}
+
+/**
+ * The athlete's own shoe / device / weather. Writes only the *_user columns (Strava's sync never
+ * touches them), so a later sync cannot overwrite them. A value equal to Strava's own is stored as
+ * null: the athlete "set" what Strava already says, which must not read as a manual edit.
+ * No review is dropped and no job is queued: these fields do not go into any prompt.
+ */
+async function putDetails(userId: string, activityId: string, raw: string) {
+  if (!UUID_RE.test(activityId)) return json(400, { error: "invalid activity id" });
+  let body: unknown;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    return json(400, { error: "invalid json" });
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) return json(400, { error: "body must be an object" });
+  const req = body as PutDetailsRequest;
+  const sets: string[] = [];
+  const params: unknown[] = [activityId, userId];
+  for (const field of DETAIL_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(req, field)) continue; // absent: left alone
+    const cleaned = cleanDetail(req[field], field);
+    if ("error" in cleaned) return json(400, { error: cleaned.error });
+    params.push(cleaned.value);
+    const column = field; // a fixed name from DETAIL_FIELDS, never from the request
+    sets.push(`${column}_user = case when $${params.length}::text = ${column} then null else $${params.length}::text end`);
+  }
+  if (!sets.length) return json(400, { error: "nothing to update" });
+
+  const hit = await query<{ id: string }>(
+    `update activities set ${sets.join(", ")}, details_updated_at = now() where id = $1 and user_id = $2 returning id`,
+    params,
+  );
+  if (!hit.length) return json(404, { error: "activity not found" });
+
+  const [row] = await query<ActivityJoined>(
+    `select ${ACTIVITY_SELECT} from activities a left join reviews r on r.activity_id = a.id where a.id = $1 and a.user_id = $2`,
+    [activityId, userId],
+  );
+  return json<PutDetailsResponse>(200, { activity: toApiActivity(row) });
+}
+
+/** Shoe / device names this athlete had before (their own and Strava's), most recently used first. */
+async function getDetailOptions(userId: string) {
+  const names = async (column: "gear_name" | "device_name"): Promise<string[]> =>
+    (await query<{ v: string }>(
+      `select v from (
+         select ${column}_user as v, coalesce(details_updated_at, start_time) as t from activities where user_id = $1 and ${column}_user is not null
+         union all
+         select ${column} as v, start_time as t from activities where user_id = $1 and ${column} is not null and ${column} <> ''
+       ) s group by v order by max(t) desc, v limit 8`,
+      [userId],
+    )).map((r) => r.v);
+  return json<DetailOptionsResponse>(200, { gear_name: await names("gear_name"), device_name: await names("device_name") });
+}
+
 /** Drop the Claude review (failed, stale or just unwanted) and have the worker write a new one. */
 async function rereview(userId: string, activityId: string) {
   if (!UUID_RE.test(activityId)) return json(400, { error: "invalid activity id" });
@@ -873,6 +971,8 @@ function toApiCoachMessage(m: CoachMessageRow, cards?: Cards): ApiCoachMessage {
     proposal: proposal ? toApiProposal(proposal) : null,
     constraint: constraint ? toApiConstraint(constraint) : null,
     proposal_rejected: meta.proposal_rejected === true,
+    // Progress while Woo works on it: a white-listed value, only for a message that is waiting (or a weekly review being rewritten).
+    stage: typeof meta.stage === "string" && COACH_STAGES.has(meta.stage) && (m.status === "pending" || m.kind === "weekly") ? meta.stage : null,
     // Rows written before the worker stored the fixed line still hold the provider's wording: never shown.
     error: typeof meta.error === "string" && meta.error ? REPLY_FAILED : null,
     created_at: new Date(m.created_at).toISOString(),
@@ -921,10 +1021,33 @@ function toApiCheckin(meta: CheckinMeta): ApiCheckin {
   };
 }
 
-async function getCoach(userId: string) {
+const COACH_PAGE_DEFAULT = 10;
+const COACH_PAGE_MAX = 100;
+
+/**
+ * The thread, oldest first within the page: the newest `limit` messages, or with `before` the
+ * `limit` messages older than that one. Keyset on (created_at, id) — created_at alone can tie
+ * (rows of one transaction) — compared inside SQL against the `before` row itself, so the
+ * microseconds Postgres keeps (a JS Date would cut them to milliseconds) are not lost.
+ */
+async function getCoach(userId: string, params: Record<string, string | undefined>) {
+  let limit = COACH_PAGE_DEFAULT;
+  if (params.limit !== undefined) {
+    limit = /^\d{1,3}$/.test(params.limit) ? Number(params.limit) : 0;
+    if (limit < 1 || limit > COACH_PAGE_MAX) return json(400, { error: "invalid limit" });
+  }
+  const before = params.before;
+  if (before !== undefined) {
+    if (!UUID_RE.test(before)) return json(400, { error: "invalid before" });
+    // 400, not 404, for another user's message too: the answer must not tell whether an id exists.
+    const known = await queryOne<{ id: string }>("select id from coach_messages where id = $1 and user_id = $2", [before, userId]);
+    if (!known) return json(400, { error: "unknown before" });
+  }
+
   // Weekly reviews written before the thread existed (or whose post failed) get
   // their message now, dated when the review was written so they sort in place.
-  await query(
+  // Only for the newest page: an older page does not write.
+  if (before === undefined) await query(
     `insert into coach_messages (id, user_id, role, kind, text, meta, weekly_review_id, status, created_at)
      select gen_random_uuid(), p.user_id, 'coach', 'weekly', coalesce(w.summary, ''),
             jsonb_build_object('week_start', to_char(w.week_start, 'YYYY-MM-DD'), 'backfilled', true),
@@ -934,12 +1057,24 @@ async function getCoach(userId: string) {
         and not exists (select 1 from coach_messages m where m.weekly_review_id = w.id)`,
     [userId],
   );
-  const rows = await query<CoachMessageRow>(
-    "select * from coach_messages where user_id = $1 order by created_at desc limit 100",
-    [userId],
-  );
+  const found = before === undefined
+    ? await query<CoachMessageRow>(
+        "select * from coach_messages where user_id = $1 order by created_at desc, id desc limit $2",
+        [userId, limit + 1],
+      )
+    : await query<CoachMessageRow>(
+        `select * from coach_messages
+          where user_id = $1 and (created_at, id) < (select created_at, id from coach_messages where id = $3 and user_id = $1)
+          order by created_at desc, id desc limit $2`,
+        [userId, limit + 1, before],
+      );
+  const rows = found.slice(0, limit); // the +1 row only says there is more
   const cards = await cardsFor(userId, rows);
-  return json<CoachResponse>(200, { coach: { name: COACH_NAME }, messages: rows.reverse().map((m) => toApiCoachMessage(m, cards)) });
+  return json<CoachResponse>(200, {
+    coach: { name: COACH_NAME },
+    messages: rows.reverse().map((m) => toApiCoachMessage(m, cards)),
+    has_more: found.length > limit,
+  });
 }
 
 /** The athlete opened the thread: everything posted so far counts as seen. */
@@ -1204,7 +1339,7 @@ async function postCoach(userId: string, raw: string) {
     await query("update coach_messages set meta = coalesce(meta, '{}'::jsonb) || '{\"state\":\"answered\"}'::jsonb where id = $1", [ask.id]);
     const m = await postCoachMessage({
       user_id: userId, role: "athlete", kind: "chat", text, status: "pending", activity_id: activity.id,
-      meta: { answer_to: ask.id, rpe: parsed.rpe },
+      meta: { answer_to: ask.id, rpe: parsed.rpe, stage: "reading" },
     });
     await query("delete from reviews where activity_id = $1 and source = 'claude'", [activity.id]);
     if (activity.session_id) await requeue(userId, activity.strava_activity_id, "check-in answered");
@@ -1238,7 +1373,8 @@ async function postCoach(userId: string, raw: string) {
 
   const m = await postCoachMessage({
     user_id: userId, role: "athlete", kind: "chat", text, status: "pending",
-    activity_id: body.activity_id ?? null, meta: quote || reProposeId ? { ...(quote ? { quote } : {}), ...(reProposeId ? { re_propose: reProposeId } : {}) } : null,
+    activity_id: body.activity_id ?? null,
+    meta: { stage: "preparing", ...(quote ? { quote } : {}), ...(reProposeId ? { re_propose: reProposeId } : {}) }, // the first stage is written here so the app never shows a stage-less wait
   });
   if (process.env.QUEUE_URL) {
     await sqs.send(new SendMessageCommand({
