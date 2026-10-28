@@ -247,13 +247,14 @@ export async function answerCoachMessage(userId: string, messageId: string, toda
   const deadline = Date.now() + CHAT_BUDGET_MS;
   try {
     const stage = stageWriter(msg.id); // progress for the app's wait line; best-effort, never throws
-    await stage("preparing"); // the api wrote this value with the message already; once more, in case that message was made elsewhere
+    // "preparing" is not written here: POST /coach/messages inserts the message with it (the only source of a coach_reply job).
     const ctx = await loadCoachContext(userId, today, msgMeta.re_propose);
     const system = coachSystem(ctx, today, quote);
     const client = anthropicClient(CHAT_BUDGET_MS);
     // Every request: no SDK retry, and a timeout of what is left of the shared budget.
     let outputTokens = 0; // over every request of this reply, for meta
     const streaming = process.env.COACH_STREAM === "true"; // anything else: one non-streaming request (stages: preparing, thinking only)
+    let searchSeen = false; // "searching" is written for the first search of the reply only: later ones (and the text between them) must not use up the writes that "writing" needs
     const send = async (params: ReplyParams): Promise<Anthropic.Message> => {
       const left = deadline - Date.now();
       if (left < CHAT_MIN_REQUEST_MS) throw new Error(`out of time for another request (${Math.round(left / 1000)} s left of ${CHAT_BUDGET_MS / 1000} s)`);
@@ -268,10 +269,23 @@ export async function answerCoachMessage(userId: string, messageId: string, toda
       const timer = setTimeout(() => ac.abort(), left);
       try {
         const s = client.messages.stream(params, { signal: ac.signal, timeout: left, maxRetries: 0 });
+        // "writing" = the reply itself has started. Text also comes between searches ("我查一下…"), so with the
+        // structured format it is the text block that begins with the JSON object; the plain form has no such mark:
+        // any text block counts (the writer skips repeats).
+        const structuredReq = !!params.output_config?.format;
+        const undecided = new Set<number>(); // text blocks (structured) whose first characters are not in yet
         s.on("streamEvent", (ev) => {
-          if (ev.type !== "content_block_start") return;
-          if (ev.content_block.type === "server_tool_use") void stage("searching");
-          else if (ev.content_block.type === "text") void stage("writing");
+          if (ev.type === "content_block_start") {
+            if (ev.content_block.type === "server_tool_use") {
+              if (!searchSeen) { searchSeen = true; void stage("searching"); }
+            } else if (ev.content_block.type === "text") {
+              if (structuredReq) undecided.add(ev.index);
+              else void stage("writing");
+            }
+          } else if (ev.type === "content_block_delta" && ev.delta.type === "text_delta" && undecided.has(ev.index) && ev.delta.text.trim()) {
+            undecided.delete(ev.index);
+            if (ev.delta.text.trimStart().startsWith("{")) void stage("writing");
+          }
         });
         const r = await s.finalMessage();
         outputTokens += r.usage?.output_tokens ?? 0;

@@ -628,6 +628,8 @@ async function putMemo(userId: string, activityId: string, raw: string) {
 }
 
 const DETAIL_MAX_CHARS = 40;
+/** C0 and C1 controls, zero-width / direction marks (U+200B-200F, 202A-202E, 2066-2069) and the BOM: shown as nothing, so they become a space. */
+const DETAIL_INVISIBLE = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
 const DETAIL_FIELDS = ["gear_name", "device_name", "weather"] as const;
 
 /**
@@ -637,7 +639,7 @@ const DETAIL_FIELDS = ["gear_name", "device_name", "weather"] as const;
 function cleanDetail(v: unknown, field: string): { value: string | null } | { error: string } {
   if (v === null) return { value: null };
   if (typeof v !== "string") return { error: `${field} must be a string` };
-  const clean = v.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
+  const clean = v.replace(DETAIL_INVISIBLE, " ").replace(/\s+/g, " ").trim();
   if (clean.length > DETAIL_MAX_CHARS) return { error: `${field} too long (${DETAIL_MAX_CHARS} chars)` };
   return { value: clean || null };
 }

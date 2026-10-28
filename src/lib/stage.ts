@@ -44,9 +44,13 @@ export function stageWriter(messageId: string): (stage: CoachStage) => Promise<v
   return writer("id = $2 and status = 'pending'", [messageId]);
 }
 
-/** The pending athlete answer(s) about this activity (the verdict's wait); 0 rows for a report-page pick — fine. */
+/**
+ * The athlete's answer that the verdict is waiting for: the pending feel answer about this activity (a `chat` with
+ * `meta.answer_to`, posted by POST /coach/messages { answer_to }). Not another pending message that merely quotes the
+ * activity; 0 rows for a report-page pick — fine.
+ */
 export function stageWriterByActivity(userId: string, activityId: string): (stage: CoachStage) => Promise<void> {
-  return writer("user_id = $2 and role = 'athlete' and status = 'pending' and activity_id = $3", [userId, activityId]);
+  return writer("user_id = $2 and role = 'athlete' and kind = 'chat' and status = 'pending' and activity_id = $3 and meta ? 'answer_to'", [userId, activityId]);
 }
 
 /** The weekly message of a review while it is rewritten. */
