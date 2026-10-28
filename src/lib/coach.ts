@@ -364,6 +364,7 @@ export async function answerCoachMessage(userId: string, messageId: string, toda
       if (checked.dropped.length) {
         console.warn(`proposal dropped for message ${msg.id}: ${checked.dropped.join("; ")}`);
         meta.proposals_dropped = checked.dropped.map((d) => d.slice(0, 300));
+        meta.proposal_rejected = true; // Woo's text may still talk about both cards: the app shows its grey line even though one card is kept
       }
       if (checked.error) {
         meta.proposal_rejected = true;

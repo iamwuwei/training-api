@@ -65,7 +65,7 @@ const TYPE_ALIASES: Record<string, string> = {
 export function normalizeType(v: unknown): unknown {
   if (typeof v !== "string") return v;
   const k = v.trim().toLowerCase();
-  return PROPOSAL_TYPES.has(k) ? k : TYPE_ALIASES[k] ?? v;
+  return PROPOSAL_TYPES.has(k) ? k : Object.hasOwn(TYPE_ALIASES, k) ? TYPE_ALIASES[k] : v; // own keys only: "constructor" must not come back as a function
 }
 
 /** A string error when the value does not fit the field, else null. */

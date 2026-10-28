@@ -440,9 +440,11 @@ export interface ApiCoachMessage {
    */
   constraint: ApiConstraint | null;
   /**
-   * Woo 的提案沒過格式檢查: his cards failed the api's check (empty basis / impact, an add or remove
-   * without a reason, a date out of range, ...) and none were stored. Show one grey line
-   * "Woo 的提案沒過格式檢查，再問他一次"; the reply text itself is fine.
+   * Woo 的提案沒過格式檢查: this reply had a proposal that failed the api's check (empty basis / impact, an add or
+   * remove without a reason, a date out of range, a type that is not one of the five, ...). Either none was stored,
+   * or one card of an A/B pair failed and the other was kept (then `proposal` is still set: a single card with no
+   * `option`, while Woo's text may still talk about two). Show one grey line "Woo 的提案沒過格式檢查，再問他一次";
+   * the reply text itself is fine.
    */
   proposal_rejected: boolean;
   /**
