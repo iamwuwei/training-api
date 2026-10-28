@@ -9,6 +9,7 @@ import { shortDate, sportName, weeklyAskQuestion } from "../lib/labels";
 import { applyChange, applyProposal, changeConflict, postProposalApplied } from "../lib/proposals";
 import { deauthorize } from "../lib/strava";
 import { postRoutineDone } from "../lib/strength";
+import { COACH_STAGES } from "../lib/stage";
 import { requestWeeklyRerun, reviewMissingActivity, WEEKLY_REVIEW_SELECT } from "../lib/weekly";
 import type { ActivityRow, BriefsJob, CoachAskJob, CoachMessageRow, CoachReplyJob, ConstraintRow, PlanRow, PlanWeekRow, PlannedSessionRow, ProposalRow, ReviewRow, RoutineJob, SessionRoutineRow, StoredAdjustments, StravaConnectionRow, UserRow, WeeklyMessageMeta, WeeklyReviewRow } from "../types";
 import type {
@@ -968,6 +969,8 @@ function toApiCoachMessage(m: CoachMessageRow, cards?: Cards): ApiCoachMessage {
     proposal: proposal ? toApiProposal(proposal) : null,
     constraint: constraint ? toApiConstraint(constraint) : null,
     proposal_rejected: meta.proposal_rejected === true,
+    // Progress while Woo works on it: a white-listed value, only for a message that is waiting (or a weekly review being rewritten).
+    stage: typeof meta.stage === "string" && COACH_STAGES.has(meta.stage) && (m.status === "pending" || m.kind === "weekly") ? meta.stage : null,
     // Rows written before the worker stored the fixed line still hold the provider's wording: never shown.
     error: typeof meta.error === "string" && meta.error ? REPLY_FAILED : null,
     created_at: new Date(m.created_at).toISOString(),
@@ -1334,7 +1337,7 @@ async function postCoach(userId: string, raw: string) {
     await query("update coach_messages set meta = coalesce(meta, '{}'::jsonb) || '{\"state\":\"answered\"}'::jsonb where id = $1", [ask.id]);
     const m = await postCoachMessage({
       user_id: userId, role: "athlete", kind: "chat", text, status: "pending", activity_id: activity.id,
-      meta: { answer_to: ask.id, rpe: parsed.rpe },
+      meta: { answer_to: ask.id, rpe: parsed.rpe, stage: "reading" },
     });
     await query("delete from reviews where activity_id = $1 and source = 'claude'", [activity.id]);
     if (activity.session_id) await requeue(userId, activity.strava_activity_id, "check-in answered");
@@ -1368,7 +1371,8 @@ async function postCoach(userId: string, raw: string) {
 
   const m = await postCoachMessage({
     user_id: userId, role: "athlete", kind: "chat", text, status: "pending",
-    activity_id: body.activity_id ?? null, meta: quote || reProposeId ? { ...(quote ? { quote } : {}), ...(reProposeId ? { re_propose: reProposeId } : {}) } : null,
+    activity_id: body.activity_id ?? null,
+    meta: { stage: "preparing", ...(quote ? { quote } : {}), ...(reProposeId ? { re_propose: reProposeId } : {}) }, // the first stage is written here so the app never shows a stage-less wait
   });
   if (process.env.QUEUE_URL) {
     await sqs.send(new SendMessageCommand({

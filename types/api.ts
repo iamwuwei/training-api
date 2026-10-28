@@ -427,6 +427,14 @@ export interface ApiCoachMessage {
    * "Woo 的提案沒過格式檢查，再問他一次"; the reply text itself is fine.
    */
   proposal_rejected: boolean;
+  /**
+   * Where Woo is with this message while it is `pending` (the worker writes it as it goes; the
+   * thread polls for it). Values the api emits today: preparing, thinking, searching, writing
+   * (a chat reply); reading, judging (the verdict after the feel answer). Also on a weekly
+   * message while it is being rewritten (preparing, thinking). null when not pending or not
+   * known. Show unknown strings as "thinking": the list may grow without a web release.
+   */
+  stage: string | null;
   error: string | null;              // failed: a fixed line to show (the provider's wording stays in the logs)
   created_at: string;
 }

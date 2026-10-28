@@ -6,6 +6,7 @@ import { adjustmentLine, anthropicClient, appNotes, coachModel } from "./claude"
 import { validateConstraint } from "./constraints";
 import { type Querier, query, queryOne, withTransaction } from "./db";
 import { describeCard, describeItem, validateCards } from "./proposals"; // cycle with proposals.ts (postCoachMessage): both only used inside functions
+import { stageWriter } from "./stage";
 import type { CoachMessageRow, ProposalRow, RawCard, RawConstraint, StoredAdjustments, WeeklyReviewRow } from "../types";
 
 // Woo, the coach, as a thread. The weekly review and each run's verdict are posted
@@ -211,6 +212,24 @@ async function threadFor(userId: string, upTo: CoachMessageRow): Promise<Anthrop
   return turns;
 }
 
+/** The parameters of one reply request; `messages.stream` adds `stream: true` itself. */
+type ReplyParams = Omit<Anthropic.MessageCreateParamsNonStreaming, "stream">;
+
+/**
+ * finalMessage() is a ParsedMessage: its text blocks carry a `parsed_output` key. Blocks go back to the
+ * API when a pause_turn is resumed (`messages.push({ role: "assistant", content: res.content })`),
+ * and the API takes no such key, so it is dropped here.
+ */
+function stripParsed(m: Anthropic.Message): Anthropic.Message {
+  return {
+    ...m,
+    content: m.content.map((b) => {
+      const { parsed_output: _parsed, ...rest } = b as Anthropic.ContentBlock & { parsed_output?: unknown };
+      return rest as Anthropic.ContentBlock;
+    }),
+  };
+}
+
 /** The plain-text form's description of the JSON object (when the API refuses the schema next to web_search). */
 const PLAIN_FORMAT = `回覆格式：先寫回覆文字，最後另起一段只放一個 JSON 物件 {"proposals": [...], "constraint": ...}。沒有的字串欄位（field、reason、note、phase、focus、option_title）給空字串 ""。proposals 是 0〜2 張卡，每張 {"changes":[{"op":"change|add|remove","session_id":string|null,"field":string（add／remove 給 ""）,"old":...,"new":...,"new_session":{"scheduled_date","type","label","target_distance_m","target_pace_sec_km","note"}|null,"reason":string}],"weeks":[{"week_no","phase","focus"}],"why","basis":[...],"basis_text","impact":{"keep","change","risk"},"option_title":string,"recommended":boolean}；constraint 是 {"text","start_date","end_date","kind","weekday"} 或 null。沒有卡就是 []。`;
 
@@ -227,19 +246,42 @@ export async function answerCoachMessage(userId: string, messageId: string, toda
   const quote = msgMeta.quote ?? null;
   const deadline = Date.now() + CHAT_BUDGET_MS;
   try {
+    const stage = stageWriter(msg.id); // progress for the app's wait line; best-effort, never throws
+    await stage("preparing"); // the api wrote this value with the message already; once more, in case that message was made elsewhere
     const ctx = await loadCoachContext(userId, today, msgMeta.re_propose);
     const system = coachSystem(ctx, today, quote);
     const client = anthropicClient(CHAT_BUDGET_MS);
     // Every request: no SDK retry, and a timeout of what is left of the shared budget.
     let outputTokens = 0; // over every request of this reply, for meta
-    const send = async (params: Anthropic.MessageCreateParamsNonStreaming) => {
+    const streaming = process.env.COACH_STREAM === "true"; // anything else: one non-streaming request (stages: preparing, thinking only)
+    const send = async (params: ReplyParams): Promise<Anthropic.Message> => {
       const left = deadline - Date.now();
       if (left < CHAT_MIN_REQUEST_MS) throw new Error(`out of time for another request (${Math.round(left / 1000)} s left of ${CHAT_BUDGET_MS / 1000} s)`);
-      const r = await client.messages.create(params, { timeout: left, maxRetries: 0 });
-      outputTokens += r.usage?.output_tokens ?? 0;
-      return r;
+      if (!streaming) {
+        const r = await client.messages.create(params, { timeout: left, maxRetries: 0 });
+        outputTokens += r.usage?.output_tokens ?? 0;
+        return r;
+      }
+      // Same request, received as a stream so "searching" / "writing" can be seen as they begin.
+      // The SDK's timeout covers connecting only; the abort timer is the whole request's share of the budget.
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), left);
+      try {
+        const s = client.messages.stream(params, { signal: ac.signal, timeout: left, maxRetries: 0 });
+        s.on("streamEvent", (ev) => {
+          if (ev.type !== "content_block_start") return;
+          if (ev.content_block.type === "server_tool_use") void stage("searching");
+          else if (ev.content_block.type === "text") void stage("writing");
+        });
+        const r = await s.finalMessage();
+        outputTokens += r.usage?.output_tokens ?? 0;
+        return stripParsed(r);
+      } finally {
+        clearTimeout(timer);
+      }
     };
     const messages = await threadFor(userId, msg);
+    await stage("thinking");
     const tools = [{
       type: "web_search_20260209" as const,
       name: "web_search" as const,
