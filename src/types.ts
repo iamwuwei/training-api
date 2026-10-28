@@ -84,6 +84,11 @@ export interface ActivityRow {
   gear_id: string | null;
   gear_name: string | null;
   weather: string | null;
+  /** The athlete's own values (PUT …/details): shown over the three Strava-side ones above when set. */
+  gear_name_user: string | null;
+  device_name_user: string | null;
+  weather_user: string | null;
+  details_updated_at: Date | null;
   memo: string | null;
   rpe: number | null;
   memo_updated_at: Date | null;

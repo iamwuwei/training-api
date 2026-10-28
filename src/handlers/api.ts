@@ -27,6 +27,9 @@ import type {
   PutSessionResponse,
   PutMemoRequest,
   PutMemoResponse,
+  PutDetailsRequest,
+  PutDetailsResponse,
+  DetailOptionsResponse,
   RereviewResponse,
   WeeklyResponse,
   ApiWeeklyReview,
@@ -68,6 +71,8 @@ import type {
 //   PUT /activities/{id}/session     the athlete's pick: which planned session this activity was (+ memo/RPE), or ignore it;
 //                                    a pick that looks wrong gets Woo's 真的是這趟嗎 in the thread instead of a verdict
 //   PUT /activities/{id}/memo        athlete's own note + RPE (re-triggers the Claude review)
+//   PUT /activities/{id}/details     the athlete's own shoe / device / weather (shown over Strava's; no review, no job)
+//   GET /activities/detail-options   shoe / device names this athlete used before, for the editor's suggestions
 //   POST /activities/{id}/rereview   drop the Claude review (failed or stale) and queue a new one
 //   GET /weekly                      weekly coach reviews with their adjustment proposals
 //   POST /weekly/{id}/adjustments/{index}   apply or dismiss one proposal
@@ -88,7 +93,7 @@ const VERDICTS = new Set<string>(["達成", "達成但有提醒", "未達成"]);
 
 const sqs = new SQSClient({});
 
-const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | PutSessionResponse | PutMemoResponse | RereviewResponse | WeeklyResponse | PostAdjustmentResponse | CoachResponse | PostCoachMessageResponse | PutCoachSeenResponse | PostCheckinPickResponse | PostCheckinResetResponse | PostRoutineResponse | PutRoutineResponse | PostWeeklyAskResponse | PostProposalResponse | PostConstraintResponse | PlanChangedResponse | ErrorResponse>(
+const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | PutSessionResponse | PutMemoResponse | PutDetailsResponse | DetailOptionsResponse | RereviewResponse | WeeklyResponse | PostAdjustmentResponse | CoachResponse | PostCoachMessageResponse | PutCoachSeenResponse | PostCheckinPickResponse | PostCheckinResetResponse | PostRoutineResponse | PutRoutineResponse | PostWeeklyAskResponse | PostProposalResponse | PostConstraintResponse | PlanChangedResponse | ErrorResponse>(
   statusCode: number,
   body: T,
 ): APIGatewayProxyResultV2 => ({
@@ -148,12 +153,14 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
   if (method === "DELETE" && path === "/me/strava") return deleteStrava(user);
   if (method === "GET" && path === "/plan") return getPlan(user.id);
   if (method === "GET" && path === "/activities") return getActivities(user.id, q.status);
+  if (method === "GET" && path === "/activities/detail-options") return getDetailOptions(user.id);
 
   const raw = event.isBase64Encoded ? Buffer.from(event.body ?? "", "base64").toString("utf8") : event.body ?? "";
-  const sub = /^\/activities\/([^/]+)\/(review|session|memo)$/.exec(path);
+  const sub = /^\/activities\/([^/]+)\/(review|session|memo|details)$/.exec(path);
   if (method === "PUT" && sub) {
     if (sub[2] === "review") return putReview(user.id, sub[1], raw);
     if (sub[2] === "session") return putSession(user.id, sub[1], raw);
+    if (sub[2] === "details") return putDetails(user.id, sub[1], raw);
     return putMemo(user.id, sub[1], raw);
   }
   const re = /^\/activities\/([^/]+)\/rereview$/.exec(path);
@@ -203,7 +210,7 @@ async function getMe(user: UserRow, event: APIGatewayProxyEventV2WithJWTAuthoriz
 const ACTIVITY_SELECT = `
   a.id, a.user_id, a.strava_activity_id, a.session_id, a.sport_type, a.start_time, a.distance_m, a.moving_time_sec,
   a.avg_pace_sec_km, a.avg_hr, a.max_hr, a.avg_watts, a.kcal, a.description, a.device_name, a.gear_id,
-  a.gear_name, a.weather, a.memo, a.rpe, a.memo_updated_at, a.splits, a.match_status,
+  a.gear_name, a.weather, a.gear_name_user, a.device_name_user, a.weather_user, a.details_updated_at, a.memo, a.rpe, a.memo_updated_at, a.splits, a.match_status,
   r.verdict as r_verdict, r.comment as r_comment, r.reminders as r_reminders,
   r.source as r_source, r.model as r_model, r.adjust_hint as r_adjust_hint, r.created_at as r_created_at`;
 
@@ -232,10 +239,28 @@ function toApiReview(r: Pick<ReviewRow, "verdict" | "comment" | "reminders" | "s
   };
 }
 
+/** Shoe / device / weather: the athlete's value over Strava's, and where the shown one came from. */
+function detailOf(user: string | null, strava: string | null): ApiActivity["details"]["gear_name"] {
+  return { source: user != null ? "user" : strava != null ? "strava" : null, strava };
+}
+
 function toApiActivity(a: ActivityJoined): ApiActivity {
-  const { r_verdict, r_comment, r_reminders, r_source, r_model, r_adjust_hint, r_created_at, ...rest } = a;
+  const {
+    r_verdict, r_comment, r_reminders, r_source, r_model, r_adjust_hint, r_created_at,
+    gear_name_user, device_name_user, weather_user, details_updated_at,
+    ...rest
+  } = a;
   return {
     ...rest,
+    gear_name: gear_name_user ?? a.gear_name,
+    device_name: device_name_user ?? a.device_name,
+    weather: weather_user ?? a.weather,
+    details: {
+      gear_name: detailOf(gear_name_user, a.gear_name),
+      device_name: detailOf(device_name_user, a.device_name),
+      weather: detailOf(weather_user, a.weather),
+    },
+    details_updated_at: details_updated_at ? new Date(details_updated_at).toISOString() : null,
     start_time: new Date(a.start_time).toISOString(),
     memo_updated_at: a.memo_updated_at ? new Date(a.memo_updated_at).toISOString() : null,
     splits: (a.splits as ApiActivity["splits"]) ?? null,
@@ -599,6 +624,76 @@ async function putMemo(userId: string, activityId: string, raw: string) {
     [activityId],
   );
   return json<PutMemoResponse>(200, { activity: toApiActivity(row) });
+}
+
+const DETAIL_MAX_CHARS = 40;
+const DETAIL_FIELDS = ["gear_name", "device_name", "weather"] as const;
+
+/**
+ * One value of PUT …/details: a string becomes single-line text (control characters and runs of
+ * whitespace -> one space, trimmed); "" / null / nothing left means clear (value null). `error` is the 400 text.
+ */
+function cleanDetail(v: unknown, field: string): { value: string | null } | { error: string } {
+  if (v === null) return { value: null };
+  if (typeof v !== "string") return { error: `${field} must be a string` };
+  const clean = v.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
+  if (clean.length > DETAIL_MAX_CHARS) return { error: `${field} too long (${DETAIL_MAX_CHARS} chars)` };
+  return { value: clean || null };
+}
+
+/**
+ * The athlete's own shoe / device / weather. Writes only the *_user columns (Strava's sync never
+ * touches them), so a later sync cannot overwrite them. A value equal to Strava's own is stored as
+ * null: the athlete "set" what Strava already says, which must not read as a manual edit.
+ * No review is dropped and no job is queued: these fields do not go into any prompt.
+ */
+async function putDetails(userId: string, activityId: string, raw: string) {
+  if (!UUID_RE.test(activityId)) return json(400, { error: "invalid activity id" });
+  let body: unknown;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    return json(400, { error: "invalid json" });
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) return json(400, { error: "body must be an object" });
+  const req = body as PutDetailsRequest;
+  const sets: string[] = [];
+  const params: unknown[] = [activityId, userId];
+  for (const field of DETAIL_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(req, field)) continue; // absent: left alone
+    const cleaned = cleanDetail(req[field], field);
+    if ("error" in cleaned) return json(400, { error: cleaned.error });
+    params.push(cleaned.value);
+    const column = field; // a fixed name from DETAIL_FIELDS, never from the request
+    sets.push(`${column}_user = case when $${params.length}::text = ${column} then null else $${params.length}::text end`);
+  }
+  if (!sets.length) return json(400, { error: "nothing to update" });
+
+  const hit = await query<{ id: string }>(
+    `update activities set ${sets.join(", ")}, details_updated_at = now() where id = $1 and user_id = $2 returning id`,
+    params,
+  );
+  if (!hit.length) return json(404, { error: "activity not found" });
+
+  const [row] = await query<ActivityJoined>(
+    `select ${ACTIVITY_SELECT} from activities a left join reviews r on r.activity_id = a.id where a.id = $1 and a.user_id = $2`,
+    [activityId, userId],
+  );
+  return json<PutDetailsResponse>(200, { activity: toApiActivity(row) });
+}
+
+/** Shoe / device names this athlete had before (their own and Strava's), most recently used first. */
+async function getDetailOptions(userId: string) {
+  const names = async (column: "gear_name" | "device_name"): Promise<string[]> =>
+    (await query<{ v: string }>(
+      `select v from (
+         select ${column}_user as v, coalesce(details_updated_at, start_time) as t from activities where user_id = $1 and ${column}_user is not null
+         union all
+         select ${column} as v, start_time as t from activities where user_id = $1 and ${column} is not null and ${column} <> ''
+       ) s group by v order by max(t) desc, v limit 8`,
+      [userId],
+    )).map((r) => r.v);
+  return json<DetailOptionsResponse>(200, { gear_name: await names("gear_name"), device_name: await names("device_name") });
 }
 
 /** Drop the Claude review (failed, stale or just unwanted) and have the worker write a new one. */

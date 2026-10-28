@@ -92,6 +92,12 @@ alter table activities add column if not exists device_name text;
 alter table activities add column if not exists gear_id text;
 alter table activities add column if not exists gear_name text;      -- shoes
 alter table activities add column if not exists weather text;        -- free text; no automatic source yet
+-- The athlete's own values for the three above (PUT /activities/{id}/details). Shown over the Strava
+-- ones when set; Strava's sync only writes gear_name / device_name, never these.
+alter table activities add column if not exists gear_name_user text;      -- shoes; shown over gear_name (Strava) when set
+alter table activities add column if not exists device_name_user text;
+alter table activities add column if not exists weather_user text;        -- weather has no automatic source: this is the only one
+alter table activities add column if not exists details_updated_at timestamptz;  -- last PUT …/details
 alter table activities add column if not exists memo text;           -- athlete's own note, written in the app
 alter table activities add column if not exists rpe int;             -- athlete's RPE 1-10
 alter table activities add column if not exists memo_updated_at timestamptz;

@@ -127,9 +127,12 @@ export interface ApiActivity {
   memo: string | null;        // athlete's own note, PUT …/memo
   rpe: number | null;         // athlete's RPE 1-10, PUT …/memo
   memo_updated_at: string | null;
-  device_name: string | null;
-  gear_name: string | null;   // shoes
-  weather: string | null;     // free text, may be null
+  device_name: string | null; // what to show: the athlete's value (PUT …/details) when set, else Strava's
+  gear_name: string | null;   // shoes; same rule
+  weather: string | null;     // free text; the athlete's value (no automatic source), may be null
+  /** Where each of the three above comes from, and Strava's own value for the editor's "清除後回到：…". */
+  details: Record<"gear_name" | "device_name" | "weather", { source: "user" | "strava" | null; strava: string | null }>;
+  details_updated_at: string | null; // last PUT …/details
   splits: ApiSplit[] | null;
   match_status: MatchStatus;
   review: ApiReview | null;
@@ -277,6 +280,34 @@ export interface PutMemoRequest {
 
 export interface PutMemoResponse {
   activity: ApiActivity;
+}
+
+// ---- PUT <ApiUrl>/activities/{id}/details --------------------------------------
+// The athlete's own shoe / device / weather for one activity. A key that is present is
+// set: a string (trimmed, single line, ≤ 40 chars) becomes the athlete's value and is
+// shown over Strava's; "" or null clears it (back to Strava's value, or nothing for
+// weather). A string equal to Strava's own value for that field is stored as "no
+// override" (it shows as Strava's). Keys that are absent are left alone. 400: no known
+// key, a non-string, over 40 chars. 404: not this user's activity. Does not touch
+// memo / RPE / the review, and does not queue anything.
+
+export interface PutDetailsRequest {
+  gear_name?: string | null;
+  device_name?: string | null;
+  weather?: string | null;
+}
+
+export interface PutDetailsResponse {
+  activity: ApiActivity;
+}
+
+// ---- GET <ApiUrl>/activities/detail-options ------------------------------------
+// Names this athlete used before (own values and Strava's), distinct, most recently
+// used first, at most 8 each. For the editor's suggestions.
+
+export interface DetailOptionsResponse {
+  gear_name: string[];
+  device_name: string[];
 }
 
 // ---- POST <ApiUrl>/activities/{id}/rereview ------------------------------------
