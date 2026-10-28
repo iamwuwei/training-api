@@ -133,7 +133,12 @@ export class TrainingApiStack extends cdk.Stack {
     // 180 s: a chat reply with two full cards plus up to three web searches does not fit in 90 s.
     const worker = fn("worker", {
       timeout: cdk.Duration.seconds(180),
-      environment: { ...stravaEnv, ...claudeEnv, AUTO_REVIEW: process.env.AUTO_REVIEW ?? "true", WEEKLY_FUNCTION_NAME: weekly.functionName },
+      environment: {
+        ...stravaEnv, ...claudeEnv, AUTO_REVIEW: process.env.AUTO_REVIEW ?? "true", WEEKLY_FUNCTION_NAME: weekly.functionName,
+        // "true": the chat reply is received as a stream, so the app can show "查資料中" / "寫回覆中". Off until the
+        // streaming + json_schema + web_search request has been tried against the real API (01b "真 API 小測試").
+        COACH_STREAM: process.env.COACH_STREAM ?? "false",
+      },
       reservedConcurrentExecutions: 2,
     });
     // maxConcurrency matches the reserved concurrency (2): without it the poller keeps handing
@@ -243,9 +248,11 @@ export class TrainingApiStack extends cdk.Stack {
       ["/me/strava", [apigw.HttpMethod.DELETE]],
       ["/plan", [apigw.HttpMethod.GET]],
       ["/activities", [apigw.HttpMethod.GET]],
+      ["/activities/detail-options", [apigw.HttpMethod.GET]],
       ["/activities/{id}/review", [apigw.HttpMethod.PUT]],
       ["/activities/{id}/session", [apigw.HttpMethod.PUT]],
       ["/activities/{id}/memo", [apigw.HttpMethod.PUT]],
+      ["/activities/{id}/details", [apigw.HttpMethod.PUT]],
       ["/activities/{id}/rereview", [apigw.HttpMethod.POST]],
       ["/weekly", [apigw.HttpMethod.GET]],
       ["/weekly/{id}/adjustments/{index}", [apigw.HttpMethod.POST]],

@@ -37,6 +37,7 @@ cp .env.example .env
 | `CLAUDE_MODEL_WEEKLY` | 週總結，預設 `claude-sonnet-5-5`（一週一次，讀整份課表＋兩週資料） |
 | `CLAUDE_MODEL_COACH` | Woo 回話，預設 `claude-sonnet-5-5`，帶 web search（地點、路線、天氣、賽事會先查） |
 | `AUTO_REVIEW` | `true`（預設）：使用者把活動對應到課表後，worker 請 Claude 寫判定；`false` 關掉 |
+| `COACH_STREAM` | worker 的 Lambda 環境變數，預設 `false`。`true`：Woo 的對話回覆用串流接收（同一個請求、同樣的 165 s 預算），等待時才看得到「查資料中」「寫回覆中」；其他值是一般請求，只有「整理資料中」「思考中」兩個階段。要開之前先用真的 API 試一次串流＋json_schema＋web_search（見 work/ui-polish-1/01b 的「真 API 小測試」） |
 | `STAGE` | 預設 `prod`，決定所有資源名稱的後綴 |
 | `CORS_ORIGIN` | 逗號分隔，例如 `https://training.pages.dev,http://localhost:5173`；同時是 API CORS 和 Cognito 的 callback / logout URL |
 | `COGNITO_DOMAIN_PREFIX` | hosted UI 網域前綴，預設 `training-api-prod-<account id>` |
@@ -197,12 +198,14 @@ aws cognito-idp admin-set-user-password --user-pool-id $POOL --username you@exam
 - `POST <ApiUrl>/activities/{id}/rereview` → 刪掉 Claude 判定、丟回 SQS 重評（202）。沒有對應課表或有手動判定回 409。
 - `GET <ApiUrl>/weekly` → `WeeklyResponse { reviews }`：每週總結（最新在前）與調整建議，每條建議有 `status: pending | applied | dismissed`。
 - `POST <ApiUrl>/weekly/{id}/adjustments/{index}` body `{ action: "apply" | "dismiss" }` → 採用會新增一筆 `version+1` 的 planned_session、舊的標 `superseded`、活動跟著搬；`/plan` 立刻反映。
-- `GET <ApiUrl>/coach` → `CoachResponse { coach: { name: "Woo" }, messages }`：教練的對話串（最近 100 則，舊在前）。週總結和每次判定由系統貼進來；跑者的訊息 `pending` 直到 Woo 回覆、失敗是 `failed`。
+- `GET <ApiUrl>/coach?limit=10&before=<訊息 id>` → `CoachResponse { coach: { name: "Woo" }, messages, has_more }`：教練的對話串，一頁 `limit` 則（預設 10、最多 100，舊在前）；帶 `before` 回那則之前的一頁（keyset：`created_at` + `id`）。`limit` 或 `before` 不合法、`before` 不是自己的訊息都回 400。等回覆的訊息帶 `stage`（`preparing`／`thinking`／`searching`／`writing`／`reading`／`judging`，worker 邊做邊寫進 `coach_messages.meta`），回覆寫入後就是 null。週總結和每次判定由系統貼進來；跑者的訊息 `pending` 直到 Woo 回覆、失敗是 `failed`。
 - `PUT <ApiUrl>/coach/seen` → `{ seen_at }`：跑者打開教練頁時呼叫，`GET /plan` 的 `coach_unread`（Woo 在那之後貼的訊息數）歸零；前端用它亮「教練」tab 的小點。
 - `POST <ApiUrl>/coach/checkins/{id}/pick` body `{ activity_id }`（休息日模式 `{ session_id }`）或 `{ none: true }` → `{ checkin, pick }`：Woo 的 check-in 選了一個 chip。把活動配到今天的課（不先分析），貼跑者的 `pick`（`pending`），丟 SQS `{ type: "coach_ask" }` 讓 worker 用教練模型寫一句追問（`ask`）。`none` 是「都不是」，Woo 回一句、不配課。
 - `POST <ApiUrl>/coach/messages` 多了 `answer_to`（`ask` 的 id）和 `rpe`：回 Woo 的追問。文字存成活動的心得、RPE 存進活動，刪掉舊的 Claude 判定、requeue 分析；判定貼進對話串後跑者這則由 `pending` 變 `sent`。不會另外產生聊天回覆。
 - `POST <ApiUrl>/coach/messages` body `{ text, activity_id? }` → 202，存成 `pending` 並丟 SQS，worker 用 Haiku 回（`src/lib/coach.ts`）；前端輪詢 `GET /coach`。`activity_id` 會把那筆活動的一行摘要當引用。500 字上限；`COACH_DAILY_LIMIT`（預設 0 = 不限）之後開放給別人用時再打開。
 - `PUT <ApiUrl>/activities/{id}/memo` body `PutMemoRequest { memo, rpe? }` → 跑者自己的心得和 RPE（1〜10）。存完如果那筆的判定是 Claude 寫的，會刪掉重評，新的判定會參考這段自述；手動判定不動。
+- `PUT <ApiUrl>/activities/{id}/details` body `PutDetailsRequest { gear_name?, device_name?, weather? }` → 跑者自己填的鞋、裝置、天氣（單行、<= 40 字）。有帶的 key 才動；`""` 或 `null` 清除（回到 Strava 的值）；跟 Strava 的值一樣就存成沒填。存在 `*_user` 欄位，Strava 同步不會蓋掉；`ApiActivity` 的 `gear_name`／`device_name`／`weather` 是顯示值（用戶的優先），`details` 說明來源與 Strava 原值。不會重評、不進 prompt。
+- `GET <ApiUrl>/activities/detail-options` → `{ gear_name: string[], device_name: string[] }`：這個跑者用過的鞋、裝置名（自己填的＋Strava 帶的），最近用過的在前、各最多 8 個，給編輯畫面當建議。
 - `PUT <ApiUrl>/activities/{id}/session` body `PutSessionRequest { session_id, memo?, rpe?, replace?, status? }` → 使用者指定這筆活動是哪堂課（`confirmed`），可同時帶心得與 RPE。原本 `auto` 占著那個 session 的活動會退回 `unplanned`；`confirmed` 占著回 409（帶 `replace: true` 才換）。指定後舊的 Claude 判定刪掉、丟回 SQS 重評一次。`session_id: null` 配 `status: "ignored"` 表示這筆不算。
 
 ## 心得 vs 判定

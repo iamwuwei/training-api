@@ -7,6 +7,7 @@ import { postCoachMessage } from "./coach";
 import { historyBetween } from "./context";
 import { type Querier, query, queryOne, withTransaction } from "./db";
 import { sessionLabel, shortDate, sportName } from "./labels";
+import { type CoachStage, clearReviewStage, stageWriterByReview } from "./stage";
 import { type CardDraft, describeCard, describeChange, validateCards } from "./proposals";
 import type { CoachMessageRow, PlanRow, PlannedSessionRow, ProposalRow, StoredAdjustment, StoredAdjustments, WeeklyMessageMeta, WeeklyRerunRequest, WeeklyReviewRow } from "../types";
 
@@ -66,7 +67,15 @@ type Plan = PlanRow & { display_name: string };
  * review of the week starting `weekStart` for `plan`. Posts / updates the thread
  * message, then rewrites the next two weeks' briefs. Serialised per (plan, week).
  */
-export async function runWeeklyReview(plan: Plan, weekStart: string, existing?: WeeklyReviewRow, reason?: string, guard: RerunGuard = {}): Promise<WeeklyRunResult> {
+export async function runWeeklyReview(
+  plan: Plan,
+  weekStart: string,
+  existing?: WeeklyReviewRow,
+  reason?: string,
+  guard: RerunGuard = {},
+  /** Progress for the thread's "Woo is rewriting" line (a rewrite only). Autocommit writes, see stage.ts. */
+  stage?: (s: CoachStage) => Promise<void>,
+): Promise<WeeklyRunResult> {
   const weekEnd = addDays(weekStart, 6);
   const r = await withTransaction(async (q): Promise<Generated | { review_id: string; skipped: true }> => {
     await q("select pg_advisory_xact_lock(hashtext($1))", [`${plan.id}:${weekStart}`]);
@@ -77,7 +86,7 @@ export async function runWeeklyReview(plan: Plan, weekStart: string, existing?: 
       console.log(`weekly review ${current.id} for plan ${plan.id} week ${weekStart}: ${alreadyDone}; not running again`);
       return { review_id: current.id, skipped: true };
     }
-    return generate(q, plan, weekStart, weekEnd, current, current ? reason ?? "重新回顧" : undefined);
+    return generate(q, plan, weekStart, weekEnd, current, current ? reason ?? "重新回顧" : undefined, stage);
   });
   if ("skipped" in r) return { review_id: r.review_id, adjustments: 0, asks: 0, skipped: true };
 
@@ -106,7 +115,12 @@ export async function runWeeklyReview(plan: Plan, weekStart: string, existing?: 
       const why = `${shortDate(m.date)} 的 ${m.label ?? sportName(m.sport_type)} 進來了`;
       console.log(`weekly review ${r.review_id}: ${missed.length} activity(ies) arrived during generation, regenerating (${why})`);
       const row = await queryOne<WeeklyReviewRow>(`${WEEKLY_REVIEW_SELECT} where id = $1`, [r.review_id]);
-      const rerun = await runWeeklyReview(plan, weekStart, row, why, { activityId: m.id });
+      let rerun: WeeklyRunResult;
+      try {
+        rerun = await runWeeklyReview(plan, weekStart, row, why, { activityId: m.id }, stageWriterByReview(r.review_id));
+      } finally {
+        await clearReviewStage(r.review_id);
+      }
       // The rerun found nothing to do (a requested rerun brought the activity in first and
       // wrote the briefs): this run still generated the review, so report that, not "skipped".
       if (!rerun.skipped) return rerun;
@@ -162,9 +176,14 @@ export async function rerunWeekly(req: WeeklyRerunRequest): Promise<WeeklyRunRes
     [w.plan_id],
   );
   if (!plan) return undefined;
-  const r = await runWeeklyReview(plan, w.week_start, w, req.reason, { requestedAt: req.requested_at, activityId: req.activity_id });
-  if (!r.skipped) console.log(`weekly review ${r.review_id} regenerated (${req.reason}): ${r.adjustments} adjustments, ${r.asks} asks`);
-  return r;
+  const stage = stageWriterByReview(w.id);
+  try {
+    const r = await runWeeklyReview(plan, w.week_start, w, req.reason, { requestedAt: req.requested_at, activityId: req.activity_id }, stage);
+    if (!r.skipped) console.log(`weekly review ${r.review_id} regenerated (${req.reason}): ${r.adjustments} adjustments, ${r.asks} asks`);
+    return r;
+  } finally {
+    await clearReviewStage(w.id); // done, skipped or failed: the thread must not keep saying Woo is working on it
+  }
 }
 
 /**
@@ -198,6 +217,7 @@ async function generate(
   weekEnd: string,
   existing: WeeklyReviewRow | undefined,
   reason: string | undefined,
+  stage?: (s: CoachStage) => Promise<void>,
 ): Promise<Generated> {
   const sessions = await q<PlannedSessionRow>(SESSIONS_SELECT, [plan.id, weekStart, weekEnd]);
   const activities = await historyBetween(plan.user_id, weekStart, weekEnd);
@@ -215,6 +235,7 @@ async function generate(
   );
 
   // The whole plan to the race, every activity so far, the constraints: what the chat gets too.
+  await stage?.("preparing");
   const today = todayJst();
   const scope = await loadPlanBriefing(plan, today);
   const briefing = buildPlanBriefing(scope, today);
@@ -240,6 +261,7 @@ async function generate(
     ...appliedCards.map(describeCard),
   ];
 
+  await stage?.("thinking");
   const review = await weeklyReview({
     plan, weeks, weekStart, weekEnd, briefing, sessions, activities, hints,
     previousSummary: previous?.summary ?? null,
@@ -314,7 +336,9 @@ async function generate(
     `update weekly_reviews set summary = $2, adjustments = $3, updated_at = now(), update_reason = $4 where id = $1`,
     [existing.id, review.summary, JSON.stringify(toStore), reason ?? null],
   );
-  const { proposal_ids: _oldIds, proposal_rejected: _oldRejected, ...carried } = latestMeta;
+  // `stage` is progress for the rewrite that is ending: the new meta must not carry it over.
+  const { proposal_ids: _oldIds, proposal_rejected: _oldRejected, ...carriedWithStage } = latestMeta as Partial<WeeklyMessageMeta> & { stage?: unknown };
+  const { stage: _oldStage, ...carried } = carriedWithStage;
   const newMeta: WeeklyMessageMeta = {
     ...carried,
     week_start: weekStart,
