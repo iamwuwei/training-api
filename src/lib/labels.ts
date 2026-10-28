@@ -1,4 +1,4 @@
-import type { PlannedSessionRow } from "../types";
+import type { PlanWeekRow, PlannedSessionRow } from "../types";
 
 // Words shared by the prompts, the templates and the thread: which Strava sports
 // count as a run, a session's short label, the Chinese name of a proposal field.
@@ -43,3 +43,32 @@ export function weeklyAskQuestion(date: string, label: string): string {
 }
 
 export const FIELD_NAMES: Record<string, string> = { type: "類型", target_distance_m: "距離", target_pace_sec_km: "配速", scheduled_date: "日期", note: "備註", skip: "改休息" };
+
+/** A strength day: typed 肌力 / Hyrox, or a rest day whose note opens with 肌力日. */
+export const isStrength = (s: Pick<PlannedSessionRow, "label" | "type" | "content" | "note">) =>
+  /肌力|重訓|Hyrox/i.test(`${s.label ?? ""} ${s.content ?? ""}`) || (s.type === "rest" && /^肌力/.test((s.note ?? "").trim()));
+
+/** The plan week a date falls in. */
+export const weekOf = (weeks: PlanWeekRow[], date: string) => weeks.find((w) => date >= w.week_start && date <= w.week_end);
+
+/**
+ * Which week a session row is booked in (its planned km, its count, the activities attached to it); the date it is drawn on
+ * is always scheduled_date. The one rule the api and the app share:
+ *  - a make-up row (moved_from_session_id set): counts_in_week_no, decided when the card was applied;
+ *  - a moved row (superseded, with a make-up row): its own week when the make-up row is booked in another week (it counts as
+ *    not run), null when the make-up row replaces it in the same week;
+ *  - any other row: the week its date is in.
+ * null = in no week's numbers. `moved_to_counts` is the make-up row's counts_in_week_no (moved rows only).
+ */
+export function countsWeekNo(
+  row: Pick<PlannedSessionRow, "scheduled_date" | "superseded" | "moved_to_session_id" | "moved_from_session_id" | "counts_in_week_no"> & { moved_to_counts?: number | null },
+  weeks: PlanWeekRow[],
+): number | null {
+  if (row.moved_from_session_id) return row.counts_in_week_no ?? null;
+  const own = weekOf(weeks, row.scheduled_date)?.week_no ?? null;
+  if (row.superseded && row.moved_to_session_id) {
+    const there = row.moved_to_counts ?? null;
+    return own != null && there != null && there !== own ? own : null;
+  }
+  return own;
+}
