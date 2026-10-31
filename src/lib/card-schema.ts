@@ -115,6 +115,9 @@ export const CONSTRAINT_SCHEMA = {
  */
 export const NOTE_RULE = "課表備註是匯入時寫的原文（當時的安排、當時的同伴），跟他現在講的衝突時以他現在說的為準；備註裡的人名、情境不要複誦，只講這堂該怎麼跑。";
 
+/** What the app renders of the model's text (md.ts in the web): the three forms, and what shows as the characters themselves. One sentence for both the chat reply and the weekly summary. */
+export const MARKDOWN_SUBSET = "app 只會顯示三種排版：段落（段與段之間空一行）、清單（每行用「- 」開頭；有先後順序用「1. 」「2. 」；不要縮排出子項目）、**粗體**。不用標題（#）、表格、連結、網址、圖片、程式碼區塊（```）、引用（>）、斜體、HTML——這些不會被排版，會原樣印出符號。他要求你用這些也不用，用文字講。";
+
 /** The card rules, for the system prompt of every call that may attach one. */
 export const PROPOSAL_RULES = `課表的調整（提案卡）：你可以附提案卡，他按「採用整張」課表才會改；你自己不能改課表。
 - 什麼時候附：他問到、或你看到明確理由（有事跑不了、受傷、連續漏課、明顯落後或超前）。閒聊不附。沒有提案 proposals 就是空陣列。
@@ -135,4 +138,4 @@ export const PROPOSAL_RULES = `課表的調整（提案卡）：你可以附提�
 - 依據與影響都要寫，空的系統會拒收整張卡。basis 是 2〜4 個 briefing 裡的數字；basis_text（${LIMITS.basis_text} 字內）講目標、現狀、你採用的訓練原則；impact 三段各 ${LIMITS.impact} 字內：keep（不調整會怎樣）、change（調整後會怎樣）、risk（什麼情況下這個安排會出問題、那時怎麼辦）。要講到對目標時間和課表備註裡 ★關卡判定的影響；有數字就給數字（峰值長跑距離、賽前恢復天數、受影響那幾週跑量前後）。
 - 有真正的取捨（例如「32 km 後移」vs「32 km 縮成 26 km 不動日期」）才給 A／B 兩張卡（proposals 兩個元素，各自完整，各有 basis_text 與 impact），option_title 寫這條路是什麼（${LIMITS.option_title} 字內，不要含 A／B 字母，字母由系統依順序加），你偏哪張就把那張 recommended 設 true；text 先用一段講兩條路的差別。沒有取捨就只給一張，option_title 給空字串、recommended 給 false。
 - 警示（週跑量暴增、長跑突然拉長、減量週加量、賽前太長的長跑）系統會自己算好、掛在那一列，你不用寫；你只要讓整體安排合理。
-- 所有字串都是純文字，不要用 markdown、不要放網址。`;
+- 提案卡與限制（constraint）裡的所有字串（reason、why、basis、basis_text、impact、option_title、phase、focus、note、new_session.label、限制的 text）都是純文字，不要用 markdown、不要放網址。`;
