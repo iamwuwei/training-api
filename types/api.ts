@@ -357,6 +357,7 @@ export interface ApiAdjustment {
 export interface ApiWeeklyReview {
   id: string;
   week_start: string; // 'YYYY-MM-DD' (Monday)
+  /** Weekly summary; may use the markdown subset: paragraphs, "- " / "1. " lists, **bold**. Other kinds of text are plain. */
   summary: string | null;
   model: string | null;
   adjustments: ApiAdjustment[];
@@ -402,6 +403,7 @@ export interface ApiCoachMessage {
   id: string;
   role: "coach" | "athlete";
   kind: "weekly" | "review" | "chat" | "checkin" | "pick" | "ask";
+  /** chat replies and weekly summaries may use the markdown subset: paragraphs, "- " / "1. " lists, **bold**; other kinds are plain text. */
   text: string;
   activity_id: string | null;        // review/ask/pick: that run; athlete chat: the quoted run
   weekly_review_id: string | null;   // weekly: look its proposals up in GET /weekly
