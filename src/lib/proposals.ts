@@ -409,9 +409,9 @@ function validateCard(b: PlanBriefing, raw: RawCard, today: string): CardDraft |
     if (!w || typeof w.week_no !== "number" || !Number.isInteger(w.week_no)) return "weeks[].week_no must be an integer";
     if (!b.weeks.some((x) => x.week_no === w.week_no)) return `week ${w.week_no} is not in the plan`;
     if (!weekNos.has(w.week_no)) continue; // a week this card does not change: the model listed it for nothing, ignore it (do not drop the card)
-    if (weeks.some((x) => x.week_no === w.week_no)) return `week ${w.week_no} listed twice`;
     const phase = text(w.phase) || null, focus = text(w.focus) || null;
-    if (!phase && !focus) return `week ${w.week_no} has nothing to change`;
+    if (!phase && !focus) continue; // a touched week with both fields empty ("" = nothing to change): skip it, keep the card
+    if (weeks.some((x) => x.week_no === w.week_no)) return `week ${w.week_no} listed twice`;
     if (phase && phase.length > LIMITS.phase) return `week ${w.week_no} phase longer than ${LIMITS.phase}`;
     if (focus && focus.length > LIMITS.focus) return `week ${w.week_no} focus longer than ${LIMITS.focus}`;
     weeks.push({ week_no: w.week_no, phase, focus });
