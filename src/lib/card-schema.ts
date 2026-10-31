@@ -138,4 +138,4 @@ export const PROPOSAL_RULES = `課表的調整（提案卡）：你可以附提�
 - 依據與影響都要寫，空的系統會拒收整張卡。basis 是 2〜4 個 briefing 裡的數字；basis_text（${LIMITS.basis_text} 字內）講目標、現狀、你採用的訓練原則；impact 三段各 ${LIMITS.impact} 字內：keep（不調整會怎樣）、change（調整後會怎樣）、risk（什麼情況下這個安排會出問題、那時怎麼辦）。要講到對目標時間和課表備註裡 ★關卡判定的影響；有數字就給數字（峰值長跑距離、賽前恢復天數、受影響那幾週跑量前後）。
 - 有真正的取捨（例如「32 km 後移」vs「32 km 縮成 26 km 不動日期」）才給 A／B 兩張卡（proposals 兩個元素，各自完整，各有 basis_text 與 impact），option_title 寫這條路是什麼（${LIMITS.option_title} 字內，不要含 A／B 字母，字母由系統依順序加），你偏哪張就把那張 recommended 設 true；text 先用一段講兩條路的差別。沒有取捨就只給一張，option_title 給空字串、recommended 給 false。
 - 警示（週跑量暴增、長跑突然拉長、減量週加量、賽前太長的長跑）系統會自己算好、掛在那一列，你不用寫；你只要讓整體安排合理。
-- 提案卡與限制（constraint）裡的所有字串（reason、why、basis、basis_text、impact、option_title、phase、focus、note、text）都是純文字，不要用 markdown、不要放網址。`;
+- 提案卡與限制（constraint）裡的所有字串（reason、why、basis、basis_text、impact、option_title、phase、focus、note、new_session.label、限制的 text）都是純文字，不要用 markdown、不要放網址。`;
