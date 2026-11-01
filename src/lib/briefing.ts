@@ -4,6 +4,7 @@ import { countsWeekNo, isRunSport, isStrength, shortDate, sportName, weekOf } fr
 import { fullSplits, splitPace } from "./splits";
 import { trendLines, type TrendRun } from "./trend";
 import { loadPlanWeeks } from "./context";
+import { combineGroup, GROUP_ACTIVITY_SELECT, GROUP_DATE_JOIN, type GroupActivity, type SegmentInfo } from "./session-group";
 import type { ConstraintRow, PlanRow, PlanWeekRow, PlannedSessionRow, StravaSplit, Verdict } from "../types";
 
 // The coach's briefing: the whole plan from today to the race day (every session
@@ -48,6 +49,11 @@ export interface BriefActivity {
   session: PlannedSessionRow | null;
   verdict: Verdict | null;
   reminders: string[];
+  /**
+   * One entry per recording; a session with several recordings is ONE BriefActivity (id = the primary, numbers = the
+   * combined ones, splits joined, verdict / reminders the primary's). Length 1 for an ordinary activity.
+   */
+  segments: Pick<SegmentInfo, "start_hm" | "distance_m" | "moving_time_sec" | "avg_pace_sec_km" | "gap_min">[];
 }
 
 /** Everything the briefing and the card validation need about one athlete's plan. */
@@ -71,12 +77,7 @@ export const SPLIT_DAYS = 14;
 
 const addDays = (iso: string, n: number) => new Date(Date.parse(`${iso}T00:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10);
 
-interface ActivityRow {
-  id: string; date: string; sport_type: string | null; distance_m: number; moving_time_sec: number;
-  avg_pace_sec_km: number | null; avg_hr: number | null; max_hr: number | null; rpe: number | null;
-  memo: string | null; description: string | null; session_id: string | null; splits: StravaSplit[] | null;
-  verdict: Verdict | null; reminders: string[] | null;
-}
+type ActivityRow = GroupActivity & { verdict: Verdict | null; reminders: string[] | null };
 
 export async function loadPlanBriefing(plan: Plan, today: string): Promise<PlanBriefing> {
   const weeks = await loadPlanWeeks(plan.id);
@@ -103,23 +104,37 @@ export async function loadPlanBriefing(plan: Plan, today: string): Promise<PlanB
   const reviews = await query<{ week_start: string }>("select to_char(week_start, 'YYYY-MM-DD') as week_start from weekly_reviews where plan_id = $1", [plan.id]);
   const reviewedWeeks = new Set(weeks.filter((w) => reviews.some((r) => r.week_start <= w.week_start && addDays(r.week_start, 6) >= w.week_start)).map((w) => w.week_no));
   const from = weeks[0]?.week_start ?? addDays(today, -120);
+  // A session of several recordings is one line: dated by its first recording (a second one after midnight stays on that day and week).
   const rows = await query<ActivityRow>(
-    `select a.id, to_char(a.start_time at time zone 'Asia/Tokyo', 'YYYY-MM-DD') as date, a.sport_type, a.distance_m, a.moving_time_sec,
-            a.avg_pace_sec_km, a.avg_hr, a.max_hr, a.rpe, a.memo, a.description, a.session_id, a.splits, r.verdict, r.reminders
-       from activities a left join reviews r on r.activity_id = a.id
+    `select ${GROUP_ACTIVITY_SELECT}, r.verdict, r.reminders
+       from activities a${GROUP_DATE_JOIN}
+       left join reviews r on r.activity_id = a.id
       where a.user_id = $1 and a.match_status <> 'ignored'
-        and (a.start_time at time zone 'Asia/Tokyo')::date between $2 and $3
-      order by a.start_time`,
+        and (coalesce(g.t0, a.start_time) at time zone 'Asia/Tokyo')::date between $2 and $3
+      order by coalesce(g.t0, a.start_time), a.start_time, a.id`,
     [plan.user_id, from, today],
   );
   const byId = new Map(sessions.map((s) => [s.id, s]));
-  const activities = rows.map((r): BriefActivity => {
-    const s = r.session_id ? byId.get(r.session_id) : undefined;
+  const bySession = new Map<string, ActivityRow[]>();
+  const units: (ActivityRow | string)[] = [];
+  for (const r of rows) {
+    if (r.session_id == null) { units.push(r); continue; }
+    const have = bySession.get(r.session_id);
+    if (have) have.push(r);
+    else { bySession.set(r.session_id, [r]); units.push(r.session_id); }
+  }
+  const activities = units.map((u): BriefActivity => {
+    const group = typeof u === "string" ? bySession.get(u)! : [u]; // already in (start_time, id) order
+    const primary = group[0];
+    const c = combineGroup(group);
+    const s = primary.session_id ? byId.get(primary.session_id) : undefined;
     const { done: _done, moved_from_date: _from, ...session } = s ?? ({} as SessionWithDone);
+    const memos = group.map((g) => g.memo ?? g.description).filter((m): m is string => !!m);
     return {
-      id: r.id, date: r.date, sport_type: r.sport_type, distance_m: r.distance_m, moving_time_sec: r.moving_time_sec,
-      avg_pace_sec_km: r.avg_pace_sec_km, avg_hr: r.avg_hr, max_hr: r.max_hr, rpe: r.rpe, memo: r.memo ?? r.description,
-      splits: r.splits, session: s ? session : null, verdict: r.verdict, reminders: r.reminders ?? [],
+      id: primary.id, date: primary.date, sport_type: c.sport_type, distance_m: c.distance_m, moving_time_sec: c.moving_time_sec,
+      avg_pace_sec_km: c.avg_pace_sec_km, avg_hr: c.avg_hr, max_hr: c.max_hr, rpe: c.rpe, memo: memos.length ? memos.join("／") : null,
+      splits: c.splits, session: s ? session : null, verdict: primary.verdict, reminders: primary.reminders ?? [],
+      segments: c.segments,
     };
   });
   const constraints = await loadLiveConstraints(plan.user_id, today);
@@ -180,13 +195,22 @@ function verdictText(a: BriefActivity): string {
   return r ? `${a.verdict}：${r}` : a.verdict;
 }
 
+/** "（2 段：06:40 3.00 km 7:20 ＋ 07:10 5.00 km 7:28，隔 8 分）" for a session of several recordings, else "". */
+function segmentsText(a: BriefActivity): string {
+  if (a.segments.length < 2) return "";
+  const run = isRunSport(a.sport_type);
+  const one = (g: BriefActivity["segments"][number]) => `${g.start_hm} ${run ? `${(g.distance_m / 1000).toFixed(2)} km ${pace(g.avg_pace_sec_km).replace("/km", "")}` : `${Math.round(g.moving_time_sec / 60)} 分`}`;
+  const gaps = a.segments.map((g) => g.gap_min).filter((m): m is number => m != null);
+  return `（${a.segments.length} 段：${a.segments.map(one).join(" ＋ ")}${gaps.length ? `，隔 ${gaps.map((m) => `${m} 分`).join("、")}` : ""}）`;
+}
+
 function activityLine(a: BriefActivity, detail: boolean): string {
   const what = isRunSport(a.sport_type)
     ? `${(a.distance_m / 1000).toFixed(2)} km ${pace(a.avg_pace_sec_km)} 心拍 ${a.avg_hr ?? "-"}`
     : `${sportName(a.sport_type)} ${Math.round(a.moving_time_sec / 60)} 分 心拍 ${a.avg_hr ?? "-"}`;
   const to = a.session ? `${a.session.label ?? a.session.type}${a.session.scheduled_date !== a.date ? `（${shortDate(a.session.scheduled_date)} 的課）` : ""}` : "未排課";
   const own = a.rpe || (detail && a.memo) ? `｜自述：${a.rpe ? `RPE ${a.rpe} ` : ""}${detail ? (a.memo ?? "").replace(/\s+/g, " ").slice(0, 80) : ""}`.trimEnd() : "";
-  const line = `- ${a.date} 配 ${to}｜${what}｜${verdictText(a)}${own}`;
+  const line = `- ${a.date} 配 ${to}｜${what}${segmentsText(a)}｜${verdictText(a)}${own}`;
   if (!detail) return line;
   const sps = fullSplits(a.splits);
   if (!sps.length || !isRunSport(a.sport_type)) return line;
