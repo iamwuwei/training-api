@@ -5,6 +5,7 @@ import { adjustmentLine, weeklyReview } from "./claude";
 import { buildPlanBriefing, loadPlanBriefing } from "./briefing";
 import { postCoachMessage } from "./coach";
 import { historyBetween, loadPlanWeeks } from "./context";
+import { GROUP_DATE_JOIN } from "./session-group";
 import { type Querier, query, queryOne, withTransaction } from "./db";
 import { sessionLabel, shortDate, sportName } from "./labels";
 import { type CoachStage, clearReviewStage, stageWriterByReview } from "./stage";
@@ -48,7 +49,10 @@ const MOVED_SELECT = `select ps.id, to_char(ps.scheduled_date, 'YYYY-MM-DD') as 
     from planned_sessions ps join planned_sessions nw on nw.id = ps.moved_to_session_id
    where ps.plan_id = $1 and ps.superseded = true and ps.scheduled_date between $2 and $3 order by ps.scheduled_date`;
 const MOVED_FROM_SELECT = `select to_char(scheduled_date, 'YYYY-MM-DD') as scheduled_date from planned_sessions where id = $1`;
-const ACTIVITY_IDS_SELECT = `select id from activities where user_id = $1 and match_status <> 'ignored' and (start_time at time zone 'Asia/Tokyo')::date between $2 and $3`;
+// The ids this week's review "saw", by the date of the session (its first recording's): a second segment that starts after midnight
+// belongs to the week of the first, so it is recorded as seen with it and does not look like a late arrival.
+const ACTIVITY_IDS_SELECT = `select a.id from activities a${GROUP_DATE_JOIN}
+  where a.user_id = $1 and a.match_status <> 'ignored' and (coalesce(g.t0, a.start_time) at time zone 'Asia/Tokyo')::date between $2 and $3`;
 
 export interface WeeklyRunResult {
   review_id: string;

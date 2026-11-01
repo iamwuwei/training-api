@@ -2,12 +2,13 @@ import { randomUUID } from "node:crypto";
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyResultV2 } from "aws-lambda";
 import { isDbWaking, query, queryOne, withTransaction } from "../lib/db";
-import { type CheckinMeta, type MismatchAskMeta, mismatchReason, postMismatchAsk, resetCheckin, undoPick } from "../lib/checkin";
+import { appendDone, type CheckinMeta, type MismatchAskMeta, mismatchReason, postMismatchAsk, resetCheckin, undoPick } from "../lib/checkin";
 import { COACH_NAME, MAX_MESSAGE_CHARS, postCoachMessage, REPLY_FAILED } from "../lib/coach";
 import { constraintsByIds, loadActiveConstraints } from "../lib/constraints";
 import { countsWeekNo, shortDate, sportName, weeklyAskQuestion } from "../lib/labels";
 import { applyChange, applyProposal, changeConflict, postProposalApplied } from "../lib/proposals";
 import { deauthorize } from "../lib/strava";
+import { elapsedSql, loadGroup, combineGroup, MAX_PER_SESSION, overlaps, regroupReview, requeueReview, SEGMENT_SELECT, sameKind } from "../lib/session-group";
 import { postRoutineDone } from "../lib/strength";
 import { COACH_STAGES } from "../lib/stage";
 import { requestWeeklyRerun, reviewMissingActivity, WEEKLY_REVIEW_SELECT } from "../lib/weekly";
@@ -213,9 +214,14 @@ const ACTIVITY_SELECT = `
   a.avg_pace_sec_km, a.avg_hr, a.max_hr, a.avg_watts, a.kcal, a.description, a.device_name, a.gear_id,
   a.gear_name, a.weather, a.gear_name_user, a.device_name_user, a.weather_user, a.details_updated_at, a.memo, a.rpe, a.memo_updated_at, a.splits, a.match_status,
   r.verdict as r_verdict, r.comment as r_comment, r.reminders as r_reminders,
-  r.source as r_source, r.model as r_model, r.adjust_hint as r_adjust_hint, r.created_at as r_created_at`;
+  r.source as r_source, r.model as r_model, r.adjust_hint as r_adjust_hint, r.created_at as r_created_at,
+  ${elapsedSql("a")} as elapsed_time_sec, ${SEGMENT_SELECT}`;
 
 type ActivityJoined = Omit<ActivityRow, "raw"> & {
+  elapsed_time_sec: number | null;
+  seg_count: number | null;
+  seg_index: number | null;
+  seg_primary: string | null;
   r_verdict: ReviewRow["verdict"];
   r_comment: string | null;
   r_reminders: string[] | null;
@@ -249,10 +255,12 @@ function toApiActivity(a: ActivityJoined): ApiActivity {
   const {
     r_verdict, r_comment, r_reminders, r_source, r_model, r_adjust_hint, r_created_at,
     gear_name_user, device_name_user, weather_user, details_updated_at,
+    seg_count, seg_index, seg_primary,
     ...rest
   } = a;
   return {
     ...rest,
+    segment: seg_count != null && seg_index != null && seg_primary != null ? { primary_activity_id: seg_primary, index: seg_index, count: seg_count } : null,
     gear_name: gear_name_user ?? a.gear_name,
     device_name: device_name_user ?? a.device_name,
     weather: weather_user ?? a.weather,
@@ -474,9 +482,11 @@ async function putSession(userId: string, activityId: string, raw: string) {
   } catch {
     return json(400, { error: "invalid json" });
   }
+  const append = body.append === true; // anything but a real boolean true is "not append"
+  if (append && body.replace === true) return json(400, { error: "append and replace are exclusive" });
 
-  const activity = await queryOne<{ id: string; strava_activity_id: string; match_status: MatchStatus }>(
-    "select id, strava_activity_id, match_status from activities where id = $1 and user_id = $2",
+  const activity = await queryOne<{ id: string; strava_activity_id: string; match_status: MatchStatus; session_id: string | null }>(
+    "select id, strava_activity_id, match_status, session_id from activities where id = $1 and user_id = $2",
     [activityId, userId],
   );
   if (!activity) return json(404, { error: "activity not found" });
@@ -488,25 +498,16 @@ async function putSession(userId: string, activityId: string, raw: string) {
   if (body.session_id === null || body.session_id === undefined) {
     const status = body.status ?? "unplanned";
     if (status !== "unplanned" && status !== "ignored") return json(400, { error: "status must be unplanned or ignored" });
-    await query("update activities set session_id = null, match_status = $2 where id = $1", [activityId, status]);
+    await query("update activities set session_id = null, match_status = $2 where id = $1 and user_id = $3", [activityId, status, userId]);
     await query("delete from reviews where activity_id = $1 and source = 'claude'", [activityId]);
+    // One segment left the session (unplanned or ignored): the others keep it, and Woo looks at what is left.
+    if (activity.session_id) await regroupReview(userId, activity.session_id, "segment removed");
   } else {
-    const err = await assignSession(userId, activityId, body.session_id, Boolean(body.replace));
+    const err = await assignSession(userId, activityId, body.session_id, { replace: Boolean(body.replace), append });
     if (err) return json(err.status, { error: err.error });
     if (memoFields) {
-      await query("update activities set memo = $2, rpe = $3, memo_updated_at = now() where id = $1", [activityId, memoFields.memo, memoFields.rpe]);
+      await query("update activities set memo = $2, rpe = $3, memo_updated_at = now() where id = $1 and user_id = $4", [activityId, memoFields.memo, memoFields.rpe, userId]);
     }
-    // The Claude verdict was about the old session: drop it and let the worker
-    // regenerate one against the new session (manual reviews are kept).
-    const dropped = await query<{ id: string }>(
-      "delete from reviews where activity_id = $1 and source = 'claude' returning id",
-      [activityId],
-    );
-    const hasManual = await queryOne<{ id: string }>("select id from reviews where activity_id = $1", [activityId]);
-    // Same doubt check as after a check-in chip: a walk on a long-run day, a run far
-    // shorter than the session. Then Woo asks 真的是這趟嗎 (POST /coach/messages
-    // { answer_to, confirm_match }) and the verdict waits for the answer.
-    const full = await queryOne<ActivityRow>("select * from activities where id = $1 and user_id = $2", [activityId, userId]);
     const session = await queryOne<PlannedSessionRow>(
       `select ps.*, to_char(ps.scheduled_date, 'YYYY-MM-DD') as scheduled_date from planned_sessions ps join plans p on p.id = ps.plan_id
         where ps.id = $1 and p.user_id = $2`,
@@ -516,32 +517,53 @@ async function putSession(userId: string, activityId: string, raw: string) {
     // this pick: close it like a chip pick would, so /plan stops saying Woo is waiting.
     // The check-in's "selected" record lets 選錯了 (reset) undo this pick the same way.
     if (session) await closeCheckinFor(userId, activityId, session);
-    const reason = full && session ? mismatchReason(full, session) : null;
-    if (reason && session) {
-      // An earlier open question about this activity (a feel question, an older doubt) is about the old pick.
-      await query(
-        `update coach_messages set meta = coalesce(meta, '{}'::jsonb) || '{"state":"closed"}'::jsonb
-          where user_id = $1 and kind = 'ask' and activity_id = $2 and meta->>'state' = 'open'`,
-        [userId, activityId],
+    const group = await loadGroup(userId, body.session_id); // this activity is in it now
+    if (append && group.length > 1) {
+      // One more segment: Woo's fixed line, the session's Claude review dropped and written again over the whole group.
+      await appendDone(userId, body.session_id);
+    } else if (group.length) {
+      // The Claude verdict was about the old session / group: drop it and let the worker regenerate one against
+      // the new one (manual reviews are kept).
+      const primary = group[0];
+      const dropped = await query<{ id: string }>(
+        "delete from reviews where activity_id = any($1::uuid[]) and source = 'claude' returning id",
+        [group.map((g) => g.id)],
       );
-      await postMismatchAsk(userId, { from: "report", activity_id: activityId, session_id: session.id, reason, checkin_id: null, pick_id: null }, session.scheduled_date, session);
-    } else if (dropped.length > 0 || !hasManual) {
-      await requeue(userId, activity.strava_activity_id, "session reassigned");
+      const hasManual = await queryOne<{ id: string }>("select id from reviews where activity_id = $1", [primary.id]);
+      // Same doubt check as after a check-in chip: a walk on a long-run day, a run far shorter than the
+      // session (the whole session, not this segment). Then Woo asks 真的是這趟嗎 (POST /coach/messages
+      // { answer_to, confirm_match }) and the verdict waits for the answer.
+      const reason = session ? mismatchReason(combineGroup(group), session) : null;
+      if (reason && session) {
+        // An earlier open question about this activity (a feel question, an older doubt) is about the old pick.
+        await query(
+          `update coach_messages set meta = coalesce(meta, '{}'::jsonb) || '{"state":"closed"}'::jsonb
+            where user_id = $1 and kind = 'ask' and activity_id = $2 and meta->>'state' = 'open'`,
+          [userId, activityId],
+        );
+        await postMismatchAsk(userId, { from: "report", activity_id: activityId, session_id: session.id, reason, checkin_id: null, pick_id: null }, session.scheduled_date, session);
+      } else if (dropped.length > 0 || !hasManual) {
+        await requeueReview(userId, primary.id, "session reassigned");
+      }
     }
   }
 
   const [row] = await query<ActivityJoined>(
-    `select ${ACTIVITY_SELECT} from activities a left join reviews r on r.activity_id = a.id where a.id = $1`,
-    [activityId],
+    `select ${ACTIVITY_SELECT} from activities a left join reviews r on r.activity_id = a.id where a.id = $1 and a.user_id = $2`,
+    [activityId, userId],
   );
   return json<PutSessionResponse>(200, { activity: toApiActivity(row) });
 }
 
+type AssignOpts = { replace: boolean; append: boolean };
+
 /**
- * Point `activityId` at `sessionId` (match_status confirmed), bumping an automatic
- * holder; a confirmed holder only with `replace`. No review is queued here.
+ * Point `activityId` at `sessionId` (match_status confirmed). Nothing held yet: just assign. `append`: next to the
+ * activities already there (they stay), refused when the session is full (MAX_PER_SESSION), the kinds differ
+ * (a walk next to runs) or two recordings overlap in time. Otherwise a confirmed holder is a 409 unless `replace`,
+ * and every holder is bumped (all of them, not only one). No review is queued here.
  */
-async function assignSession(userId: string, activityId: string, sessionId: string, replace: boolean): Promise<{ status: number; error: string } | null> {
+async function assignSession(userId: string, activityId: string, sessionId: string, opts: AssignOpts): Promise<{ status: number; error: string } | null> {
   if (!UUID_RE.test(sessionId)) return { status: 400, error: "invalid session id" };
   const session = await queryOne<{ id: string }>(
     `select ps.id from planned_sessions ps join plans p on p.id = ps.plan_id
@@ -549,18 +571,33 @@ async function assignSession(userId: string, activityId: string, sessionId: stri
     [sessionId, userId],
   );
   if (!session) return { status: 404, error: "session not found" };
-  const holder = await queryOne<{ id: string; match_status: MatchStatus }>(
-    "select id, match_status from activities where session_id = $1 and id <> $2 and user_id = $3",
+  const me = await queryOne<AssignRow>(
+    `select a.id, a.match_status, a.sport_type, a.start_time, coalesce(${elapsedSql("a")}, a.moving_time_sec) as elapsed_sec from activities a where a.id = $1 and a.user_id = $2`,
+    [activityId, userId],
+  );
+  if (!me) return { status: 404, error: "activity not found" };
+  const holders = await query<AssignRow>(
+    `select a.id, a.match_status, a.sport_type, a.start_time, coalesce(${elapsedSql("a")}, a.moving_time_sec) as elapsed_sec
+       from activities a where a.session_id = $1 and a.id <> $2 and a.user_id = $3 and a.match_status <> 'ignored'
+      order by a.start_time, a.id`,
     [session.id, activityId, userId],
   );
-  if (holder?.match_status === "confirmed" && !replace) return { status: 409, error: "session already confirmed for another activity" };
-  // The bumped holder is unassigned exactly like 選錯了 does it: its Claude review dropped,
-  // Woo's open question about it (a feel question after a chip) closed — otherwise that
-  // question stays open forever and /plan keeps saying Woo is waiting for an answer.
-  if (holder) await undoPick(userId, holder.id, session.id);
-  await query("update activities set session_id = $2, match_status = 'confirmed' where id = $1", [activityId, session.id]);
+  if (holders.length && opts.append) {
+    if (holders.length + 1 > MAX_PER_SESSION) return { status: 409, error: `too many activities for one session (${MAX_PER_SESSION})` };
+    if (holders.some((h) => !sameKind(me, h))) return { status: 409, error: "segments must be the same kind of activity" };
+    if (holders.some((h) => overlaps(me, h))) return { status: 409, error: "activities overlap in time" };
+  } else if (holders.length) {
+    if (holders.some((h) => h.match_status === "confirmed") && !opts.replace) return { status: 409, error: "session already confirmed for another activity" };
+    // The bumped holders are unassigned exactly like 選錯了 does it: Claude review dropped, Woo's open
+    // question about them (a feel question after a chip) closed — otherwise that question stays open
+    // forever and /plan keeps saying Woo is waiting for an answer. The new activity's pick re-judges the session.
+    for (const h of holders) await undoPick(userId, h.id, session.id, { regroup: false });
+  }
+  await query("update activities set session_id = $2, match_status = 'confirmed' where id = $1 and user_id = $3", [activityId, session.id, userId]);
   return null;
 }
+
+type AssignRow = { id: string; match_status: MatchStatus; sport_type: string | null; start_time: Date; elapsed_sec: number };
 
 /**
  * The report page assigned `activityId` to `session`: the check-in that this answers —
@@ -574,7 +611,7 @@ async function assignSession(userId: string, activityId: string, sessionId: stri
 async function closeCheckinFor(userId: string, activityId: string, session: Pick<PlannedSessionRow, "id" | "scheduled_date">): Promise<void> {
   const checkin = await queryOne<CoachMessageRow>(
     `select * from coach_messages where user_id = $1 and kind = 'checkin' and meta->>'state' in ('open', 'picked')
-        and ((meta->>'mode' = 'activity' and meta->>'session_id' = $2)
+        and ((meta->>'mode' in ('activity', 'append') and meta->>'session_id' = $2)
           or (meta->>'mode' = 'session' and activity_id = $3)
           or meta->'picked'->>'session_id' = $2)
       order by created_at desc limit 1`,
@@ -583,28 +620,6 @@ async function closeCheckinFor(userId: string, activityId: string, session: Pick
   if (!checkin) return;
   const meta = (checkin.meta ?? {}) as unknown as CheckinMeta;
   await query("update coach_messages set meta = $2 where id = $1", [checkin.id, JSON.stringify({ ...meta, state: "picked", picked: { activity_id: activityId, session_id: session.id } } satisfies CheckinMeta)]);
-}
-
-/** Push the activity back through the worker so a Claude review is regenerated. */
-async function requeue(userId: string, stravaActivityId: string, reason: string): Promise<void> {
-  if (!process.env.QUEUE_URL) return;
-  const conn = await queryOne<{ strava_athlete_id: string }>(
-    "select strava_athlete_id from strava_connections where user_id = $1",
-    [userId],
-  );
-  if (!conn) return;
-  await sqs.send(
-    new SendMessageCommand({
-      QueueUrl: process.env.QUEUE_URL,
-      MessageBody: JSON.stringify({
-        object_type: "activity",
-        aspect_type: "update",
-        object_id: Number(stravaActivityId),
-        owner_id: Number(conn.strava_athlete_id),
-        updates: { reason },
-      }),
-    }),
-  );
 }
 
 async function putMemo(userId: string, activityId: string, raw: string) {
@@ -619,23 +634,17 @@ async function putMemo(userId: string, activityId: string, raw: string) {
   if (typeof parsed === "string") return json(400, { error: parsed });
   const { memo, rpe } = parsed;
 
-  const activity = await queryOne<{ id: string; strava_activity_id: string; session_id: string | null }>(
-    "select id, strava_activity_id, session_id from activities where id = $1 and user_id = $2",
+  const activity = await queryOne<{ id: string; session_id: string | null }>(
+    "select id, session_id from activities where id = $1 and user_id = $2",
     [activityId, userId],
   );
   if (!activity) return json(404, { error: "activity not found" });
 
-  await query("update activities set memo = $2, rpe = $3, memo_updated_at = now() where id = $1", [activityId, memo, rpe]);
+  await query("update activities set memo = $2, rpe = $3, memo_updated_at = now() where id = $1 and user_id = $4", [activityId, memo, rpe, userId]);
 
-  // Let Claude take the athlete's words into account: drop its review and requeue.
-  if (activity.session_id) {
-    const dropped = await query<{ id: string }>(
-      "delete from reviews where activity_id = $1 and source = 'claude' returning id",
-      [activityId],
-    );
-    const hasManual = await queryOne<{ id: string }>("select id from reviews where activity_id = $1", [activityId]);
-    if (dropped.length > 0 || !hasManual) await requeue(userId, activity.strava_activity_id, "memo updated");
-  }
+  // Let Claude take the athlete's words into account: drop the session's Claude review and requeue
+  // (the review is the session's, on its primary activity, whichever segment the memo is on).
+  if (activity.session_id) await regroupReview(userId, activity.session_id, "memo updated");
 
   const [row] = await query<ActivityJoined>(
     `select ${ACTIVITY_SELECT} from activities a left join reviews r on r.activity_id = a.id where a.id = $1`,
@@ -719,17 +728,20 @@ async function getDetailOptions(userId: string) {
 /** Drop the Claude review (failed, stale or just unwanted) and have the worker write a new one. */
 async function rereview(userId: string, activityId: string) {
   if (!UUID_RE.test(activityId)) return json(400, { error: "invalid activity id" });
-  const activity = await queryOne<{ id: string; strava_activity_id: string; session_id: string | null }>(
-    "select id, strava_activity_id, session_id from activities where id = $1 and user_id = $2",
+  const activity = await queryOne<{ id: string; session_id: string | null }>(
+    "select id, session_id from activities where id = $1 and user_id = $2",
     [activityId, userId],
   );
   if (!activity) return json(404, { error: "activity not found" });
   if (!activity.session_id) return json(409, { error: "assign the activity to a session first" });
-  const manual = await queryOne<{ id: string }>("select id from reviews where activity_id = $1 and source = 'manual'", [activityId]);
+  // The review is the session's: it sits on the group's primary activity, whichever segment's report asked.
+  const primary = (await loadGroup(userId, activity.session_id))[0];
+  if (!primary) return json(409, { error: "assign the activity to a session first" });
+  const manual = await queryOne<{ id: string }>("select id from reviews where activity_id = $1 and source = 'manual'", [primary.id]);
   if (manual) return json(409, { error: "a manual review is kept; remove it first" });
 
-  await query("delete from reviews where activity_id = $1 and source = 'claude'", [activityId]);
-  await requeue(userId, activity.strava_activity_id, "rereview requested");
+  await query("delete from reviews where activity_id = $1 and source = 'claude'", [primary.id]);
+  await requeueReview(userId, primary.id, "rereview requested");
   return json<RereviewResponse>(202, { queued: true });
 }
 
@@ -1121,8 +1133,10 @@ async function postCheckinPick(userId: string, checkinId: string, raw: string) {
 
   if (body.none) {
     await setMeta({ state: "dismissed" });
-    const pick = await postCoachMessage({ user_id: userId, role: "athlete", kind: "pick", text: "都不是", meta: { none: true } });
-    await postCoachMessage({ user_id: userId, role: "coach", kind: "chat", text: "好，這趟不算。改變主意的話按「重新選」。" });
+    // append mode: the new recording is not another segment of today's session; it stays in 其他活動 (the report page can still add it).
+    const appendMode = meta.mode === "append";
+    const pick = await postCoachMessage({ user_id: userId, role: "athlete", kind: "pick", text: appendMode ? "不是，另外算" : "都不是", meta: { none: true } });
+    await postCoachMessage({ user_id: userId, role: "coach", kind: "chat", text: appendMode ? "好，這趟另外算，留在「其他活動」。要併進去的話到報告頁按「這堂的活動」。" : "好，這趟不算。改變主意的話按「重新選」。" });
     // The activity stays unplanned, but the week's review (if already written without it) should list it.
     if (checkin.activity_id) {
       const a = await queryOne<{ date: string; sport_type: string | null }>(
@@ -1136,14 +1150,30 @@ async function postCheckinPick(userId: string, checkinId: string, raw: string) {
     return json<PostCheckinPickResponse>(200, { checkin: toApiCoachMessage(c), pick: toApiCoachMessage(pick) });
   }
 
-  // activity mode: the chip is an activity, the session is today's; session mode: the reverse.
-  const activityId = meta.mode === "activity" ? body.activity_id : checkin.activity_id;
-  const sessionId = meta.mode === "activity" ? meta.session_id : body.session_id;
-  if (!activityId || !sessionId || !UUID_RE.test(activityId)) return json(400, { error: meta.mode === "activity" ? "activity_id is required" : "session_id is required" });
-  const candidate = meta.candidates.find((c) => (meta.mode === "activity" ? c.activity_id === activityId : c.session_id === sessionId));
+  // activity / append mode: the chip is an activity, the session is today's; session mode: the reverse.
+  const byActivity = meta.mode !== "session";
+  const activityId = byActivity ? body.activity_id : checkin.activity_id;
+  const sessionId = byActivity ? meta.session_id : body.session_id;
+  if (!activityId || !sessionId || !UUID_RE.test(activityId)) return json(400, { error: byActivity ? "activity_id is required" : "session_id is required" });
+  const candidate = meta.candidates.find((c) => (byActivity ? c.activity_id === activityId : c.session_id === sessionId));
   if (!candidate) return json(400, { error: "not one of the candidates" });
 
-  const err = await assignSession(userId, activityId, sessionId, false);
+  if (meta.mode === "append") {
+    // One more segment of today's session. A 409 (the session was changed elsewhere meanwhile) goes back as it is.
+    const err = await assignSession(userId, activityId, sessionId, { replace: false, append: true });
+    if (err) return json(err.status, { error: err.error });
+    await setMeta({ state: "picked", picked: { activity_id: activityId, session_id: sessionId } });
+    // Already answered about how it felt for the first segment: no feel question, no doubt check; Woo's fixed line and one new review of the whole session.
+    const pick = await postCoachMessage({
+      user_id: userId, role: "athlete", kind: "pick", text: candidate.label, status: "sent", activity_id: activityId,
+      meta: { activity_id: activityId, session_id: sessionId, append: true },
+    });
+    await appendDone(userId, sessionId);
+    const [c] = await query<CoachMessageRow>("select * from coach_messages where id = $1", [checkin.id]);
+    return json<PostCheckinPickResponse>(200, { checkin: toApiCoachMessage(c), pick: toApiCoachMessage(pick) });
+  }
+
+  const err = await assignSession(userId, activityId, sessionId, { replace: false, append: false });
   if (err) return json(err.status, { error: err.error });
   await setMeta({ state: "picked", picked: { activity_id: activityId, session_id: sessionId } });
 
@@ -1301,8 +1331,7 @@ async function answerMismatch(userId: string, ask: CoachMessageRow, text: string
       await query("update coach_messages set status = 'pending' where id = $1 and user_id = $2 and kind = 'pick'", [am.pick_id, userId]);
       await queueCoachAsk(userId, am.pick_id);
     } else {
-      const activity = await queryOne<{ strava_activity_id: string }>("select strava_activity_id from activities where id = $1 and user_id = $2", [am.activity_id, userId]);
-      if (activity) await requeue(userId, activity.strava_activity_id, "match confirmed");
+      await requeueReview(userId, am.activity_id, "match confirmed");
     }
   } else if (am.checkin_id) {
     const checkin = await queryOne<CoachMessageRow>("select * from coach_messages where id = $1 and user_id = $2 and kind = 'checkin'", [am.checkin_id, userId]);
@@ -1350,19 +1379,21 @@ async function postCoach(userId: string, raw: string) {
     if (body.confirm_match !== undefined) return json(400, { error: "confirm_match only answers a mismatch question" });
     const parsed = parseMemo({ memo: text, rpe: body.rpe ?? null });
     if (typeof parsed === "string") return json(400, { error: parsed });
-    const activity = await queryOne<{ id: string; strava_activity_id: string; session_id: string | null }>(
-      "select id, strava_activity_id, session_id from activities where id = $1 and user_id = $2",
+    const activity = await queryOne<{ id: string; session_id: string | null }>(
+      "select id, session_id from activities where id = $1 and user_id = $2",
       [am.activity_id ?? "", userId],
     );
     if (!activity) return json(404, { error: "activity not found" });
-    await query("update activities set memo = $2, rpe = $3, memo_updated_at = now() where id = $1", [activity.id, parsed.memo, parsed.rpe]);
+    await query("update activities set memo = $2, rpe = $3, memo_updated_at = now() where id = $1 and user_id = $4", [activity.id, parsed.memo, parsed.rpe, userId]);
     await query("update coach_messages set meta = coalesce(meta, '{}'::jsonb) || '{\"state\":\"answered\"}'::jsonb where id = $1", [ask.id]);
     const m = await postCoachMessage({
       user_id: userId, role: "athlete", kind: "chat", text, status: "pending", activity_id: activity.id,
       meta: { answer_to: ask.id, rpe: parsed.rpe, stage: "reading" },
     });
-    await query("delete from reviews where activity_id = $1 and source = 'claude'", [activity.id]);
-    if (activity.session_id) await requeue(userId, activity.strava_activity_id, "check-in answered");
+    // The review is the session's: every segment's Claude review goes (the one on the primary is the one that matters).
+    const groupIds = activity.session_id ? (await loadGroup(userId, activity.session_id)).map((g) => g.id) : [];
+    await query("delete from reviews where activity_id = any($1::uuid[]) and source = 'claude'", [[activity.id, ...groupIds]]);
+    if (activity.session_id) await requeueReview(userId, activity.id, "check-in answered");
     else await query("update coach_messages set status = 'sent' where id = $1", [m.id]);
     return json<PostCoachMessageResponse>(202, { message: toApiCoachMessage(m) });
   }

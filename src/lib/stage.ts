@@ -53,6 +53,11 @@ export function stageWriterByActivity(userId: string, activityId: string): (stag
   return writer("user_id = $2 and role = 'athlete' and kind = 'chat' and status = 'pending' and activity_id = $3 and meta ? 'answer_to'", [userId, activityId]);
 }
 
+/** Same, for a session of several recordings: the answer may be about any of them (`ids` = the group). */
+export function stageWriterByActivities(userId: string, ids: string[]): (stage: CoachStage) => Promise<void> {
+  return writer("user_id = $2 and role = 'athlete' and kind = 'chat' and status = 'pending' and activity_id = any($3::uuid[]) and meta ? 'answer_to'", [userId, ids]);
+}
+
 /** The weekly message of a review while it is rewritten. */
 export function stageWriterByReview(reviewId: string): (stage: CoachStage) => Promise<void> {
   return writer("weekly_review_id = $2 and kind = 'weekly'", [reviewId]);
