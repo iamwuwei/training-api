@@ -262,10 +262,14 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
           });
           for (const id of ids) await settleAthleteMessages(conn.user_id, id); // the answer that triggered this review is replied to
           // The week's review was written without this activity (late sync): the weekly Lambda regenerates it in place.
-          // Once for the session, asked with the primary: the weekly review lists the ids it saw by the session's date
-          // (ACTIVITY_IDS_SELECT), so that one rerun covers every recording; asking per recording would invoke the weekly Lambda
-          // once each before the first has finished.
-          await maybeRerunWeeklyReview(conn.user_id, row.id, c.date, `${reviewDay} 的 ${session.label ?? session.type} 進來了`);
+          // At most one weekly Lambda invoke for the session, however many recordings it has: ask about the recordings in
+          // order until one request goes out. The weekly review lists the ids it saw by the session's date
+          // (ACTIVITY_IDS_SELECT), so that one rerun brings in every recording it was missing; asking all of them
+          // regardless would invoke the Lambda once each before the first has finished. Asking only the primary would miss
+          // a segment bound after the review was written (the primary is already in its list).
+          for (const gid of ids) {
+            if (await maybeRerunWeeklyReview(conn.user_id, gid, c.date, `${reviewDay} 的 ${session.label ?? session.type} 進來了`)) break;
+          }
         } catch (err) {
           // Not requeued (SQS would only retry the same failure). Recorded so the
           // app can show "分析失敗" with a retry instead of waiting forever.
