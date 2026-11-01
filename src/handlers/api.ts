@@ -503,7 +503,7 @@ async function putSession(userId: string, activityId: string, raw: string) {
     // One segment left the session (unplanned or ignored): the others keep it, and Woo looks at what is left.
     if (activity.session_id) await regroupReview(userId, activity.session_id, "segment removed");
   } else {
-    const assigned = await assignSession(userId, activityId, body.session_id, { replace: Boolean(body.replace), append });
+    const assigned = await assignSession(userId, activityId, body.session_id, { replace: body.replace === true, append });
     if (assigned && "status" in assigned) return json(assigned.status, { error: assigned.error });
     // Appending an activity that is already one of this session's segments (a retried request, a double tap, a second
     // tab): nothing to add. No second fixed line, no second review; a memo that came along is still saved.
