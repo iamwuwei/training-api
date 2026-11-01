@@ -127,6 +127,18 @@ export interface ApiReview {
   created_at: string;
 }
 
+/**
+ * Where this activity sits in its session's group (the activities bound to one planned session, ignored ones left
+ * out, ordered by start_time). `primary_activity_id` is the first one: it carries the session's review, memo / RPE
+ * and is the report page's canonical id (a report opened on another segment redirects to it). null when the
+ * activity has no session (or is ignored). A session with one activity: { primary_activity_id: <itself>, index: 1, count: 1 }.
+ */
+export interface ApiSegment {
+  primary_activity_id: string;
+  index: number;  // 1-based, by start_time
+  count: number;  // 1..5
+}
+
 export interface ApiActivity {
   id: string;
   user_id: string;
@@ -154,6 +166,9 @@ export interface ApiActivity {
   splits: ApiSplit[] | null;
   match_status: MatchStatus;
   review: ApiReview | null;
+  /** Strava's elapsed_time (wall clock, pauses included), seconds; null when Strava did not send it. The gap between two segments of one session ("隔 8 分") is start_{i} − (start_{i−1} + elapsed_{i−1}), the same number the api puts in Woo's prompt. */
+  elapsed_time_sec: number | null;
+  segment: ApiSegment | null;
 }
 
 export interface PlanResponse {
@@ -260,13 +275,24 @@ export interface ActivitiesResponse {
 //           thread instead and the review waits for the answer (see ApiCoachMessage.ask).
 //   { session_id: null, status: "ignored" } -> not a training activity (kept out of lists)
 //   { session_id: null }                    -> back to "unplanned"
+//   { session_id: "<uuid>", append: true } -> this activity becomes one more segment of that session (the watch was
+//        stopped by mistake, a second recording was started). The holders stay. 409 when the session already has 5
+//        activities ("too many activities for one session (5)"), when the kinds differ (a walk next to runs:
+//        "segments must be the same kind of activity") or when the two recordings overlap in time ("activities overlap
+//        in time"). The session's Claude review is dropped and regenerated over the whole group (one model call).
+//   Without `append` and without `replace`, a session that already has a confirmed activity is still a 409
+//   ("session already confirmed for another activity"). `replace: true` bumps every holder.
+//   { session_id: null } on one segment of a group: that segment is unplanned again; the rest of the group keeps the
+//   session and its review is regenerated (one model call).
 
 export interface PutSessionRequest {
   session_id: string | null;
   status?: "unplanned" | "ignored"; // only when session_id is null; default "unplanned"
   memo?: string | null;  // only with a session_id; omitted = leave the stored memo alone
   rpe?: number | null;   // 1-10, same rule as memo
-  replace?: boolean;     // take the session over from a "confirmed" holder
+  replace?: boolean;     // take the session over from every "confirmed" holder
+  /** Add this activity to the session next to the ones already there (see above). Ignored when the session is empty; cannot be combined with `replace` (400 "append and replace are exclusive"). */
+  append?: boolean;
 }
 
 export interface PutSessionResponse {
@@ -289,7 +315,8 @@ export interface PutReviewResponse {
 // ---- PUT <ApiUrl>/activities/{id}/memo -----------------------------------------
 // The athlete's own note after a session. If the activity's review was written
 // by Claude it is regenerated with the memo as input (arrives a few seconds
-// later); a manual review is left alone.
+// later); a manual review is left alone. On a segment of a group, the regenerated review is the
+// session's (it is written on the group's primary activity, and quotes every segment's memo).
 
 export interface PutMemoRequest {
   memo: string | null;  // null / "" clears
@@ -331,7 +358,8 @@ export interface DetailOptionsResponse {
 // ---- POST <ApiUrl>/activities/{id}/rereview ------------------------------------
 // Drops the Claude review (failed or stale) and queues a new one; the result arrives
 // a few seconds to a minute later on /plan and /activities. 409 when the activity has no
-// session yet, or carries a manual review.
+// session yet, or carries a manual review. On a segment of a group, acts on the group's primary
+// activity (the review is the session's).
 
 export interface RereviewResponse {
   queued: true;
@@ -497,8 +525,13 @@ export interface ApiWeeklyAsk {
 export interface ApiCheckin {
   /** reset: the athlete asked to pick again; a new open check-in follows it in the thread. */
   state: "open" | "picked" | "dismissed" | "reset";
-  /** activity: today's session is known, chips are the day's activities; session: rest day, chips are this week's open sessions. */
-  mode: "activity" | "session";
+  /**
+   * activity: today's session is known, chips are the day's activities; session: rest day, chips are this week's
+   * open sessions; append: today's session already has a recording and another one of the same kind arrived — chips
+   * are the new ones ("加進同一堂：跑步 07:10 · 5.00 km · 7:28/km"), picking one makes it one more segment (no feel
+   * question follows, Woo posts one fixed line and re-judges the whole session). `none` = 不是，另外算.
+   */
+  mode: "activity" | "session" | "append";
   date: string;
   session_id: string | null;
   session_label: string | null;
