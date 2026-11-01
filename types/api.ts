@@ -284,6 +284,9 @@ export interface ActivitiesResponse {
 //   ("session already confirmed for another activity"). `replace: true` bumps every holder.
 //   { session_id: null } on one segment of a group: that segment is unplanned again; the rest of the group keeps the
 //   session and its review is regenerated (one model call).
+//   Binding (with or without append / replace) an activity that is currently one of several segments of ANOTHER session
+//   is a 409 ("source session has other segments, remove it there first"); nothing changes. Remove it from that session first
+//   ({ session_id: null }), then bind it. An activity alone in its session can be moved as before.
 
 export interface PutSessionRequest {
   session_id: string | null;

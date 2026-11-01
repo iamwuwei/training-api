@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyResultV2 } from "aws-lambda";
-import { isDbWaking, query, queryOne, withTransaction } from "../lib/db";
+import { isDbWaking, type Querier, query, queryOne, withTransaction } from "../lib/db";
 import { appendDone, type CheckinMeta, type MismatchAskMeta, mismatchReason, postMismatchAsk, resetCheckin, undoPick } from "../lib/checkin";
 import { COACH_NAME, MAX_MESSAGE_CHARS, postCoachMessage, REPLY_FAILED } from "../lib/coach";
 import { constraintsByIds, loadActiveConstraints } from "../lib/constraints";
@@ -575,6 +575,9 @@ type AssignOpts = { replace: boolean; append: boolean };
  * activities already there (they stay), refused when the session is full (MAX_PER_SESSION), the kinds differ
  * (a walk next to runs) or two recordings overlap in time; the activity already being one of them is a no-op.
  * Otherwise a confirmed holder is a 409 unless `replace`, and every holder is bumped (all of them, not only one).
+ * An activity that sits in ANOTHER session together with other segments is not moved (409, SOURCE_HAS_SEGMENTS): that
+ * session's review would be left about a group that no longer exists, so the athlete removes it there first
+ * (regroupReview re-judges what is left); alone in its source session it moves as it always did.
  * No review is queued here.
  */
 async function assignSession(userId: string, activityId: string, sessionId: string, opts: AssignOpts): Promise<{ status: number; error: string } | { alreadyHere: true } | null> {
@@ -585,11 +588,16 @@ async function assignSession(userId: string, activityId: string, sessionId: stri
     [sessionId, userId],
   );
   if (!session) return { status: 404, error: "session not found" };
-  const me = await queryOne<AssignRow>(
-    `select a.id, a.match_status, a.sport_type, a.start_time, coalesce(${elapsedSql("a")}, a.moving_time_sec) as elapsed_sec from activities a where a.id = $1 and a.user_id = $2`,
+  const me = await queryOne<AssignRow & { session_id: string | null }>(
+    `select a.id, a.session_id, a.match_status, a.sport_type, a.start_time, coalesce(${elapsedSql("a")}, a.moving_time_sec) as elapsed_sec from activities a where a.id = $1 and a.user_id = $2`,
     [activityId, userId],
   );
   if (!me) return { status: 404, error: "activity not found" };
+  // Moving a segment out of a session that has other segments would leave that session with a review about a different
+  // group (or none at all, when it was the primary that moved) and no job to fix it. Not allowed: remove it there first
+  // (PUT …/session { session_id: null }, which re-judges what is left), then bind it here. Nothing is changed.
+  const movedFrom = me.session_id && me.session_id !== session.id && me.match_status !== "ignored" ? me.session_id : null;
+  if (movedFrom && (await hasOtherSegments(query, userId, movedFrom, activityId))) return { status: 409, error: SOURCE_HAS_SEGMENTS };
 
   if (opts.append) {
     // The count / kind / overlap checks and the write are one step per session: two appends to the same session at the
@@ -621,6 +629,17 @@ async function assignSession(userId: string, activityId: string, sessionId: stri
   }
   await query("update activities set session_id = $2, match_status = 'confirmed' where id = $1 and user_id = $3", [activityId, session.id, userId]);
   return null;
+}
+
+const SOURCE_HAS_SEGMENTS = "source session has other segments, remove it there first";
+
+/** Does `sessionId` (the session an activity is being moved out of) hold any activity besides `activityId`? */
+async function hasOtherSegments(q: Querier, userId: string, sessionId: string, activityId: string): Promise<boolean> {
+  const [x] = await q<{ n: number }>(
+    "select count(*)::int as n from activities where session_id = $1 and id <> $2 and user_id = $3 and match_status <> 'ignored'",
+    [sessionId, activityId, userId],
+  );
+  return (x?.n ?? 0) > 0;
 }
 
 /** The session's other activities (not ignored), in group order. */
