@@ -220,6 +220,13 @@ function quoteOwnWords(text: string): string {
     .join("\n");
 }
 
+/** A memo of a non-primary segment goes into the prompt at most this many characters long (the primary's keeps its 4000). */
+export const OTHER_MEMO_CHARS = 500;
+function clipMemo(memo: string): string {
+  const chars = [...memo];
+  return chars.length > OTHER_MEMO_CHARS ? `${chars.slice(0, OTHER_MEMO_CHARS).join("")}…（後略）` : memo;
+}
+
 function weeksToRace(raceDate: string, today: string | undefined): string {
   if (!today) return "";
   const days = Math.round((Date.parse(`${raceDate}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000);
@@ -240,7 +247,8 @@ export function buildReviewPrompt({ session: s, activity: a, context: c }: Activ
 
   const segments = a.segments ?? [];
   // The other recordings' own words (the primary's memo is a.memo), each marked with its segment number.
-  const otherMemos = segments.flatMap((g, i) => (i > 0 && g.memo ? [{ n: i + 1, memo: g.memo }] : []));
+  // Each is cut to OTHER_MEMO_CHARS: up to 4 more memos of 4000 characters each would multiply the input of this one call.
+  const otherMemos = segments.flatMap((g, i) => (i > 0 && g.memo ? [{ n: i + 1, memo: clipMemo(g.memo) }] : []));
 
   const parts: string[] = [];
 
