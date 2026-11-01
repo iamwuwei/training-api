@@ -485,8 +485,8 @@ async function putSession(userId: string, activityId: string, raw: string) {
   const append = body.append === true; // anything but a real boolean true is "not append"
   if (append && body.replace === true) return json(400, { error: "append and replace are exclusive" });
 
-  const activity = await queryOne<{ id: string; strava_activity_id: string; match_status: MatchStatus; session_id: string | null }>(
-    "select id, strava_activity_id, match_status, session_id from activities where id = $1 and user_id = $2",
+  const activity = await queryOne<{ id: string; match_status: MatchStatus; session_id: string | null }>(
+    "select id, match_status, session_id from activities where id = $1 and user_id = $2",
     [activityId, userId],
   );
   if (!activity) return json(404, { error: "activity not found" });
@@ -503,10 +503,21 @@ async function putSession(userId: string, activityId: string, raw: string) {
     // One segment left the session (unplanned or ignored): the others keep it, and Woo looks at what is left.
     if (activity.session_id) await regroupReview(userId, activity.session_id, "segment removed");
   } else {
-    const err = await assignSession(userId, activityId, body.session_id, { replace: Boolean(body.replace), append });
-    if (err) return json(err.status, { error: err.error });
+    const assigned = await assignSession(userId, activityId, body.session_id, { replace: Boolean(body.replace), append });
+    if (assigned && "status" in assigned) return json(assigned.status, { error: assigned.error });
+    // Appending an activity that is already one of this session's segments (a retried request, a double tap, a second
+    // tab): nothing to add. No second fixed line, no second review; a memo that came along is still saved.
+    const alreadyHere = assigned !== null;
     if (memoFields) {
       await query("update activities set memo = $2, rpe = $3, memo_updated_at = now() where id = $1 and user_id = $4", [activityId, memoFields.memo, memoFields.rpe, userId]);
+    }
+    if (alreadyHere) {
+      if (memoFields) await regroupReview(userId, body.session_id, "memo updated");
+      const [cur] = await query<ActivityJoined>(
+        `select ${ACTIVITY_SELECT} from activities a left join reviews r on r.activity_id = a.id where a.id = $1 and a.user_id = $2`,
+        [activityId, userId],
+      );
+      return json<PutSessionResponse>(200, { activity: toApiActivity(cur) });
     }
     const session = await queryOne<PlannedSessionRow>(
       `select ps.*, to_char(ps.scheduled_date, 'YYYY-MM-DD') as scheduled_date from planned_sessions ps join plans p on p.id = ps.plan_id
@@ -516,8 +527,10 @@ async function putSession(userId: string, activityId: string, raw: string) {
     // Woo's check-in for this session (or, on a rest day, for this activity) is answered by
     // this pick: close it like a chip pick would, so /plan stops saying Woo is waiting.
     // The check-in's "selected" record lets 選錯了 (reset) undo this pick the same way.
-    if (session) await closeCheckinFor(userId, activityId, session);
     const group = await loadGroup(userId, body.session_id); // this activity is in it now
+    // One more segment: only a check-in still waiting (open) is answered by it. A check-in already picked keeps the
+    // activity it was picked with, so 選錯了 on it still takes back that one, not the segment added later.
+    if (session) await closeCheckinFor(userId, activityId, session, { openOnly: append && group.length > 1 });
     if (append && group.length > 1) {
       // One more segment: Woo's fixed line, the session's Claude review dropped and written again over the whole group.
       await appendDone(userId, body.session_id);
@@ -560,10 +573,11 @@ type AssignOpts = { replace: boolean; append: boolean };
 /**
  * Point `activityId` at `sessionId` (match_status confirmed). Nothing held yet: just assign. `append`: next to the
  * activities already there (they stay), refused when the session is full (MAX_PER_SESSION), the kinds differ
- * (a walk next to runs) or two recordings overlap in time. Otherwise a confirmed holder is a 409 unless `replace`,
- * and every holder is bumped (all of them, not only one). No review is queued here.
+ * (a walk next to runs) or two recordings overlap in time; the activity already being one of them is a no-op.
+ * Otherwise a confirmed holder is a 409 unless `replace`, and every holder is bumped (all of them, not only one).
+ * No review is queued here.
  */
-async function assignSession(userId: string, activityId: string, sessionId: string, opts: AssignOpts): Promise<{ status: number; error: string } | null> {
+async function assignSession(userId: string, activityId: string, sessionId: string, opts: AssignOpts): Promise<{ status: number; error: string } | { alreadyHere: true } | null> {
   if (!UUID_RE.test(sessionId)) return { status: 400, error: "invalid session id" };
   const session = await queryOne<{ id: string }>(
     `select ps.id from planned_sessions ps join plans p on p.id = ps.plan_id
@@ -576,17 +590,29 @@ async function assignSession(userId: string, activityId: string, sessionId: stri
     [activityId, userId],
   );
   if (!me) return { status: 404, error: "activity not found" };
-  const holders = await query<AssignRow>(
-    `select a.id, a.match_status, a.sport_type, a.start_time, coalesce(${elapsedSql("a")}, a.moving_time_sec) as elapsed_sec
-       from activities a where a.session_id = $1 and a.id <> $2 and a.user_id = $3 and a.match_status <> 'ignored'
-      order by a.start_time, a.id`,
-    [session.id, activityId, userId],
-  );
-  if (holders.length && opts.append) {
-    if (holders.length + 1 > MAX_PER_SESSION) return { status: 409, error: `too many activities for one session (${MAX_PER_SESSION})` };
-    if (holders.some((h) => !sameKind(me, h))) return { status: 409, error: "segments must be the same kind of activity" };
-    if (holders.some((h) => overlaps(me, h))) return { status: 409, error: "activities overlap in time" };
-  } else if (holders.length) {
+
+  if (opts.append) {
+    // The count / kind / overlap checks and the write are one step per session: two appends to the same session at the
+    // same time (two tabs, the check-in and the today page) must not both pass the cap. The lock is per user and session
+    // and lives only as long as this transaction.
+    return withTransaction(async (q) => {
+      await q("select pg_advisory_xact_lock(hashtext($1))", [`${userId}:${session.id}`]);
+      // Read under the lock: a request that waited for the lock finds the activity already added by the one before it.
+      const [now] = await q<{ session_id: string | null; match_status: MatchStatus }>("select session_id, match_status from activities where id = $1 and user_id = $2", [activityId, userId]);
+      if (now?.session_id === session.id && now.match_status !== "ignored") return { alreadyHere: true as const };
+      const holders = await q<AssignRow>(HOLDERS_SQL, [session.id, activityId, userId]);
+      if (holders.length) {
+        if (holders.length + 1 > MAX_PER_SESSION) return { status: 409, error: `too many activities for one session (${MAX_PER_SESSION})` };
+        if (holders.some((h) => !sameKind(me, h))) return { status: 409, error: "segments must be the same kind of activity" };
+        if (holders.some((h) => overlaps(me, h))) return { status: 409, error: "activities overlap in time" };
+      }
+      await q("update activities set session_id = $2, match_status = 'confirmed' where id = $1 and user_id = $3", [activityId, session.id, userId]);
+      return null;
+    });
+  }
+
+  const holders = await query<AssignRow>(HOLDERS_SQL, [session.id, activityId, userId]);
+  if (holders.length) {
     if (holders.some((h) => h.match_status === "confirmed") && !opts.replace) return { status: 409, error: "session already confirmed for another activity" };
     // The bumped holders are unassigned exactly like 選錯了 does it: Claude review dropped, Woo's open
     // question about them (a feel question after a chip) closed — otherwise that question stays open
@@ -596,6 +622,11 @@ async function assignSession(userId: string, activityId: string, sessionId: stri
   await query("update activities set session_id = $2, match_status = 'confirmed' where id = $1 and user_id = $3", [activityId, session.id, userId]);
   return null;
 }
+
+/** The session's other activities (not ignored), in group order. */
+const HOLDERS_SQL = `select a.id, a.match_status, a.sport_type, a.start_time, coalesce(${elapsedSql("a")}, a.moving_time_sec) as elapsed_sec
+       from activities a where a.session_id = $1 and a.id <> $2 and a.user_id = $3 and a.match_status <> 'ignored'
+      order by a.start_time, a.id`;
 
 type AssignRow = { id: string; match_status: MatchStatus; sport_type: string | null; start_time: Date; elapsed_sec: number };
 
@@ -608,14 +639,14 @@ type AssignRow = { id: string; match_status: MatchStatus; sport_type: string | n
  * chose another activity, the report page replaces it) is re-pointed, so 選錯了 undoes
  * the activity that holds the session now. Another day's check-in is left alone.
  */
-async function closeCheckinFor(userId: string, activityId: string, session: Pick<PlannedSessionRow, "id" | "scheduled_date">): Promise<void> {
+async function closeCheckinFor(userId: string, activityId: string, session: Pick<PlannedSessionRow, "id" | "scheduled_date">, opts: { openOnly: boolean } = { openOnly: false }): Promise<void> {
   const checkin = await queryOne<CoachMessageRow>(
-    `select * from coach_messages where user_id = $1 and kind = 'checkin' and meta->>'state' in ('open', 'picked')
+    `select * from coach_messages where user_id = $1 and kind = 'checkin' and meta->>'state' = any($4::text[])
         and ((meta->>'mode' in ('activity', 'append') and meta->>'session_id' = $2)
           or (meta->>'mode' = 'session' and activity_id = $3)
           or meta->'picked'->>'session_id' = $2)
       order by created_at desc limit 1`,
-    [userId, session.id, activityId],
+    [userId, session.id, activityId, opts.openOnly ? ["open"] : ["open", "picked"]],
   );
   if (!checkin) return;
   const meta = (checkin.meta ?? {}) as unknown as CheckinMeta;
@@ -1161,20 +1192,20 @@ async function postCheckinPick(userId: string, checkinId: string, raw: string) {
   if (meta.mode === "append") {
     // One more segment of today's session. A 409 (the session was changed elsewhere meanwhile) goes back as it is.
     const err = await assignSession(userId, activityId, sessionId, { replace: false, append: true });
-    if (err) return json(err.status, { error: err.error });
+    if (err && "status" in err) return json(err.status, { error: err.error });
     await setMeta({ state: "picked", picked: { activity_id: activityId, session_id: sessionId } });
     // Already answered about how it felt for the first segment: no feel question, no doubt check; Woo's fixed line and one new review of the whole session.
     const pick = await postCoachMessage({
       user_id: userId, role: "athlete", kind: "pick", text: candidate.label, status: "sent", activity_id: activityId,
       meta: { activity_id: activityId, session_id: sessionId, append: true },
     });
-    await appendDone(userId, sessionId);
+    if (!err) await appendDone(userId, sessionId); // (already a segment of it, e.g. added from the report page meanwhile: nothing more to do)
     const [c] = await query<CoachMessageRow>("select * from coach_messages where id = $1", [checkin.id]);
     return json<PostCheckinPickResponse>(200, { checkin: toApiCoachMessage(c), pick: toApiCoachMessage(pick) });
   }
 
   const err = await assignSession(userId, activityId, sessionId, { replace: false, append: false });
-  if (err) return json(err.status, { error: err.error });
+  if (err && "status" in err) return json(err.status, { error: err.error });
   await setMeta({ state: "picked", picked: { activity_id: activityId, session_id: sessionId } });
 
   const pick = await postCoachMessage({

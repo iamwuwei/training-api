@@ -153,13 +153,14 @@ export async function loadReviewContext(
     [userId, since, date, activityIds],
   ));
 
-  // The last five sessions of this kind (a session of several recordings is one): read ten rows, then group.
+  // The last five sessions of this kind (a session of several recordings is one): read up to 5 x MAX_PER_SESSION rows so
+  // five whole sessions are in, then group and keep the last five.
   const sameType = session.label
     ? groupHistory(await query<HistoryRow>(
         `${HISTORY_SELECT}
           where a.user_id = $1 and a.match_status <> 'ignored' and a.id <> all($3::uuid[]) and ps.label = $2
             and coalesce(g.t0, a.start_time) < (select min(start_time) from activities where id = any($3::uuid[]) and user_id = $1)
-          order by coalesce(g.t0, a.start_time) desc, a.start_time desc, a.id desc limit 10`,
+          order by coalesce(g.t0, a.start_time) desc, a.start_time desc, a.id desc limit 25`,
         [userId, session.label, activityIds],
       )).reverse().slice(-5)
     : [];

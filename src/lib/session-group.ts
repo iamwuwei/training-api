@@ -22,7 +22,7 @@ export const MAX_PER_SESSION = 5;
  * number). `alias` is the activities alias in the query. Not a column: `raw` already holds the whole Strava object.
  */
 export const elapsedSql = (alias: string) =>
-  `(case when ${alias}.raw->>'elapsed_time' ~ '^[0-9]+(\\.[0-9]+)?$' then round((${alias}.raw->>'elapsed_time')::numeric)::int end)`;
+  `(case when ${alias}.raw->>'elapsed_time' ~ '^[0-9]{1,9}(\\.[0-9]+)?$' then round((${alias}.raw->>'elapsed_time')::numeric)::int end)`;
 
 /** The members of a.session_id's group, in the same order loadGroup uses. `a` must be an activities alias. */
 const groupOf = (extra = "") =>
