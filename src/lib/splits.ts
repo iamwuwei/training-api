@@ -104,6 +104,25 @@ export function fullSplits(splits: StravaSplit[] | null): StravaSplit[] {
 
 export const splitPace = (sp: StravaSplit) => Math.round(1000 / sp.average_speed);
 
+/**
+ * The per-km splits of a session's recordings, in time order, as one list: each recording's whole kilometres
+ * (fullSplits) one after the other, `split` renumbered 1..n (an approximation: the kilometres of the second
+ * recording do not start on a round distance). `boundaries` = the new number of the first split of every
+ * recording after the first that has any (where the report draws a divider). Same algorithm as
+ * training-web/app/lib/segments.ts mergeSplits (copied; keep the two in sync).
+ */
+export function mergeSplits(parts: (StravaSplit[] | null)[]): { splits: StravaSplit[]; boundaries: number[] } {
+  const splits: StravaSplit[] = [];
+  const boundaries: number[] = [];
+  parts.forEach((part, i) => {
+    const whole = fullSplits(part);
+    if (!whole.length) return;
+    if (i > 0) boundaries.push(splits.length + 1);
+    for (const sp of whole) splits.push({ ...sp, split: splits.length + 1 });
+  });
+  return { splits, boundaries };
+}
+
 export interface FocusStats {
   from: number; // 1-based km
   to: number;

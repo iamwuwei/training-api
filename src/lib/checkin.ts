@@ -3,6 +3,7 @@ import { anthropicClient, coachModel } from "./claude";
 import { COACH_NAME, postCoachMessage } from "./coach";
 import { query, queryOne } from "./db";
 import { isRunSport, sessionLabel, shortDate, sportName } from "./labels";
+import { combineGroup, elapsedSql, loadGroup, MAX_PER_SESSION, overlaps, regroupReview } from "./session-group";
 import type { ActivityRow, CoachMessageRow, PlannedSessionRow } from "../types";
 
 // Woo comes to the athlete after a run. When a Strava activity lands, he posts a
@@ -41,7 +42,11 @@ function kindMatches(a: ActivityLite, s: PlannedSessionRow): boolean {
 
 export interface CheckinMeta {
   state: "open" | "picked" | "dismissed" | "reset"; // reset: the athlete asked to pick again (a new open one follows)
-  mode: "activity" | "session";            // chips are activities (today's session known) or sessions (rest day)
+  /**
+   * activity: chips are activities (today's session known); session: chips are sessions (rest day);
+   * append: today's session already has a recording, the chips are the new same-kind ones (picking one makes it one more segment).
+   */
+  mode: "activity" | "session" | "append";
   date: string;
   session_id: string | null;
   session_label: string | null;
@@ -68,8 +73,28 @@ export async function maybeCheckin(userId: string, a: ActivityLite, localDate: s
   let meta: CheckinMeta;
   let text: string;
 
-  if (!isRestDay(today)) {
-    if (today.done || !kindMatches(a, today)) return false;
+  if (!isRestDay(today) && today.done) {
+    // Today's session already has a recording and another one arrived: is it the same session's other segment?
+    // Only a same-kind, non-overlapping one that fits under the cap is worth asking about.
+    if (!kindMatches(a, today)) return false;
+    const group = await loadGroup(userId, today.id);
+    if (!group.length || group.length >= MAX_PER_SESSION) return false;
+    const rows = await query<ActivityLite & { elapsed_sec: number }>(
+      `select id, sport_type, start_time, distance_m, moving_time_sec, avg_pace_sec_km, avg_hr, max_hr,
+              coalesce(${elapsedSql("activities")}, moving_time_sec) as elapsed_sec
+         from activities where user_id = $1 and session_id is null and match_status <> 'ignored'
+          and (start_time at time zone 'Asia/Tokyo')::date = $2 order by start_time`,
+      [userId, localDate],
+    );
+    const acts = rows.filter((x) => kindMatches(x, today) && !group.some((g) => overlaps(g, x)));
+    if (!acts.some((x) => x.id === a.id)) return false; // the one that just arrived cannot be added: nothing to ask
+    const label = sessionLabel(today);
+    const bound = group.map((g) => `${timeJst(new Date(g.start_time))} 那趟 ${(g.distance_m / 1000).toFixed(2)} km`).join("、");
+    text = `今天的 ${label} 已經配了 ${bound}。Strava 又進來 ${acts.length} 個活動，是同一堂的另一段嗎？`;
+    meta = { state: "open", mode: "append", date: localDate, session_id: today.id, session_label: label,
+      candidates: acts.map((x) => ({ activity_id: x.id, label: `加進同一堂：${activityLabel(x)}` })) };
+  } else if (!isRestDay(today)) {
+    if (!kindMatches(a, today)) return false;
     // Every unassigned activity of the day of the right kind is a candidate; the
     // newest is Woo's guess (first chip).
     const rows = await query<ActivityLite>(
@@ -176,9 +201,9 @@ export async function postMismatchAsk(userId: string, meta: Omit<MismatchAskMeta
  * messages about it settled. Used by 選錯了 (resetCheckin) and by 不是 on a mismatch
  * question that came from the report page (no check-in to reset).
  */
-export async function undoPick(userId: string, activityId: string, sessionId: string | null): Promise<void> {
-  await query(
-    "update activities set session_id = null, match_status = 'unplanned' where id = $1 and user_id = $2 and ($3::uuid is null or session_id = $3)",
+export async function undoPick(userId: string, activityId: string, sessionId: string | null, opts: { regroup: boolean } = { regroup: true }): Promise<void> {
+  const released = await query<{ id: string }>(
+    "update activities set session_id = null, match_status = 'unplanned' where id = $1 and user_id = $2 and ($3::uuid is null or session_id = $3) returning id",
     [activityId, userId, sessionId],
   );
   await query("delete from reviews where activity_id = $1 and source = 'claude'", [activityId]);
@@ -188,6 +213,28 @@ export async function undoPick(userId: string, activityId: string, sessionId: st
     [userId, activityId],
   );
   await query("update coach_messages set status = 'sent' where user_id = $1 and role = 'athlete' and status = 'pending' and activity_id = $2", [userId, activityId]);
+  // The activity was one segment of the session's group: the others keep the session, and Woo looks at what is left
+  // (one new review). `regroup: false` when the caller assigns something to the session right after and re-judges itself.
+  if (opts.regroup && sessionId && released.length) await regroupReview(userId, sessionId, "segment removed");
+}
+
+/**
+ * Another segment joined today's session (the check-in chip, the today page's 也算今天的課 or the report page's 加進這堂 — every
+ * append path ends here): Woo's one fixed line in the thread (a template, no model) and the session's Claude review
+ * dropped and queued again over the whole group (the one model call this action costs; none when the primary
+ * carries a manual review). Safe to call with the group already containing the new segment.
+ */
+export async function appendDone(userId: string, sessionId: string): Promise<void> {
+  const group = await loadGroup(userId, sessionId);
+  if (!group.length) return;
+  if (group.length > 1) {
+    const c = combineGroup(group);
+    await postCoachMessage({
+      user_id: userId, role: "coach", kind: "chat", activity_id: group[0].id,
+      text: `好，${group.length} 段一起算 ${(c.distance_m / 1000).toFixed(2)} km，我重新看一次。`,
+    });
+  }
+  await regroupReview(userId, sessionId, "segment appended");
 }
 
 /**
@@ -205,7 +252,9 @@ export async function resetCheckin(userId: string, checkin: CoachMessageRow): Pr
   const fresh: CheckinMeta = { ...meta, state: "open", picked: null };
   const text = meta.mode === "activity"
     ? `好，那是哪一個？${meta.session_label ? `今天的課是 ${meta.session_label}。` : ""}`
-    : "好，那要算這週的哪一堂？";
+    : meta.mode === "append"
+      ? "好，那這趟是同一堂的另一段嗎？"
+      : "好，那要算這週的哪一堂？";
   return postCoachMessage({ user_id: userId, role: "coach", kind: "checkin", text, meta: fresh as unknown as Record<string, unknown>, activity_id: checkin.activity_id });
 }
 

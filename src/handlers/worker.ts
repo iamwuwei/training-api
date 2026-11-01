@@ -9,7 +9,8 @@ import { loadReviewContext } from "../lib/context";
 import { isDbWaking, query, queryOne } from "../lib/db";
 import { sessionLabel, shortDate, sportName } from "../lib/labels";
 import { getActivity, refreshToken, StravaError } from "../lib/strava";
-import { stageWriterByActivity } from "../lib/stage";
+import { combineGroup, loadGroup } from "../lib/session-group";
+import { stageWriterByActivities } from "../lib/stage";
 import { maybeRerunWeeklyReview } from "../lib/weekly";
 import type { BriefsJob, CoachAskJob, CoachReplyJob, PlannedSessionRow, RoutineJob, StravaConnectionRow, StravaWebhookEvent } from "../types";
 
@@ -190,7 +191,15 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
   // activity to a session (the api requeues it then), once per activity, never over
   // a manual review. Any sport counts (e.g. Hyrox on a 肌力 day). A Claude
   // failure must not requeue.
+  // A session can hold several recordings: the review is the whole session's, written on its PRIMARY activity
+  // (the earliest) when that one's event comes in; the other segments' events do nothing here.
   if (process.env.AUTO_REVIEW === "true" && row.session_id) {
+    const group = await loadGroup(conn.user_id, row.session_id);
+    if (group[0]?.id !== row.id) {
+      console.log(`activity ${activity.id} is not the primary of its session ${row.session_id}, no review`);
+      return;
+    }
+    const ids = group.map((g) => g.id);
     const existing = await queryOne<{ id: string }>(
       "select id from reviews where activity_id = $1 and not (source = 'claude' and verdict is null)",
       [row.id],
@@ -201,29 +210,39 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
         [row.session_id],
       );
       if (session) {
+        const c = combineGroup(group);
+        const reviewDay = shortDate(c.date);
         // The athlete's answer waiting for this verdict shows where Woo is (0 rows when there is none: a report-page pick, the today page).
-        const stage = stageWriterByActivity(conn.user_id, row.id);
+        const stage = stageWriterByActivities(conn.user_id, ids);
         try {
           await stage("reading");
-          const context = await loadReviewContext(conn.user_id, session, localDate, row.id);
+          const context = await loadReviewContext(conn.user_id, session, c.date, ids);
           await stage("judging");
           const r = await reviewActivity({
             session,
             activity: {
-              sport_type: activity.sport_type ?? activity.type,
-              start_date: localDate,
-              distance_m,
-              moving_time_sec,
-              avg_pace_sec_km,
-              avg_hr: round(activity.average_heartrate),
-              max_hr: round(activity.max_heartrate),
-              splits: activity.splits_metric ?? null,
-              description: activity.description ?? null,
-              memo: row.memo,
-              rpe: row.rpe,
+              sport_type: c.sport_type,
+              start_date: c.date,
+              distance_m: c.distance_m,
+              moving_time_sec: c.moving_time_sec,
+              avg_pace_sec_km: c.avg_pace_sec_km,
+              avg_hr: c.avg_hr,
+              max_hr: c.max_hr,
+              splits: c.splits,
+              description: c.description,
+              memo: c.memo,
+              rpe: c.rpe,
+              segments: c.segments.length > 1 ? c.segments : undefined,
             },
             context,
           });
+          // The model took a while: if the session's make-up changed meanwhile (a segment added or removed), this
+          // review is about a different session. Drop it, no retry: the api queued a new review when it changed the group.
+          const again = await loadGroup(conn.user_id, row.session_id);
+          if (again.length !== ids.length || again.some((g, i) => g.id !== ids[i])) {
+            console.log(`group of session ${row.session_id} changed during review of activity ${activity.id}, result dropped`);
+            return;
+          }
           // A failed attempt (verdict null) from an earlier delivery is replaced; a real review is kept.
           await query(
             `insert into reviews (id, activity_id, verdict, comment, reminders, source, model, adjust_hint)
@@ -234,16 +253,23 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
              where reviews.source = 'claude' and reviews.verdict is null`,
             [randomUUID(), row.id, r.verdict, r.comment, JSON.stringify(r.reminders), r.model, r.adjust_hint],
           );
-          console.log(`review for activity ${activity.id}: ${r.verdict} (${r.reminders.length} reminders)${r.adjust_hint ? ` hint: ${r.adjust_hint}` : ""}`);
+          console.log(`review for activity ${activity.id}${ids.length > 1 ? ` (+${ids.length - 1} more segments)` : ""}: ${r.verdict} (${r.reminders.length} reminders)${r.adjust_hint ? ` hint: ${r.adjust_hint}` : ""}`);
           // The verdict also shows up in the coach's thread.
           const label = sessionLabel(session);
           await postCoachMessage({
             user_id: conn.user_id, role: "coach", kind: "review", text: r.comment, activity_id: row.id,
-            meta: { label, verdict: r.verdict, reminder: r.reminders[0] ?? null, date: localDate },
+            meta: { label, verdict: r.verdict, reminder: r.reminders[0] ?? null, date: c.date },
           });
-          await settleAthleteMessages(conn.user_id, row.id); // the answer that triggered this review is replied to
+          for (const id of ids) await settleAthleteMessages(conn.user_id, id); // the answer that triggered this review is replied to
           // The week's review was written without this activity (late sync): the weekly Lambda regenerates it in place.
-          await maybeRerunWeeklyReview(conn.user_id, row.id, localDate, `${day} 的 ${session.label ?? session.type} 進來了`);
+          // At most one weekly Lambda invoke for the session, however many recordings it has: ask about the recordings in
+          // order until one request goes out. The weekly review lists the ids it saw by the session's date
+          // (ACTIVITY_IDS_SELECT), so that one rerun brings in every recording it was missing; asking all of them
+          // regardless would invoke the Lambda once each before the first has finished. Asking only the primary would miss
+          // a segment bound after the review was written (the primary is already in its list).
+          for (const gid of ids) {
+            if (await maybeRerunWeeklyReview(conn.user_id, gid, c.date, `${reviewDay} 的 ${session.label ?? session.type} 進來了`)) break;
+          }
         } catch (err) {
           // Not requeued (SQS would only retry the same failure). Recorded so the
           // app can show "分析失敗" with a retry instead of waiting forever.
@@ -255,7 +281,7 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
              on conflict (activity_id) do nothing`,
             [randomUUID(), row.id, `分析失敗：${reason}`],
           );
-          await settleAthleteMessages(conn.user_id, row.id);
+          for (const id of ids) await settleAthleteMessages(conn.user_id, id);
           await postCoachMessage({ user_id: conn.user_id, role: "coach", kind: "chat", text: "這次分析沒成功，報告頁可以按「重新分析」。", activity_id: row.id });
         }
       }
