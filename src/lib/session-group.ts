@@ -214,10 +214,16 @@ const sqs = new SQSClient({});
  * here and is never refused. 0 (or an unreadable value) = no cap. The model is called once per queued re-judge, so this
  * bounds the day's cost of a broken client or a button pressed over and over.
  */
-const limitFromEnv = (): number => {
-  const n = Number(process.env.REVIEW_DAILY_LIMIT ?? 20);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
-};
+export const REVIEW_DAILY_LIMIT_DEFAULT = 20;
+/** Unset = the default; exactly "0" = no cap; a positive whole number = that cap. Anything else ("", "abc", "-3", "Infinity", "007") falls back to the default (and says so once): a bad value must not turn the cap off. */
+export function parseReviewLimit(raw: string | undefined): number {
+  if (raw === undefined) return REVIEW_DAILY_LIMIT_DEFAULT;
+  if (raw === "0") return 0;
+  if (/^[1-9][0-9]{0,5}$/.test(raw)) return Number(raw);
+  console.warn(`REVIEW_DAILY_LIMIT=${JSON.stringify(raw).slice(0, 40)} is not "0" or a positive whole number, using ${REVIEW_DAILY_LIMIT_DEFAULT}`);
+  return REVIEW_DAILY_LIMIT_DEFAULT;
+}
+const limitFromEnv = (): number => parseReviewLimit(process.env.REVIEW_DAILY_LIMIT);
 export const REVIEW_DAILY_LIMIT = limitFromEnv();
 /** `reviews.comment` of the failed row written when the cap refused a re-judge; the api turns it into REVIEW_LIMIT_TEXT. */
 export const REVIEW_LIMIT_MARKER = "分析失敗：limit";
@@ -275,6 +281,30 @@ export async function writeLimitedReview(userId: string, group: GroupActivity[])
     await postCoachMessage({ user_id: userId, role: "coach", kind: "chat", text: REVIEW_LIMIT_THREAD, activity_id: primary.id });
   }
   for (const g of group) await settleAthleteMessages(userId, g.id);
+}
+
+/**
+ * A re-judge that was promised but could not be queued (the queue refused it): the session's Claude review is already gone,
+ * so leave a failed row on the primary, or the report page waits for a verdict that is not coming, and say so once in the
+ * thread (the same line a failed model call gets). Nothing when the primary has a review row (a manual one, or the cap's
+ * own failed row, which has said its line). Never throws.
+ */
+export async function writeNotQueuedReview(userId: string, sessionId: string): Promise<void> {
+  try {
+    const primary = (await loadGroup(userId, sessionId))[0];
+    if (!primary) return;
+    const rows = await query<{ id: string }>(
+      `insert into reviews (id, activity_id, verdict, comment, reminders, source, model)
+       values ($1, $2, null, '分析失敗：not queued', '[]', 'claude', null)
+       on conflict (activity_id) do nothing returning id`,
+      [randomUUID(), primary.id],
+    );
+    if (!rows.length) return;
+    const { postCoachMessage } = await import("./coach");
+    await postCoachMessage({ user_id: userId, role: "coach", kind: "chat", text: "這次分析沒成功，報告頁可以按「重新分析」。", activity_id: primary.id });
+  } catch (err) {
+    console.error(`failed review row for session ${sessionId} not written`, err);
+  }
 }
 
 /**

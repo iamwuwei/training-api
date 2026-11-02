@@ -68,11 +68,17 @@ interface CandidateRow {
 
 /**
  * The sessions Woo may re-judge: the user's own, not ignored, the primary activity of their session, with a finished
- * verdict, from the last CORRECTION_WINDOW_DAYS days or the one the message quotes; newest first, at most
- * CORRECTION_CANDIDATES. The ones that cannot be re-judged now are listed too, with the reason (Woo must know why).
+ * verdict, from the last CORRECTION_WINDOW_DAYS days or the one the message quotes or the one the thread's latest verdict
+ * message is about; at most CORRECTION_CANDIDATES, the quoted one first, then the latest verdict's, then the rest newest first
+ * (so neither can be pushed out of the list by the limit). The ones that cannot be re-judged now are listed too, with the reason (Woo must know why).
  */
 export async function loadCorrectionCandidates(userId: string, _today: string, quotedActivityId: string | null): Promise<CorrectionCandidate[]> {
   const quoted = quotedActivityId && UUID_RE.test(quotedActivityId) ? quotedActivityId : null;
+  // The session the thread's latest verdict message is about: what "這堂" most likely means when nothing is quoted.
+  const lastVerdict = (await query<{ activity_id: string }>(
+    "select activity_id from coach_messages where user_id = $1 and role = 'coach' and kind = 'review' and activity_id is not null order by created_at desc, id desc limit 1",
+    [userId],
+  ))[0]?.activity_id ?? null;
   const rows = await query<CandidateRow>(
     `select a.id as activity_id, a.session_id, ps.label, ps.type, ps.target_distance_m,
             to_char(coalesce(g.t0, a.start_time) at time zone 'Asia/Tokyo', 'YYYY-MM-DD') as date,
@@ -89,9 +95,9 @@ export async function loadCorrectionCandidates(userId: string, _today: string, q
       where a.user_id = $1 and a.match_status <> 'ignored' and r.verdict is not null
         and not exists (select 1 from activities x where x.session_id = a.session_id and x.user_id = a.user_id
                           and x.match_status <> 'ignored' and (x.start_time, x.id) < (a.start_time, a.id))
-        and (a.start_time > now() - ($3::int * interval '1 day') or ($2::uuid is not null and a.id = $2::uuid))
-      order by a.start_time desc limit $4`,
-    [userId, quoted, CORRECTION_WINDOW_DAYS, CORRECTION_CANDIDATES, CORRECTION_QUEUED_STALE_MIN],
+        and (a.start_time > now() - ($3::int * interval '1 day') or a.id = $2::uuid or a.id = $6::uuid)
+      order by coalesce(a.id = $2::uuid, false) desc, coalesce(a.id = $6::uuid, false) desc, a.start_time desc limit $4`,
+    [userId, quoted, CORRECTION_WINDOW_DAYS, CORRECTION_CANDIDATES, CORRECTION_QUEUED_STALE_MIN, lastVerdict],
   );
   const daily = await reviewLimitReached(userId); // the day's quota for every re-judge is used up: none of them can be
   return rows.map((r) => {

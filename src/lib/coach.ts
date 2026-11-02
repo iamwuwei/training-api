@@ -7,7 +7,7 @@ import { validateConstraint } from "./constraints";
 import { CORRECTION_RULES, correctionSection, loadCorrectionCandidates, settleCorrection, validateCorrection, type CorrectionCandidate, type RawCorrection } from "./correction";
 import { type Querier, query, queryOne, withTransaction } from "./db";
 import { checkCards, describeCard, describeItem } from "./proposals"; // cycle with proposals.ts (postCoachMessage): both only used inside functions
-import { regroupReview } from "./session-group";
+import { regroupReview, writeNotQueuedReview } from "./session-group";
 import { stageWriter } from "./stage";
 import type { CoachMessageRow, ProposalRow, RawCard, RawConstraint, StoredAdjustments, WeeklyReviewRow } from "../types";
 
@@ -483,13 +483,23 @@ export async function answerCoachMessage(userId: string, messageId: string, toda
     });
     if (wrote && corr?.ok) {
       // The reply is stored; now the one re-judge it promised (no model call here: the worker's review path writes the new verdict).
-      let queued = false;
+      // Nothing in this block may throw: the reply is out and the athlete's message is answered, whatever happens to the re-judge.
       try {
-        queued = await regroupReview(userId, corr.session_id, "correction");
+        let queued = false;
+        try {
+          queued = await regroupReview(userId, corr.session_id, "correction");
+        } catch (err) {
+          console.error(`correction re-judge not queued for message ${msg.id}`, err);
+        }
+        if (!queued) {
+          // The session's Claude review was dropped for the re-judge: leave a failed row (report page: 分析失敗 · 重新分析, not an
+          // endless 分析中) and tell the reply.
+          await writeNotQueuedReview(userId, corr.session_id);
+          await settleCorrection(userId, [corr.activity_id], "failed");
+        }
       } catch (err) {
-        console.error(`correction re-judge not queued for message ${msg.id}`, err);
+        console.error(`correction follow-up failed for message ${msg.id}`, err);
       }
-      if (!queued) await settleCorrection(userId, [corr.activity_id], "failed");
     }
     return wrote ? out.text : null;
   } catch (err) {
