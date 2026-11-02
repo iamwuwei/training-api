@@ -6,11 +6,12 @@ import { askAboutActivity, maybeCheckin, settleAthleteMessages } from "../lib/ch
 import { writeRoutine } from "../lib/strength";
 import { answerCoachMessage, postCoachMessage } from "../lib/coach";
 import { loadReviewContext } from "../lib/context";
-import { isDbWaking, query, queryOne } from "../lib/db";
+import { CORRECTION_REASON_MAX, settleCorrection, supersedeReviewMessages } from "../lib/correction";
+import { isDbWaking, query, queryOne, withTransaction } from "../lib/db";
 import { sessionLabel, shortDate, sportName } from "../lib/labels";
 import { getActivity, refreshToken, StravaError } from "../lib/strava";
 import { combineGroup, loadGroup } from "../lib/session-group";
-import { stageWriterByActivities } from "../lib/stage";
+import { stageWriterAll, stageWriterByActivities, stageWriterByCorrection } from "../lib/stage";
 import { maybeRerunWeeklyReview } from "../lib/weekly";
 import type { BriefsJob, CoachAskJob, CoachReplyJob, PlannedSessionRow, RoutineJob, StravaConnectionRow, StravaWebhookEvent } from "../types";
 
@@ -212,8 +213,9 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
       if (session) {
         const c = combineGroup(group);
         const reviewDay = shortDate(c.date);
-        // The athlete's answer waiting for this verdict shows where Woo is (0 rows when there is none: a report-page pick, the today page).
-        const stage = stageWriterByActivities(conn.user_id, ids);
+        // The athlete's answer waiting for this verdict shows where Woo is (0 rows when there is none: a report-page pick, the today page);
+        // so does Woo's reply that promised this re-judge (a correction in the thread).
+        const stage = stageWriterAll(stageWriterByActivities(conn.user_id, ids), stageWriterByCorrection(conn.user_id, ids));
         try {
           await stage("reading");
           const context = await loadReviewContext(conn.user_id, session, c.date, ids);
@@ -254,11 +256,20 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
             [randomUUID(), row.id, r.verdict, r.comment, JSON.stringify(r.reminders), r.model, r.adjust_hint],
           );
           console.log(`review for activity ${activity.id}${ids.length > 1 ? ` (+${ids.length - 1} more segments)` : ""}: ${r.verdict} (${r.reminders.length} reminders)${r.adjust_hint ? ` hint: ${r.adjust_hint}` : ""}`);
-          // The verdict also shows up in the coach's thread.
+          // The verdict also shows up in the coach's thread. One transaction: the reply that promised this re-judge turns
+          // `done` together with the new verdict message appearing (the app stops polling at `done`), the message says it
+          // redid a verdict the athlete corrected, and the earlier verdict messages of the session are marked replaced.
           const label = sessionLabel(session);
-          await postCoachMessage({
-            user_id: conn.user_id, role: "coach", kind: "review", text: r.comment, activity_id: row.id,
-            meta: { label, verdict: r.verdict, reminder: r.reminders[0] ?? null, date: c.date },
+          await withTransaction(async (q) => {
+            const settled = await settleCorrection(conn.user_id, ids, "done", q);
+            const posted = await postCoachMessage({
+              user_id: conn.user_id, role: "coach", kind: "review", text: r.comment, activity_id: row.id,
+              meta: {
+                label, verdict: r.verdict, reminder: r.reminders[0] ?? null, date: c.date,
+                ...(settled.n ? { corrected: { reason: [...(settled.note ?? "你的說明")].slice(0, CORRECTION_REASON_MAX).join("") } } : {}),
+              },
+            }, q);
+            await supersedeReviewMessages(conn.user_id, ids, posted.id, q);
           });
           for (const id of ids) await settleAthleteMessages(conn.user_id, id); // the answer that triggered this review is replied to
           // The week's review was written without this activity (late sync): the weekly Lambda regenerates it in place.
@@ -283,6 +294,7 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
           );
           for (const id of ids) await settleAthleteMessages(conn.user_id, id);
           await postCoachMessage({ user_id: conn.user_id, role: "coach", kind: "chat", text: "這次分析沒成功，報告頁可以按「重新分析」。", activity_id: row.id });
+          await settleCorrection(conn.user_id, ids, "failed"); // a correction that promised this re-judge: the reply says it did not come
         }
       }
     }

@@ -1,5 +1,6 @@
 import type { HistoryItem, ReviewContext } from "./claude";
 import { loadLiveConstraints } from "./constraints";
+import { loadCorrectionNotes } from "./correction";
 import { query, queryOne } from "./db";
 import { GROUP_DATE_JOIN, sumGroup } from "./session-group";
 import type { PlanRow, PlanWeekRow, PlannedSessionRow, Verdict } from "../types";
@@ -175,5 +176,5 @@ export async function loadReviewContext(
 
   const constraints = await loadLiveConstraints(userId, date);
 
-  return { plan, weeks, thisWeek, recent, sameType, prevReminders: prev?.reminders ?? [], constraints };
+  return { plan, weeks, thisWeek, recent, sameType, prevReminders: prev?.reminders ?? [], constraints, corrections: await loadCorrectionNotes(userId, activityIds) };
 }

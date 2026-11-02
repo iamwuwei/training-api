@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import { query, queryOne } from "./db";
 import { isRunSport } from "./labels";
@@ -207,19 +208,95 @@ export const sameKind = (a: Pick<GroupActivity, "sport_type">, b: Pick<GroupActi
 const sqs = new SQSClient({});
 
 /**
+ * The day's cap on re-judges per user (JST day), counted by `reviewsToday`. Every re-judge the app queues goes through
+ * `requeueReview` — "重新分析", removing / adding / replacing a segment, 選錯了, 是這趟, the memo / RPE, the feel answer, a
+ * correction in the thread — so one number covers all of them. The first review of a Strava event does not come through
+ * here and is never refused. 0 (or an unreadable value) = no cap. The model is called once per queued re-judge, so this
+ * bounds the day's cost of a broken client or a button pressed over and over.
+ */
+const limitFromEnv = (): number => {
+  const n = Number(process.env.REVIEW_DAILY_LIMIT ?? 20);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+};
+export const REVIEW_DAILY_LIMIT = limitFromEnv();
+/** `reviews.comment` of the failed row written when the cap refused a re-judge; the api turns it into REVIEW_LIMIT_TEXT. */
+export const REVIEW_LIMIT_MARKER = "分析失敗：limit";
+/** ApiReview.error of that failed row. */
+export const REVIEW_LIMIT_TEXT = `今天重新分析的次數用完了（每天 ${REVIEW_DAILY_LIMIT} 次）。數據和心得都存好了，明天按「重新分析」就會重判。`;
+/** Woo's one line in the thread (once a day) when the cap refused a re-judge. */
+export const REVIEW_LIMIT_THREAD = `今天重新分析的次數用完了（每天 ${REVIEW_DAILY_LIMIT} 次），這些我明天再看；數據和心得都存好了。`;
+
+/** Verdicts finished today (JST): the review messages in the user's thread, one per finished verdict, the first review of an event included. A failed verdict posts none. */
+export async function reviewsToday(userId: string): Promise<number> {
+  const row = await queryOne<{ n: number }>(
+    `select count(*)::int as n from coach_messages
+      where user_id = $1 and role = 'coach' and kind = 'review'
+        and (created_at at time zone 'Asia/Tokyo')::date = (now() at time zone 'Asia/Tokyo')::date`,
+    [userId],
+  );
+  return row?.n ?? 0;
+}
+
+export async function reviewLimitReached(userId: string): Promise<boolean> {
+  return REVIEW_DAILY_LIMIT > 0 && (await reviewsToday(userId)) >= REVIEW_DAILY_LIMIT;
+}
+
+/** After the review (or its failure) the athlete's pending answer about that activity is settled. */
+export async function settleAthleteMessages(userId: string, activityId: string): Promise<void> {
+  await query(
+    "update coach_messages set status = 'sent' where user_id = $1 and role = 'athlete' and status = 'pending' and activity_id = $2",
+    [userId, activityId],
+  );
+}
+
+/**
+ * The cap refused a re-judge: the data action that asked for it has already happened (the memo is saved, the segment is
+ * bound), so say so instead of failing quietly. (1) a failed review row on the primary with the cap's marker (a manual
+ * review stays); (2) one fixed line from Woo in the thread, once a day; (3) the athlete's pending answer about any of the
+ * group's activities is settled, so the app stops waiting for a verdict that is not coming.
+ */
+export async function writeLimitedReview(userId: string, group: GroupActivity[]): Promise<void> {
+  const primary = group[0];
+  if (!primary) return;
+  await query(
+    `insert into reviews (id, activity_id, verdict, comment, reminders, source, model)
+     values ($1, $2, null, $3, '[]', 'claude', null)
+     on conflict (activity_id) do nothing`,
+    [randomUUID(), primary.id, REVIEW_LIMIT_MARKER],
+  );
+  const said = await queryOne<{ x: number }>(
+    `select 1 as x from coach_messages
+      where user_id = $1 and role = 'coach' and kind = 'chat' and text = $2
+        and (created_at at time zone 'Asia/Tokyo')::date = (now() at time zone 'Asia/Tokyo')::date limit 1`,
+    [userId, REVIEW_LIMIT_THREAD],
+  );
+  if (!said) {
+    const { postCoachMessage } = await import("./coach"); // coach.ts imports this file: loaded when needed, not at the top
+    await postCoachMessage({ user_id: userId, role: "coach", kind: "chat", text: REVIEW_LIMIT_THREAD, activity_id: primary.id });
+  }
+  for (const g of group) await settleAthleteMessages(userId, g.id);
+}
+
+/**
  * Have the worker write a new Claude review for the session `activityId` belongs to: the same fake Strava "update"
  * event the api always sent, for the group's PRIMARY activity (the worker reviews the whole session when it gets
- * the primary's event, and ignores any other segment's). Nothing is sent when the activity has no session / group
- * or there is no queue (local scripts).
+ * the primary's event, and ignores any other segment's). Returns whether one was queued. Nothing is sent (false) when
+ * the activity has no session / group or there is no queue (local scripts), and when the day's cap (REVIEW_DAILY_LIMIT)
+ * is reached: then writeLimitedReview says so instead.
  */
-export async function requeueReview(userId: string, activityId: string, reason: string): Promise<void> {
-  if (!process.env.QUEUE_URL) return;
+export async function requeueReview(userId: string, activityId: string, reason: string): Promise<boolean> {
+  if (!process.env.QUEUE_URL) return false;
   const act = await queryOne<{ session_id: string | null }>("select session_id from activities where id = $1 and user_id = $2", [activityId, userId]);
-  if (!act?.session_id) return;
-  const primary = (await loadGroup(userId, act.session_id))[0];
-  if (!primary) return;
+  if (!act?.session_id) return false;
+  const group = await loadGroup(userId, act.session_id);
+  const primary = group[0];
+  if (!primary) return false;
   const conn = await queryOne<{ strava_athlete_id: string }>("select strava_athlete_id from strava_connections where user_id = $1", [userId]);
-  if (!conn) return;
+  if (!conn) return false;
+  if (await reviewLimitReached(userId)) {
+    await writeLimitedReview(userId, group);
+    return false;
+  }
   await sqs.send(
     new SendMessageCommand({
       QueueUrl: process.env.QUEUE_URL,
@@ -232,21 +309,24 @@ export async function requeueReview(userId: string, activityId: string, reason: 
       }),
     }),
   );
+  return true;
 }
 
 /**
  * The make-up of the session changed (a segment added, removed, replaced, a memo edited): drop the group's Claude
  * reviews and, when the primary has no review left (a manual one stays), queue one new review of the whole session.
- * One model call per user action, however many segments there are. An empty group: nothing to do.
+ * One model call per user action, however many segments there are. An empty group: nothing to do. Returns whether a
+ * review was queued (false: nothing to do, a manual review stays, no queue, or the day's cap).
  */
-export async function regroupReview(userId: string, sessionId: string, reason: string): Promise<void> {
+export async function regroupReview(userId: string, sessionId: string, reason: string): Promise<boolean> {
   const group = await loadGroup(userId, sessionId);
-  if (!group.length) return;
+  if (!group.length) return false;
   const primary = group[0];
   const dropped = await query<{ id: string }>(
     "delete from reviews where activity_id = any($1::uuid[]) and source = 'claude' returning id",
     [group.map((g) => g.id)],
   );
   const hasManual = await queryOne<{ id: string }>("select id from reviews where activity_id = $1", [primary.id]);
-  if (dropped.length > 0 || !hasManual) await requeueReview(userId, primary.id, reason);
+  if (dropped.length > 0 || !hasManual) return requeueReview(userId, primary.id, reason);
+  return false;
 }

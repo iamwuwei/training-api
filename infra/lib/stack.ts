@@ -138,6 +138,7 @@ export class TrainingApiStack extends cdk.Stack {
         // "true": the chat reply is received as a stream, so the app can show "查資料中" / "寫回覆中". Off until the
         // streaming + json_schema + web_search request has been tried against the real API (01b "真 API 小測試").
         COACH_STREAM: process.env.COACH_STREAM ?? "false",
+        REVIEW_DAILY_LIMIT: process.env.REVIEW_DAILY_LIMIT ?? "20", // 0 = no cap; the day's re-judges per user — every entrance goes through requeueReview
       },
       reservedConcurrentExecutions: 2,
     });
@@ -158,6 +159,7 @@ export class TrainingApiStack extends cdk.Stack {
         QUEUE_URL: queue.queueUrl,
         WEEKLY_FUNCTION_NAME: weekly.functionName,
         COACH_DAILY_LIMIT: process.env.COACH_DAILY_LIMIT ?? "0", // 0 = no cap (two known athletes)
+        REVIEW_DAILY_LIMIT: process.env.REVIEW_DAILY_LIMIT ?? "20", // 0 = no cap; the day's re-judges per user — every entrance goes through requeueReview
       },
     });
     queue.grantSendMessages(api); // re-review after a manual session assignment

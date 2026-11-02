@@ -315,10 +315,6 @@ export async function askAboutActivity(userId: string, pickMessageId: string): P
   await query("update coach_messages set status = 'sent' where id = $1", [pick.id]);
 }
 
-/** After the review (or its failure) the athlete's pending answer about that activity is settled. */
-export async function settleAthleteMessages(userId: string, activityId: string): Promise<void> {
-  await query(
-    "update coach_messages set status = 'sent' where user_id = $1 and role = 'athlete' and status = 'pending' and activity_id = $2",
-    [userId, activityId],
-  );
-}
+// The athlete's pending answer settled after the review (or its failure) lives in session-group.ts (the daily cap needs it
+// there); re-exported so the worker's import does not change.
+export { settleAthleteMessages } from "./session-group";
