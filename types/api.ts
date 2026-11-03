@@ -114,6 +114,9 @@ export interface ApiSplit {
  * `error` is a fixed line to show ("這次分析沒成功，再試一次"; the provider's wording
  * stays in the logs); POST …/rereview tries again. Nothing at all (activity.review
  * null) with a session assigned = still being analysed.
+ * `error` is the fixed line to show, do not write your own: a model failure is "這次分析沒成功，再試一次"; when the day's
+ * re-judge quota (REVIEW_DAILY_LIMIT per user, JST day) was used up while the data/memo was saved it is "今天重新分析的次數用完了
+ * （每天 N 次）。數據和心得都存好了，明天按「重新分析」就會重判。" (the review was not re-queued; POST …/rereview works again tomorrow).
  */
 export interface ApiReview {
   verdict: Verdict | null;
@@ -125,6 +128,12 @@ export interface ApiReview {
   failed: boolean;
   error: string | null;
   created_at: string;
+  /**
+   * The athlete corrected this session's verdict in the thread ("課表是 7:10") and the review was redone with that
+   * correction (coach-correct-review): the time of his latest correction message. null when the review was never
+   * corrected. Show "已更正" next to the review's time.
+   */
+  corrected_at: string | null;
 }
 
 /**
@@ -363,6 +372,8 @@ export interface DetailOptionsResponse {
 // a few seconds to a minute later on /plan and /activities. 409 when the activity has no
 // session yet, or carries a manual review. On a segment of a group, acts on the group's primary
 // activity (the review is the session's).
+// 429 `review daily limit reached`: the day's re-judge quota (REVIEW_DAILY_LIMIT per user, JST day) is used up; the
+// review is left as it is. Show「今天重新分析的次數用完了（每天 20 次），明天再試」.
 
 export interface RereviewResponse {
   queued: true;
@@ -439,7 +450,13 @@ export interface ApiCoachMessage {
   activity_id: string | null;        // review/ask/pick: that run; athlete chat: the quoted run
   weekly_review_id: string | null;   // weekly: look its proposals up in GET /weekly
   status: "pending" | "sent" | "failed";
-  review: { label: string; verdict: Verdict | null; reminder: string | null; date: string | null } | null;
+  review: {
+    label: string; verdict: Verdict | null; reminder: string | null; date: string | null;
+    /** This verdict replaced an earlier one after the athlete's correction: draw "⟳ 已更新判定 · {reason}" (reason ≤ 40 chars). null otherwise. */
+    updated: { reason: string } | null;
+    /** A newer verdict of the same session was posted later in the thread: draw this one dimmed with "這則判定已更新，以下面新的為準". */
+    superseded: boolean;
+  } | null;
   quote: string | null;              // athlete chat sent from a report: one line about that run
   rpe: number | null;                // athlete answer to an ask: the RPE they picked
   checkin: ApiCheckin | null;        // kind checkin
@@ -486,8 +503,22 @@ export interface ApiCoachMessage {
    * (a chat reply); reading, judging (the verdict after the feel answer). Also on a weekly
    * message while it is being rewritten (preparing, thinking). null when not pending or not
    * known. Show unknown strings as "thinking": the list may grow without a web release.
+   * Also on a coach reply whose `correction.state` is queued (reading, judging).
    */
   stage: string | null;
+  /**
+   * A coach chat reply in which Woo agreed to redo a verdict (the athlete pointed out a factual error, or asked for the
+   * report to be updated). queued: the new verdict is on its way (poll; `stage` says where Woo is; the report page shows
+   * 分析中); done: the new `review` message follows in the thread; failed: the re-judge did not complete (the report page
+   * offers 重新分析); rejected: Woo wanted to but the api refused (a manual verdict, the daily cap, a re-judge already
+   * running, an unknown session) — show one fixed grey line. null on every other message.
+   */
+  correction: {
+    activity_id: string; label: string; date: string;
+    state: "queued" | "done" | "failed" | "rejected";
+    /** rejected only: limit = this session was corrected twice today; daily = the day's re-judge quota (REVIEW_DAILY_LIMIT) is used up; manual = a manual verdict; queued = a re-judge is already running; unknown = not one of the sessions Woo could pick. null otherwise. */
+    why: "limit" | "daily" | "manual" | "queued" | "unknown" | null;
+  } | null;
   error: string | null;              // failed: a fixed line to show (the provider's wording stays in the logs)
   created_at: string;
 }

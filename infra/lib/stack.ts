@@ -138,6 +138,9 @@ export class TrainingApiStack extends cdk.Stack {
         // "true": the chat reply is received as a stream, so the app can show "查資料中" / "寫回覆中". Off until the
         // streaming + json_schema + web_search request has been tried against the real API (01b "真 API 小測試").
         COACH_STREAM: process.env.COACH_STREAM ?? "false",
+        // A correction in the thread (answerCoachMessage) re-queues one verdict job through requeueReview, so the worker sends to its own queue.
+        QUEUE_URL: queue.queueUrl,
+        REVIEW_DAILY_LIMIT: process.env.REVIEW_DAILY_LIMIT ?? "20", // 0 = no cap; finished verdicts per user and JST day: asked before a job is queued (requeueReview) and again right before the model is called (processEvent), Strava's first review included
       },
       reservedConcurrentExecutions: 2,
     });
@@ -145,6 +148,7 @@ export class TrainingApiStack extends cdk.Stack {
     // messages to a function that is full, they get throttled and every throttle counts as a
     // receive towards the DLQ's maxReceiveCount.
     worker.addEventSource(new SqsEventSource(queue, { batchSize: 1, maxConcurrency: 2 }));
+    queue.grantSendMessages(worker); // coach-correct-review: the re-judge a correction asks for (requeueReview), the only message the worker sends
     weekly.grantInvoke(worker); // a late activity: regenerate the week's review there, not in the worker's 90 s
 
     const oauth = fn("oauth", { environment: stravaEnv, retryAttempts: 0 });
@@ -158,6 +162,7 @@ export class TrainingApiStack extends cdk.Stack {
         QUEUE_URL: queue.queueUrl,
         WEEKLY_FUNCTION_NAME: weekly.functionName,
         COACH_DAILY_LIMIT: process.env.COACH_DAILY_LIMIT ?? "0", // 0 = no cap (two known athletes)
+        REVIEW_DAILY_LIMIT: process.env.REVIEW_DAILY_LIMIT ?? "20", // 0 = no cap; finished verdicts per user and JST day: asked before a job is queued (requeueReview; "重新分析" gets a 429) and again by the worker right before the model is called
       },
     });
     queue.grantSendMessages(api); // re-review after a manual session assignment

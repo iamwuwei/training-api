@@ -190,7 +190,7 @@ function pace(sec: number | null | undefined): string {
   if (!sec) return "-";
   return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}/km`;
 }
-const bandText = (b: Band | null) => (b ? `${pace(b.lo).replace("/km", "")}〜${pace(b.hi)}` : null);
+export const bandText = (b: Band | null) => (b ? `${pace(b.lo).replace("/km", "")}〜${pace(b.hi)}` : null);
 
 export interface SplitsActivity {
   sport_type?: string | null;
