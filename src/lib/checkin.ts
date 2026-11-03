@@ -314,7 +314,3 @@ export async function askAboutActivity(userId: string, pickMessageId: string): P
   });
   await query("update coach_messages set status = 'sent' where id = $1", [pick.id]);
 }
-
-// The athlete's pending answer settled after the review (or its failure) lives in session-group.ts (the daily cap needs it
-// there); re-exported so the worker's import does not change.
-export { settleAthleteMessages } from "./session-group";

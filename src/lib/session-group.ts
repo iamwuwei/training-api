@@ -249,14 +249,6 @@ export async function reviewLimitReached(userId: string): Promise<boolean> {
   return REVIEW_DAILY_LIMIT > 0 && (await reviewsToday(userId)) >= REVIEW_DAILY_LIMIT;
 }
 
-/** After the review (or its failure) the athlete's pending answer about that activity is settled. */
-export async function settleAthleteMessages(userId: string, activityId: string): Promise<void> {
-  await query(
-    "update coach_messages set status = 'sent' where user_id = $1 and role = 'athlete' and status = 'pending' and activity_id = $2",
-    [userId, activityId],
-  );
-}
-
 /**
  * Only the athlete's answers that are waiting for THIS verdict (the feel answer: a chat with `meta.answer_to`, the same set the
  * stage writer follows) are settled. Other pending messages that merely mention the activity (a question quoting it, a correction
