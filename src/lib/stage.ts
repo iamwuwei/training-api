@@ -58,6 +58,22 @@ export function stageWriterByActivities(userId: string, ids: string[]): (stage: 
   return writer("user_id = $2 and role = 'athlete' and kind = 'chat' and status = 'pending' and activity_id = any($3::uuid[]) and meta ? 'answer_to'", [userId, ids]);
 }
 
+/**
+ * Woo's reply that agreed to redo these activities' verdict (a correction in the thread, state `queued`): the app shows
+ * "Woo 在重判…" under it and polls while it is queued. `ids` = the session's group; the reply names the primary of that
+ * moment, which can be any member after a change of primary. 0 rows for every re-judge that is not a correction.
+ */
+export function stageWriterByCorrection(userId: string, ids: string[]): (stage: CoachStage) => Promise<void> {
+  return writer("user_id = $2 and role = 'coach' and kind = 'chat' and meta->'correction'->>'activity_id' = any($3::text[]) and meta->'correction'->>'state' = 'queued'", [userId, ids]);
+}
+
+/** Several writers as one: each stage goes to every one of them in turn (each keeps its own MAX_STAGE_WRITES). */
+export function stageWriterAll(...writers: ((stage: CoachStage) => Promise<void>)[]): (stage: CoachStage) => Promise<void> {
+  return async (stage) => {
+    for (const w of writers) await w(stage);
+  };
+}
+
 /** The weekly message of a review while it is rewritten. */
 export function stageWriterByReview(reviewId: string): (stage: CoachStage) => Promise<void> {
   return writer("weekly_review_id = $2 and kind = 'weekly'", [reviewId]);

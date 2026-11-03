@@ -1,5 +1,6 @@
 import type { HistoryItem, ReviewContext } from "./claude";
 import { loadLiveConstraints } from "./constraints";
+import { loadCorrectionNotes } from "./correction";
 import { query, queryOne } from "./db";
 import { GROUP_DATE_JOIN, sumGroup } from "./session-group";
 import type { PlanRow, PlanWeekRow, PlannedSessionRow, Verdict } from "../types";
@@ -165,15 +166,24 @@ export async function loadReviewContext(
       )).reverse().slice(-5)
     : [];
 
-  const prev = await queryOne<{ reminders: string[] | null }>(
-    `select r.reminders from reviews r join activities a on a.id = r.activity_id
-      where a.user_id = $1 and a.id <> all($2::uuid[]) and r.verdict is not null
-        and a.start_time < (select min(start_time) from activities where id = any($2::uuid[]) and user_id = $1)
-      order by a.start_time desc limit 1`,
-    [userId, activityIds],
-  );
+  // The reminders go to "the next session of the same kind" (same session label): the previous verdict of this kind, on its
+  // session's primary activity. Not the latest verdict of any kind — an Easy run's "keep 7:20" is not advice for the next long run.
+  // A session without a label has no kind to match: none.
+  const prev = session.label
+    ? await queryOne<{ reminders: string[] | null }>(
+        `select r.reminders from reviews r
+           join activities a on a.id = r.activity_id
+           join planned_sessions ps on ps.id = a.session_id
+          where a.user_id = $1 and a.id <> all($2::uuid[]) and a.match_status <> 'ignored' and r.verdict is not null and ps.label = $3
+            and not exists (select 1 from activities x where x.session_id = a.session_id and x.user_id = a.user_id
+                              and x.match_status <> 'ignored' and (x.start_time, x.id) < (a.start_time, a.id))
+            and a.start_time < (select min(start_time) from activities where id = any($2::uuid[]) and user_id = $1)
+          order by a.start_time desc limit 1`,
+        [userId, activityIds, session.label],
+      )
+    : undefined;
 
   const constraints = await loadLiveConstraints(userId, date);
 
-  return { plan, weeks, thisWeek, recent, sameType, prevReminders: prev?.reminders ?? [], constraints };
+  return { plan, weeks, thisWeek, recent, sameType, prevReminders: prev?.reminders ?? [], constraints, corrections: await loadCorrectionNotes(userId, activityIds) };
 }

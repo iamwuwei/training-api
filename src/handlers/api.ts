@@ -5,10 +5,11 @@ import { isDbWaking, type Querier, query, queryOne, withTransaction } from "../l
 import { appendDone, type CheckinMeta, type MismatchAskMeta, mismatchReason, postMismatchAsk, resetCheckin, undoPick } from "../lib/checkin";
 import { COACH_NAME, MAX_MESSAGE_CHARS, postCoachMessage, REPLY_FAILED } from "../lib/coach";
 import { constraintsByIds, loadActiveConstraints } from "../lib/constraints";
+import { CORRECTION_QUEUED_STALE_MIN } from "../lib/correction";
 import { countsWeekNo, shortDate, sportName, weeklyAskQuestion } from "../lib/labels";
 import { applyChange, applyProposal, changeConflict, postProposalApplied } from "../lib/proposals";
 import { deauthorize } from "../lib/strava";
-import { elapsedSql, loadGroup, combineGroup, MAX_PER_SESSION, overlaps, regroupReview, requeueReview, SEGMENT_SELECT, sameKind } from "../lib/session-group";
+import { elapsedSql, loadGroup, combineGroup, MAX_PER_SESSION, overlaps, regroupReview, requeueReview, REVIEW_LIMIT_MARKER, REVIEW_LIMIT_TEXT, reviewLimitReached, SEGMENT_SELECT, sameKind } from "../lib/session-group";
 import { postRoutineDone } from "../lib/strength";
 import { COACH_STAGES } from "../lib/stage";
 import { requestWeeklyRerun, reviewMissingActivity, WEEKLY_REVIEW_SELECT } from "../lib/weekly";
@@ -215,7 +216,10 @@ const ACTIVITY_SELECT = `
   a.gear_name, a.weather, a.gear_name_user, a.device_name_user, a.weather_user, a.details_updated_at, a.memo, a.rpe, a.memo_updated_at, a.splits, a.match_status,
   r.verdict as r_verdict, r.comment as r_comment, r.reminders as r_reminders,
   r.source as r_source, r.model as r_model, r.adjust_hint as r_adjust_hint, r.created_at as r_created_at,
-  ${elapsedSql("a")} as elapsed_time_sec, ${SEGMENT_SELECT}`;
+  ${elapsedSql("a")} as elapsed_time_sec, ${SEGMENT_SELECT},
+  (select max(m.created_at) from coach_messages m
+     where m.user_id = a.user_id and m.role = 'athlete' and m.meta->'correction'->>'activity_id' = a.id::text
+       and r.created_at is not null and m.created_at < r.created_at) as r_corrected_at`;
 
 type ActivityJoined = Omit<ActivityRow, "raw"> & {
   elapsed_time_sec: number | null;
@@ -229,9 +233,11 @@ type ActivityJoined = Omit<ActivityRow, "raw"> & {
   r_model: string | null;
   r_adjust_hint: string | null;
   r_created_at: Date | null;
+  /** The athlete's latest correction of this session's verdict that the current review was redone after; null = never corrected. */
+  r_corrected_at: Date | null;
 };
 
-function toApiReview(r: Pick<ReviewRow, "verdict" | "comment" | "reminders" | "source" | "model" | "adjust_hint" | "created_at">): ApiReview {
+function toApiReview(r: Pick<ReviewRow, "verdict" | "comment" | "reminders" | "source" | "model" | "adjust_hint" | "created_at">, correctedAt: Date | null): ApiReview {
   const failed = r.source === "claude" && r.verdict === null;
   return {
     verdict: r.verdict,
@@ -241,8 +247,10 @@ function toApiReview(r: Pick<ReviewRow, "verdict" | "comment" | "reminders" | "s
     model: r.model,
     adjust_hint: r.adjust_hint ?? null,
     failed,
-    error: failed ? REPLY_FAILED : null, // one fixed line for every failed model call; the provider's wording stays in the logs / the row
+    // one fixed line for every failed model call (the provider's wording stays in the logs / the row); the day's re-judge cap has its own
+    error: failed ? (r.comment === REVIEW_LIMIT_MARKER ? REVIEW_LIMIT_TEXT : REPLY_FAILED) : null,
     created_at: new Date(r.created_at).toISOString(),
+    corrected_at: correctedAt ? new Date(correctedAt).toISOString() : null,
   };
 }
 
@@ -253,7 +261,7 @@ function detailOf(user: string | null, strava: string | null): ApiActivity["deta
 
 function toApiActivity(a: ActivityJoined): ApiActivity {
   const {
-    r_verdict, r_comment, r_reminders, r_source, r_model, r_adjust_hint, r_created_at,
+    r_verdict, r_comment, r_reminders, r_source, r_model, r_adjust_hint, r_created_at, r_corrected_at,
     gear_name_user, device_name_user, weather_user, details_updated_at,
     seg_count, seg_index, seg_primary,
     ...rest
@@ -277,7 +285,7 @@ function toApiActivity(a: ActivityJoined): ApiActivity {
       ? toApiReview({
           verdict: r_verdict, comment: r_comment, reminders: r_reminders,
           source: r_source ?? "manual", model: r_model, adjust_hint: r_adjust_hint, created_at: r_created_at,
-        })
+        }, r_corrected_at)
       : null,
   };
 }
@@ -460,7 +468,7 @@ async function putReview(userId: string, activityId: string, raw: string) {
      returning *`,
     [randomUUID(), activityId, body.verdict, body.comment ?? null, JSON.stringify(reminders)],
   );
-  return json<PutReviewResponse>(200, { review: toApiReview(review) });
+  return json<PutReviewResponse>(200, { review: toApiReview(review, null) });
 }
 
 type MemoFields = { memo: string | null; rpe: number | null };
@@ -789,6 +797,8 @@ async function rereview(userId: string, activityId: string) {
   if (!primary) return json(409, { error: "assign the activity to a session first" });
   const manual = await queryOne<{ id: string }>("select id from reviews where activity_id = $1 and source = 'manual'", [primary.id]);
   if (manual) return json(409, { error: "a manual review is kept; remove it first" });
+  // The day's re-judge quota: asked before anything is deleted, so the review stays as it is.
+  if (await reviewLimitReached(userId)) return json(429, { error: "review daily limit reached" });
 
   await query("delete from reviews where activity_id = $1 and source = 'claude'", [primary.id]);
   await requeueReview(userId, primary.id, "rereview requested");
@@ -1020,8 +1030,31 @@ function proposalIds(meta: Record<string, unknown>): string[] {
   return typeof meta.proposal_id === "string" ? [meta.proposal_id] : [];
 }
 
+/**
+ * Woo's reply that promised a re-judge, as the app draws it. A reply still `queued` after CORRECTION_QUEUED_STALE_MIN minutes
+ * is shown as failed (the worker died between writing the verdict and settling the reply; the report page has the new verdict
+ * or offers 重新分析). `why` of a refusal comes from meta.correction_rejected; anything unknown is "unknown".
+ */
+function toApiCorrection(m: CoachMessageRow, meta: Record<string, unknown>): ApiCoachMessage["correction"] {
+  if (m.role !== "coach" || m.kind !== "chat") return null;
+  const c = meta.correction as { activity_id?: unknown; label?: unknown; date?: unknown; state?: unknown } | undefined;
+  if (!c || typeof c !== "object") return null;
+  const state = c.state === "queued" || c.state === "done" || c.state === "failed" || c.state === "rejected" ? c.state : null;
+  if (!state) return null;
+  const stale = state === "queued" && Date.now() - new Date(m.created_at).getTime() > CORRECTION_QUEUED_STALE_MIN * 60_000;
+  const why = meta.correction_rejected;
+  return {
+    activity_id: typeof c.activity_id === "string" ? c.activity_id : "",
+    label: typeof c.label === "string" ? c.label : "",
+    date: typeof c.date === "string" ? c.date : "",
+    state: stale ? "failed" : state,
+    why: state === "rejected" ? (why === "limit" || why === "daily" || why === "manual" || why === "queued" ? why : "unknown") : null,
+  };
+}
+
 function toApiCoachMessage(m: CoachMessageRow, cards?: Cards): ApiCoachMessage {
   const meta = (m.meta ?? {}) as Record<string, unknown>;
+  const correction = toApiCorrection(m, meta);
   const proposal = proposalIds(meta).map((id) => cards?.proposals.get(id)).find((p): p is ProposalRow => !!p);
   const constraint = typeof meta.constraint_id === "string" ? cards?.constraints.get(meta.constraint_id) : undefined;
   return {
@@ -1033,7 +1066,11 @@ function toApiCoachMessage(m: CoachMessageRow, cards?: Cards): ApiCoachMessage {
     weekly_review_id: m.weekly_review_id,
     status: m.status,
     review: m.kind === "review"
-      ? { label: String(meta.label ?? ""), verdict: (meta.verdict as Verdict | undefined) ?? null, reminder: (meta.reminder as string | null) ?? null, date: (meta.date as string | undefined) ?? null }
+      ? {
+          label: String(meta.label ?? ""), verdict: (meta.verdict as Verdict | undefined) ?? null, reminder: (meta.reminder as string | null) ?? null, date: (meta.date as string | undefined) ?? null,
+          updated: meta.corrected && typeof (meta.corrected as { reason?: unknown }).reason === "string" ? { reason: (meta.corrected as { reason: string }).reason } : null,
+          superseded: meta.superseded === true,
+        }
       : null,
     quote: typeof meta.quote === "string" ? meta.quote : null,
     rpe: typeof meta.rpe === "number" ? meta.rpe : null,
@@ -1053,7 +1090,8 @@ function toApiCoachMessage(m: CoachMessageRow, cards?: Cards): ApiCoachMessage {
     constraint: constraint ? toApiConstraint(constraint) : null,
     proposal_rejected: meta.proposal_rejected === true,
     // Progress while Woo works on it: a white-listed value, only for a message that is waiting (or a weekly review being rewritten).
-    stage: typeof meta.stage === "string" && COACH_STAGES.has(meta.stage) && (m.status === "pending" || m.kind === "weekly") ? meta.stage : null,
+    stage: typeof meta.stage === "string" && COACH_STAGES.has(meta.stage) && (m.status === "pending" || m.kind === "weekly" || correction?.state === "queued") ? meta.stage : null,
+    correction,
     // Rows written before the worker stored the fixed line still hold the provider's wording: never shown.
     error: typeof meta.error === "string" && meta.error ? REPLY_FAILED : null,
     created_at: new Date(m.created_at).toISOString(),
@@ -1443,8 +1481,10 @@ async function postCoach(userId: string, raw: string) {
     // The review is the session's: every segment's Claude review goes (the one on the primary is the one that matters).
     const groupIds = activity.session_id ? (await loadGroup(userId, activity.session_id)).map((g) => g.id) : [];
     await query("delete from reviews where activity_id = any($1::uuid[]) and source = 'claude'", [[activity.id, ...groupIds]]);
-    if (activity.session_id) await requeueReview(userId, activity.id, "check-in answered");
-    else await query("update coach_messages set status = 'sent' where id = $1", [m.id]);
+    // Not queued (no session, no queue, or the day's re-judge quota: requeueReview has already said so in the thread): nothing is
+    // coming to answer this message, close it. When the quota settled it already this is 0 rows.
+    const queued = activity.session_id ? await requeueReview(userId, activity.id, "check-in answered") : false;
+    if (!queued) await query("update coach_messages set status = 'sent' where id = $1", [m.id]);
     return json<PostCoachMessageResponse>(202, { message: toApiCoachMessage(m) });
   }
 
