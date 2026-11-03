@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { SQSHandler } from "aws-lambda";
 import { reviewActivity } from "../lib/claude";
 import { writeBriefs } from "../lib/briefs";
-import { askAboutActivity, maybeCheckin, settleAthleteMessages } from "../lib/checkin";
+import { askAboutActivity, maybeCheckin } from "../lib/checkin";
 import { writeRoutine } from "../lib/strength";
 import { answerCoachMessage, postCoachMessage } from "../lib/coach";
 import { loadReviewContext } from "../lib/context";
@@ -10,7 +10,7 @@ import { CORRECTION_REASON_MAX, settleCorrection, supersedeReviewMessages } from
 import { isDbWaking, query, queryOne, withTransaction } from "../lib/db";
 import { sessionLabel, shortDate, sportName } from "../lib/labels";
 import { getActivity, refreshToken, StravaError } from "../lib/strava";
-import { combineGroup, loadGroup, reviewLimitReached, writeLimitedReview } from "../lib/session-group";
+import { combineGroup, loadGroup, reviewLimitReached, settleAnswerMessages, writeLimitedReview } from "../lib/session-group";
 import { stageWriterAll, stageWriterByActivities, stageWriterByCorrection } from "../lib/stage";
 import { maybeRerunWeeklyReview } from "../lib/weekly";
 import type { BriefsJob, CoachAskJob, CoachReplyJob, PlannedSessionRow, RoutineJob, StravaConnectionRow, StravaWebhookEvent } from "../types";
@@ -283,7 +283,7 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
             }, q);
             await supersedeReviewMessages(conn.user_id, ids, posted.id, q);
           });
-          for (const id of ids) await settleAthleteMessages(conn.user_id, id); // the answer that triggered this review is replied to
+          for (const id of ids) await settleAnswerMessages(conn.user_id, id); // the feel answer that triggered this review is replied to (other pending messages wait for Woo's reply, not for a verdict)
           // The week's review was written without this activity (late sync): the weekly Lambda regenerates it in place.
           // At most one weekly Lambda invoke for the session, however many recordings it has: ask about the recordings in
           // order until one request goes out. The weekly review lists the ids it saw by the session's date
@@ -304,7 +304,7 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
              on conflict (activity_id) do nothing`,
             [randomUUID(), row.id, `分析失敗：${reason}`],
           );
-          for (const id of ids) await settleAthleteMessages(conn.user_id, id);
+          for (const id of ids) await settleAnswerMessages(conn.user_id, id);
           await postCoachMessage({ user_id: conn.user_id, role: "coach", kind: "chat", text: "這次分析沒成功，報告頁可以按「重新分析」。", activity_id: row.id });
           await settleCorrection(conn.user_id, ids, "failed"); // a correction that promised this re-judge: the reply says it did not come
         }
