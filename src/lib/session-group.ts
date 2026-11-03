@@ -256,7 +256,7 @@ export async function settleAthleteMessages(userId: string, activityId: string):
 }
 
 /**
- * The cap refused a re-judge: the data action that asked for it has already happened (the memo is saved, the segment is
+ * The cap refused a re-judge (at the door in requeueReview, or in the worker just before the model call): the data action that asked for it has already happened (the memo is saved, the segment is
  * bound), so say so instead of failing quietly. (1) a failed review row on the primary with the cap's marker (a manual
  * review stays); (2) one fixed line from Woo in the thread, once a day; (3) the athlete's pending answer about any of the
  * group's activities is settled, so the app stops waiting for a verdict that is not coming.
@@ -264,10 +264,12 @@ export async function settleAthleteMessages(userId: string, activityId: string):
 export async function writeLimitedReview(userId: string, group: GroupActivity[]): Promise<void> {
   const primary = group[0];
   if (!primary) return;
+  // A manual review stays; an earlier failed Claude row (the worker found the cap reached for a job queued before it was) is replaced by the cap's own.
   await query(
     `insert into reviews (id, activity_id, verdict, comment, reminders, source, model)
      values ($1, $2, null, $3, '[]', 'claude', null)
-     on conflict (activity_id) do nothing`,
+     on conflict (activity_id) do update set comment = excluded.comment, created_at = now()
+       where reviews.source = 'claude' and reviews.verdict is null`,
     [randomUUID(), primary.id, REVIEW_LIMIT_MARKER],
   );
   const said = await queryOne<{ x: number }>(

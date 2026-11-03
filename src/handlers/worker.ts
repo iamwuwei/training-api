@@ -10,7 +10,7 @@ import { CORRECTION_REASON_MAX, settleCorrection, supersedeReviewMessages } from
 import { isDbWaking, query, queryOne, withTransaction } from "../lib/db";
 import { sessionLabel, shortDate, sportName } from "../lib/labels";
 import { getActivity, refreshToken, StravaError } from "../lib/strava";
-import { combineGroup, loadGroup } from "../lib/session-group";
+import { combineGroup, loadGroup, reviewLimitReached, writeLimitedReview } from "../lib/session-group";
 import { stageWriterAll, stageWriterByActivities, stageWriterByCorrection } from "../lib/stage";
 import { maybeRerunWeeklyReview } from "../lib/weekly";
 import type { BriefsJob, CoachAskJob, CoachReplyJob, PlannedSessionRow, RoutineJob, StravaConnectionRow, StravaWebhookEvent } from "../types";
@@ -211,6 +211,18 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
         [row.session_id],
       );
       if (session) {
+        // The day's cap, asked again here, right before the model is called: the queue holds jobs that were let in when the day's
+        // verdicts were still few (requeueReview counts finished verdicts only), and the first review of a Strava event comes
+        // through here too. Every job that reaches the model counts, however it got on the queue. A count, no model call, no
+        // retry (the job ends normally; SQS does not redeliver): the review becomes the cap's failed row, one line in the thread
+        // a day, the athlete's waiting answer is settled, and a correction waiting for this verdict says it did not come.
+        // Worker concurrency is 2, so two jobs can both pass at the count one below the cap: at most REVIEW_DAILY_LIMIT + 1 verdicts a day.
+        if (await reviewLimitReached(conn.user_id)) {
+          console.log(`day's review cap reached, activity ${activity.id} not judged`);
+          await writeLimitedReview(conn.user_id, group);
+          await settleCorrection(conn.user_id, ids, "failed");
+          return;
+        }
         const c = combineGroup(group);
         const reviewDay = shortDate(c.date);
         // The athlete's answer waiting for this verdict shows where Woo is (0 rows when there is none: a report-page pick, the today page);
