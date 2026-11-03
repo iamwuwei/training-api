@@ -207,13 +207,6 @@ export const sameKind = (a: Pick<GroupActivity, "sport_type">, b: Pick<GroupActi
 
 const sqs = new SQSClient({});
 
-/**
- * The day's cap on re-judges per user (JST day), counted by `reviewsToday`. Every re-judge the app queues goes through
- * `requeueReview` — "重新分析", removing / adding / replacing a segment, 選錯了, 是這趟, the memo / RPE, the feel answer, a
- * correction in the thread — so one number covers all of them. The first review of a Strava event does not come through
- * here and is never refused. 0 (or an unreadable value) = no cap. The model is called once per queued re-judge, so this
- * bounds the day's cost of a broken client or a button pressed over and over.
- */
 export const REVIEW_DAILY_LIMIT_DEFAULT = 20;
 /** Unset = the default; exactly "0" = no cap; a positive whole number = that cap. Anything else ("", "abc", "-3", "Infinity", "007") falls back to the default (and says so once): a bad value must not turn the cap off. */
 export function parseReviewLimit(raw: string | undefined): number {
@@ -224,6 +217,15 @@ export function parseReviewLimit(raw: string | undefined): number {
   return REVIEW_DAILY_LIMIT_DEFAULT;
 }
 const limitFromEnv = (): number => parseReviewLimit(process.env.REVIEW_DAILY_LIMIT);
+/**
+ * The day's cap on finished verdicts per user (JST day), counted by `reviewsToday` (the review messages in the thread). It is
+ * asked twice: at the door, in `requeueReview` — every re-judge the app queues ("重新分析", removing / adding / replacing a
+ * segment, 選錯了, 是這趟, the memo / RPE, the feel answer, a correction in the thread), where a refusal leaves a failed row
+ * and one line in the thread (and a 429 for "重新分析") instead of a job — and again in the worker, right before the model is
+ * called (`processEvent`), for every job that got that far, a Strava event's first review included (the first review is
+ * queued through `requeueReview` too; nothing is exempt). 0 = no cap; unset = 20; an unreadable value is 20, never "no cap".
+ * Worker concurrency is 2, so a day ends with at most REVIEW_DAILY_LIMIT + 1 finished verdicts. Failed verdicts are not counted.
+ */
 export const REVIEW_DAILY_LIMIT = limitFromEnv();
 /** `reviews.comment` of the failed row written when the cap refused a re-judge; the api turns it into REVIEW_LIMIT_TEXT. */
 export const REVIEW_LIMIT_MARKER = "分析失敗：limit";
@@ -256,10 +258,23 @@ export async function settleAthleteMessages(userId: string, activityId: string):
 }
 
 /**
+ * Only the athlete's answers that are waiting for THIS verdict (the feel answer: a chat with `meta.answer_to`, the same set the
+ * stage writer follows) are settled. Other pending messages that merely mention the activity (a question quoting it, a correction
+ * Woo has not answered yet) are waiting for Woo's reply, not for a verdict: closing them would leave them without any reply.
+ */
+export async function settleAnswerMessages(userId: string, activityId: string): Promise<void> {
+  await query(
+    "update coach_messages set status = 'sent' where user_id = $1 and role = 'athlete' and kind = 'chat' and status = 'pending' and activity_id = $2 and meta ? 'answer_to'",
+    [userId, activityId],
+  );
+}
+
+/**
  * The cap refused a re-judge (at the door in requeueReview, or in the worker just before the model call): the data action that asked for it has already happened (the memo is saved, the segment is
  * bound), so say so instead of failing quietly. (1) a failed review row on the primary with the cap's marker (a manual
- * review stays); (2) one fixed line from Woo in the thread, once a day; (3) the athlete's pending answer about any of the
- * group's activities is settled, so the app stops waiting for a verdict that is not coming.
+ * review stays); (2) one fixed line from Woo in the thread, once a day; (3) the athlete's pending answer to Woo's feel question
+ * about any of the group's activities is settled, so the app stops waiting for a verdict that is not coming (not the other
+ * pending messages: they wait for Woo's reply).
  */
 export async function writeLimitedReview(userId: string, group: GroupActivity[]): Promise<void> {
   const primary = group[0];
@@ -282,7 +297,7 @@ export async function writeLimitedReview(userId: string, group: GroupActivity[])
     const { postCoachMessage } = await import("./coach"); // coach.ts imports this file: loaded when needed, not at the top
     await postCoachMessage({ user_id: userId, role: "coach", kind: "chat", text: REVIEW_LIMIT_THREAD, activity_id: primary.id });
   }
-  for (const g of group) await settleAthleteMessages(userId, g.id);
+  for (const g of group) await settleAnswerMessages(userId, g.id);
 }
 
 /**

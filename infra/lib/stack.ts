@@ -140,7 +140,7 @@ export class TrainingApiStack extends cdk.Stack {
         COACH_STREAM: process.env.COACH_STREAM ?? "false",
         // A correction in the thread (answerCoachMessage) re-queues one verdict job through requeueReview, so the worker sends to its own queue.
         QUEUE_URL: queue.queueUrl,
-        REVIEW_DAILY_LIMIT: process.env.REVIEW_DAILY_LIMIT ?? "20", // 0 = no cap; the day's re-judges per user — every entrance goes through requeueReview
+        REVIEW_DAILY_LIMIT: process.env.REVIEW_DAILY_LIMIT ?? "20", // 0 = no cap; finished verdicts per user and JST day: asked before a job is queued (requeueReview) and again right before the model is called (processEvent), Strava's first review included
       },
       reservedConcurrentExecutions: 2,
     });
@@ -162,7 +162,7 @@ export class TrainingApiStack extends cdk.Stack {
         QUEUE_URL: queue.queueUrl,
         WEEKLY_FUNCTION_NAME: weekly.functionName,
         COACH_DAILY_LIMIT: process.env.COACH_DAILY_LIMIT ?? "0", // 0 = no cap (two known athletes)
-        REVIEW_DAILY_LIMIT: process.env.REVIEW_DAILY_LIMIT ?? "20", // 0 = no cap; the day's re-judges per user — every entrance goes through requeueReview
+        REVIEW_DAILY_LIMIT: process.env.REVIEW_DAILY_LIMIT ?? "20", // 0 = no cap; finished verdicts per user and JST day: asked before a job is queued (requeueReview; "重新分析" gets a 429) and again by the worker right before the model is called
       },
     });
     queue.grantSendMessages(api); // re-review after a manual session assignment
