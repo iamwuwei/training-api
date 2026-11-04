@@ -6,6 +6,9 @@ import { appendDone, type CheckinMeta, type MismatchAskMeta, mismatchReason, pos
 import { COACH_NAME, MAX_MESSAGE_CHARS, postCoachMessage, REPLY_FAILED } from "../lib/coach";
 import { constraintsByIds, loadActiveConstraints } from "../lib/constraints";
 import { CORRECTION_QUEUED_STALE_MIN } from "../lib/correction";
+import { EVENTS_PAGE_MAX } from "../lib/group-events";
+import { eventDetail, groupEvents, groupsList, groupView, memberPlanView, unreadTotal } from "../lib/group-view";
+import { acceptInvite, createGroup, createInvite, disbandGroup, getShare, GROUP_MAX_PER_USER, INVITE_TOKEN_RE, leaveGroup, markSeen, membership, parseGroupBody, previewInvite, putShare, removeMember, revokeInvite, SHARE_KEYS } from "../lib/groups";
 import { countsWeekNo, shortDate, sportName, weeklyAskQuestion } from "../lib/labels";
 import { applyChange, applyProposal, changeConflict, postProposalApplied } from "../lib/proposals";
 import { deauthorize } from "../lib/strava";
@@ -60,6 +63,18 @@ import type {
   PostProposalResponse,
   PostWeeklyAskRequest,
   PostWeeklyAskResponse,
+  AcceptInviteResponse,
+  GroupEventDetailResponse,
+  GroupEventsResponse,
+  GroupOkResponse,
+  GroupResponse,
+  GroupsResponse,
+  InvitePreviewResponse,
+  MemberPlanResponse,
+  PostGroupInviteResponse,
+  PostGroupResponse,
+  PutShareRequest,
+  ShareResponse,
 } from "../../types/api";
 
 // Lambda training-api-prod. Behind API Gateway (HTTP API) with a Cognito JWT authorizer: by the time we
@@ -89,6 +104,20 @@ import type {
 //   POST /coach/checkins/{id}/reset  選錯了: unassign and ask again
 //   POST /sessions/{id}/routine      肌力 day: { place } → Woo's checklist (worker fills it; poll /plan)
 //   PUT /sessions/{id}/routine       tick items, RPE / note, complete
+//
+// group-race (src/lib/groups.ts: groups, invites, switches; src/lib/group-view.ts: the ONLY code that reads another member's rows).
+// Every route with a group id answers a non-member exactly like an unknown id: 404 "group not found".
+//   GET  /groups                              my groups (+ unread)               POST /groups   create (409 "group limit" at 3)
+//   GET  /groups/{id}                         dashboard: members + their shared numbers, newest events, owner's invite
+//   DELETE /groups/{id}                       disband (owner)
+//   POST /groups/{id}/invite                  new invite link, plaintext token once (owner)      DELETE …/invite   revoke (owner)
+//   POST /groups/{id}/leave                   leave (409 for the owner)
+//   POST /groups/{id}/members/{mid}/remove    remove a member (owner)
+//   GET  /groups/{id}/members/{mid}/plan      a member's plan, read-only, by his switches
+//   GET  /groups/{id}/events?before&limit     消息中心                                         GET …/events/{eid}   看詳細
+//   PUT  /groups/{id}/seen                    the 消息中心 was opened (clears unread)
+//   GET  /invites/{token}                     invite preview                                   POST …/accept   join
+//   GET|PUT /me/share                         what the members of my groups may see
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const STATUSES = new Set<string>(["auto", "confirmed", "unplanned", "ignored"] satisfies MatchStatus[]);
@@ -96,7 +125,7 @@ const VERDICTS = new Set<string>(["達成", "達成但有提醒", "未達成"]);
 
 const sqs = new SQSClient({});
 
-const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | PutSessionResponse | PutMemoResponse | PutDetailsResponse | DetailOptionsResponse | RereviewResponse | WeeklyResponse | PostAdjustmentResponse | CoachResponse | PostCoachMessageResponse | PutCoachSeenResponse | PostCheckinPickResponse | PostCheckinResetResponse | PostRoutineResponse | PutRoutineResponse | PostWeeklyAskResponse | PostProposalResponse | PostConstraintResponse | PlanChangedResponse | ErrorResponse>(
+const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | PutSessionResponse | PutMemoResponse | PutDetailsResponse | DetailOptionsResponse | RereviewResponse | WeeklyResponse | PostAdjustmentResponse | CoachResponse | PostCoachMessageResponse | PutCoachSeenResponse | PostCheckinPickResponse | PostCheckinResetResponse | PostRoutineResponse | PutRoutineResponse | PostWeeklyAskResponse | PostProposalResponse | PostConstraintResponse | PlanChangedResponse | GroupsResponse | PostGroupResponse | GroupResponse | GroupOkResponse | PostGroupInviteResponse | MemberPlanResponse | GroupEventsResponse | GroupEventDetailResponse | InvitePreviewResponse | AcceptInviteResponse | ShareResponse | ErrorResponse>(
   statusCode: number,
   body: T,
 ): APIGatewayProxyResultV2 => ({
@@ -154,6 +183,8 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
 
   if (method === "GET" && path === "/me") return getMe(user, event);
   if (method === "DELETE" && path === "/me/strava") return deleteStrava(user);
+  if (method === "GET" && path === "/me/share") return getShareSettings(user.id);
+  if (method === "GET" && path === "/groups") return getGroups(user.id);
   if (method === "GET" && path === "/plan") return getPlan(user.id);
   if (method === "GET" && path === "/activities") return getActivities(user.id, q.status);
   if (method === "GET" && path === "/activities/detail-options") return getDetailOptions(user.id);
@@ -168,6 +199,29 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
   }
   const re = /^\/activities\/([^/]+)\/rereview$/.exec(path);
   if (method === "POST" && re) return rereview(user.id, re[1]);
+
+  if (method === "PUT" && path === "/me/share") return putShareSettings(user.id, raw);
+  if (method === "POST" && path === "/groups") return postGroup(user.id, raw);
+  const grp = /^\/groups\/([^/]+)$/.exec(path);
+  if (method === "GET" && grp) return getGroup(user.id, grp[1]);
+  if (method === "DELETE" && grp) return deleteGroup(user.id, grp[1]);
+  const grpInvite = /^\/groups\/([^/]+)\/invite$/.exec(path);
+  if (method === "POST" && grpInvite) return postGroupInvite(user.id, grpInvite[1]);
+  if (method === "DELETE" && grpInvite) return deleteGroupInvite(user.id, grpInvite[1]);
+  const grpLeave = /^\/groups\/([^/]+)\/leave$/.exec(path);
+  if (method === "POST" && grpLeave) return postGroupLeave(user.id, grpLeave[1]);
+  const grpSeen = /^\/groups\/([^/]+)\/seen$/.exec(path);
+  if (method === "PUT" && grpSeen) return putGroupSeen(user.id, grpSeen[1]);
+  const grpEvents = /^\/groups\/([^/]+)\/events$/.exec(path);
+  if (method === "GET" && grpEvents) return getGroupEvents(user.id, grpEvents[1], q);
+  const grpEvent = /^\/groups\/([^/]+)\/events\/([^/]+)$/.exec(path);
+  if (method === "GET" && grpEvent) return getGroupEvent(user.id, grpEvent[1], grpEvent[2]);
+  const grpMember = /^\/groups\/([^/]+)\/members\/([^/]+)\/(remove|plan)$/.exec(path);
+  if (method === "POST" && grpMember?.[3] === "remove") return postGroupMemberRemove(user.id, grpMember[1], grpMember[2]);
+  if (method === "GET" && grpMember?.[3] === "plan") return getMemberPlan(user.id, grpMember[1], grpMember[2]);
+  const invitePath = /^\/invites\/([^/]+)(\/accept)?$/.exec(path);
+  if (method === "GET" && invitePath && !invitePath[2]) return getInvitePreview(user.id, invitePath[1]);
+  if (method === "POST" && invitePath?.[2]) return postInviteAccept(user.id, invitePath[1]);
 
   if (method === "GET" && path === "/weekly") return getWeekly(user.id);
   if (method === "GET" && path === "/coach") return getCoach(user.id, q);
@@ -398,7 +452,7 @@ async function getPlan(userId: string) {
     unassigned: unassigned.map(toApiActivity),
     routines: routines.map(toApiRoutine),
     constraints: constraints.map(toApiConstraint),
-    groups_unread: 0, // placeholder until unreadTotal lands (group-race)
+    groups_unread: await unreadTotal(userId),
   });
 }
 
@@ -1525,4 +1579,152 @@ async function postCoach(userId: string, raw: string) {
     }));
   }
   return json<PostCoachMessageResponse>(202, { message: toApiCoachMessage(m) });
+}
+
+// ---- group-race ---------------------------------------------------------------------------------
+// Each handler: validate the path / body, call src/lib, map the answer to a status. No body, token or share value is logged.
+
+/** Unknown id, disbanded group, or I am not a current member: one answer, byte for byte. */
+const groupNotFound = () => json(404, { error: "group not found" });
+const badBody = (error: string) => json(400, { error });
+
+function parseJson(raw: string): { ok: true; value: unknown } | { ok: false } {
+  try {
+    return { ok: true, value: JSON.parse(raw) };
+  } catch {
+    return { ok: false };
+  }
+}
+
+async function getShareSettings(userId: string) {
+  return json<ShareResponse>(200, { share: await getShare(userId) });
+}
+
+async function putShareSettings(userId: string, raw: string) {
+  const body = parseJson(raw);
+  if (!body.ok) return badBody("invalid json");
+  const req = body.value as Partial<PutShareRequest> | null;
+  const share = req && typeof req === "object" && !Array.isArray(req) ? req.share : undefined;
+  if (!share || typeof share !== "object" || Array.isArray(share)) return badBody("share must be an object");
+  const patch: Record<string, boolean> = {};
+  for (const [k, v] of Object.entries(share)) {
+    if (!(SHARE_KEYS as readonly string[]).includes(k)) return badBody("unknown share key");
+    if (typeof v !== "boolean") return badBody(`${k} must be a boolean`);
+    patch[k] = v;
+  }
+  return json<ShareResponse>(200, { share: await putShare(userId, patch) });
+}
+
+async function getGroups(userId: string) {
+  return json<GroupsResponse>(200, { groups: await groupsList(userId), max_groups: GROUP_MAX_PER_USER });
+}
+
+async function postGroup(userId: string, raw: string) {
+  const body = parseJson(raw);
+  if (!body.ok) return badBody("invalid json");
+  const parsed = parseGroupBody(body.value);
+  if (!parsed.ok) return badBody(parsed.error);
+  const made = await createGroup(userId, parsed.value);
+  if (!made.ok) return json(409, { error: "group limit" });
+  return json<PostGroupResponse>(200, { group: made.group });
+}
+
+async function getGroup(userId: string, groupId: string) {
+  if (!UUID_RE.test(groupId)) return badBody("invalid group id");
+  const view = await groupView(userId, groupId);
+  return view ? json<GroupResponse>(200, view) : groupNotFound();
+}
+
+async function deleteGroup(userId: string, groupId: string) {
+  if (!UUID_RE.test(groupId)) return badBody("invalid group id");
+  const r = await disbandGroup(userId, groupId);
+  if (r === "not_member") return groupNotFound();
+  if (r === "not_owner") return json(403, { error: "not owner" });
+  return json<GroupOkResponse>(200, { ok: true });
+}
+
+async function postGroupInvite(userId: string, groupId: string) {
+  if (!UUID_RE.test(groupId)) return badBody("invalid group id");
+  const r = await createInvite(userId, groupId);
+  if (r.ok) return json<PostGroupInviteResponse>(200, { invite: r.invite });
+  if (r.reason === "not_member") return groupNotFound();
+  if (r.reason === "not_owner") return json(403, { error: "not owner" });
+  return json(409, { error: "group is full" });
+}
+
+async function deleteGroupInvite(userId: string, groupId: string) {
+  if (!UUID_RE.test(groupId)) return badBody("invalid group id");
+  const r = await revokeInvite(userId, groupId);
+  if (r === "not_member") return groupNotFound();
+  if (r === "not_owner") return json(403, { error: "not owner" });
+  return json<GroupOkResponse>(200, { ok: true });
+}
+
+async function postGroupLeave(userId: string, groupId: string) {
+  if (!UUID_RE.test(groupId)) return badBody("invalid group id");
+  const r = await leaveGroup(userId, groupId);
+  if (r === "none") return groupNotFound();
+  if (r === "owner") return json(409, { error: "owner cannot leave" });
+  return json<GroupOkResponse>(200, { ok: true });
+}
+
+async function postGroupMemberRemove(userId: string, groupId: string, memberId: string) {
+  if (!UUID_RE.test(groupId)) return badBody("invalid group id");
+  // membership first: a non-member gets the 404 whatever he put in `mid`
+  if (!(await membership(userId, groupId))) return groupNotFound();
+  if (!UUID_RE.test(memberId)) return badBody("invalid member id");
+  const r = await removeMember(userId, groupId, memberId);
+  if (r === "not_member") return groupNotFound();
+  if (r === "not_owner") return json(403, { error: "not owner" });
+  if (r === "not_found") return json(404, { error: "member not found" });
+  if (r === "self") return badBody("cannot remove yourself");
+  return json<GroupOkResponse>(200, { ok: true });
+}
+
+async function putGroupSeen(userId: string, groupId: string) {
+  if (!UUID_RE.test(groupId)) return badBody("invalid group id");
+  return (await markSeen(userId, groupId)) ? json<GroupOkResponse>(200, { ok: true }) : groupNotFound();
+}
+
+async function getGroupEvents(userId: string, groupId: string, q: Record<string, string | undefined>) {
+  if (!UUID_RE.test(groupId)) return badBody("invalid group id");
+  if (!(await membership(userId, groupId))) return groupNotFound();
+  let limit: number | undefined;
+  if (q.limit !== undefined) {
+    if (!/^\d{1,3}$/.test(q.limit) || Number(q.limit) < 1 || Number(q.limit) > EVENTS_PAGE_MAX) return badBody(`limit must be 1-${EVENTS_PAGE_MAX}`);
+    limit = Number(q.limit);
+  }
+  if (q.before !== undefined && !UUID_RE.test(q.before)) return badBody("invalid before");
+  const events = await groupEvents(userId, groupId, { before: q.before, limit });
+  return events ? json<GroupEventsResponse>(200, events) : groupNotFound();
+}
+
+async function getGroupEvent(userId: string, groupId: string, eventId: string) {
+  if (!UUID_RE.test(groupId)) return badBody("invalid group id");
+  if (!(await membership(userId, groupId))) return groupNotFound();
+  if (!UUID_RE.test(eventId)) return badBody("invalid event id");
+  const detail = await eventDetail(userId, groupId, eventId);
+  return detail ? json<GroupEventDetailResponse>(200, detail) : json(404, { error: "event not found" });
+}
+
+async function getMemberPlan(userId: string, groupId: string, memberId: string) {
+  if (!UUID_RE.test(groupId)) return badBody("invalid group id");
+  if (!(await membership(userId, groupId))) return groupNotFound();
+  if (!UUID_RE.test(memberId)) return badBody("invalid member id");
+  const view = await memberPlanView(userId, groupId, memberId);
+  return view ? json<MemberPlanResponse>(200, view) : json(404, { error: "member not found" });
+}
+
+async function getInvitePreview(userId: string, token: string) {
+  if (!INVITE_TOKEN_RE.test(token)) return badBody("invalid token");
+  const preview = await previewInvite(userId, token);
+  return preview ? json<InvitePreviewResponse>(200, preview) : json(404, { error: "invite not found" });
+}
+
+async function postInviteAccept(userId: string, token: string) {
+  if (!INVITE_TOKEN_RE.test(token)) return badBody("invalid token");
+  const r = await acceptInvite(userId, token);
+  if (!r) return json(404, { error: "invite not found" });
+  if (!r.ok) return json(409, { error: r.state });
+  return json<AcceptInviteResponse>(200, { group: r.group });
 }

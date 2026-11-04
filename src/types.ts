@@ -417,3 +417,60 @@ export interface WeeklyMessageMeta {
   /** Make-up sessions booked in this week when the review was written (coach-adjust-2). */
   makeups?: { from: string; to: string; label: string; done: boolean }[];
 }
+
+// ---- group-race (see sql/schema.sql) ---------------------------------------------------------
+
+export interface GroupRow {
+  id: string;
+  name: string;
+  race_name: string;
+  race_date: string; // 'YYYY-MM-DD'
+  owner_user_id: string;
+  created_at: Date;
+  disbanded_at: Date | null;
+}
+
+export interface GroupMemberRow {
+  id: string;
+  group_id: string;
+  user_id: string;
+  role: "owner" | "member";
+  joined_at: Date;
+  left_at: Date | null;
+  left_reason: "left" | "removed" | "disbanded" | null;
+  events_seen_at: Date | null;
+}
+
+export interface GroupInviteRow {
+  id: string;
+  group_id: string;
+  token_hash: string;
+  created_by: string;
+  expires_at: Date;
+  max_uses: number;
+  uses: number;
+  revoked_at: Date | null;
+  created_at: Date;
+}
+
+export interface ShareSettingsRow {
+  user_id: string;
+  progress: boolean;
+  events: boolean;
+  plan: boolean;
+  runs: boolean;
+  reviews: boolean;
+  updated_at: Date;
+}
+
+export interface GroupEventRow {
+  id: string;
+  group_id: string;
+  member_id: string;
+  kind: "session_done" | "joined" | "left";
+  session_id: string | null;
+  activity_id: string | null;
+  label: string | null;
+  session_date: string | null; // 'YYYY-MM-DD'
+  created_at: Date;
+}

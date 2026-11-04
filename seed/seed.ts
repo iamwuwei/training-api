@@ -18,7 +18,8 @@ import type { SessionType } from "../src/types";
 // cognito_sub: the Cognito user's `sub` (User pool → Users → User ID). Set it
 // here when known; otherwise the first API call links the row whose email
 // matches the ID token.
-const USERS: Record<string, { id: string; display_name: string; email: string | null; cognito_sub: string | null }> = {
+/** Exported for scripts/seed-group.ts (it looks the two people up by these ids). */
+export const USERS: Record<string, { id: string; display_name: string; email: string | null; cognito_sub: string | null }> = {
   ww: {
     id: "7d1c3a0e-4f7b-4d2e-9c1a-5b8e2f6a1c01",
     display_name: "Wei Wu",
@@ -215,9 +216,12 @@ async function main() {
   }
 }
 
-main()
-  .catch((err) => {
-    console.error(err);
-    process.exitCode = 1;
-  })
-  .finally(end);
+// Only when run directly (`npm run seed`): scripts/seed-group.ts imports USERS from here and must not seed as a side effect.
+if (require.main === module) {
+  main()
+    .catch((err) => {
+      console.error(err);
+      process.exitCode = 1;
+    })
+    .finally(end);
+}

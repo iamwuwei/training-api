@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import { query, queryOne } from "./db";
+import { recordSessionDone } from "./group-events";
 import { isRunSport } from "./labels";
 import { mergeSplits } from "./splits";
 import type { StravaSplit } from "../types";
@@ -330,6 +331,10 @@ export async function requeueReview(userId: string, activityId: string, reason: 
   const group = await loadGroup(userId, act.session_id);
   const primary = group[0];
   if (!primary) return false;
+  // group-race 消息中心: every in-app binding of an activity to a session gets here, so this is where "he finished the session"
+  // is recorded — once per group and session (a re-judge, a second segment write nothing more). Before the day's cap:
+  // the cap limits verdicts, not the fact. One SQL, never throws, no retry, no queue message.
+  await recordSessionDone(userId, act.session_id, primary.id);
   const conn = await queryOne<{ strava_athlete_id: string }>("select strava_athlete_id from strava_connections where user_id = $1", [userId]);
   if (!conn) return false;
   if (await reviewLimitReached(userId)) {
