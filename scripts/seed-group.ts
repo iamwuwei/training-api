@@ -17,13 +17,14 @@ import { cleanName, NAME_MAX, RACE_NAME_MAX } from "../src/lib/groups";
 // is created. By default NO share_settings row is written: a missing row is the default (progress and finished-session events
 // on; plan, runs, reviews off), so each person decides in the settings page what the other may see; --share is for the
 // other choices. `--undo` deletes the group, its members, invites and events, never share_settings.
-// Exit code: 0 = done, or nothing to do (already seeded, a person missing, nothing to undo); 1 = misuse, no active plan, DB error.
+// Exit code: 0 = done, or nothing to do (already seeded, a person missing, nothing to undo); 1 = misuse, no active plan, DB error;
+// 2 = --undo refused (not the group this script made: a third person, a used invite, a second group of ww).
 
 const LOCK = "seed-group";
 const ww = USERS.ww.id;
 const gf = USERS.gf.id;
 
-interface Outcome { done: boolean; reason: string; failed?: boolean }
+interface Outcome { done: boolean; reason: string; failed?: boolean; refused?: boolean }
 interface Options { undo: boolean; name?: string; share?: "all" | "ww" | "gf" }
 
 function parseArgs(argv: string[]): Options | string {
@@ -88,13 +89,13 @@ async function undoGroup(q: Querier): Promise<Outcome> {
   await q("select pg_advisory_xact_lock(hashtext($1))", [LOCK]);
   const groups = await q<{ id: string }>("select id from groups where owner_user_id = $1 and disbanded_at is null", [ww]);
   if (!groups.length) return { done: false, reason: "ww 沒有進行中的群組，沒有東西可以還原。" };
-  if (groups.length > 1) return { done: false, reason: "ww 擁有不只一個群組：這不是腳本建的樣子，請用畫面解散。" };
+  if (groups.length > 1) return { done: false, refused: true, reason: "ww 擁有不只一個群組：這不是腳本建的樣子，請用畫面解散。" };
   const id = groups[0].id;
 
   const others = await q("select 1 from group_members where group_id = $1 and user_id <> all($2::uuid[])", [id, [ww, gf]]);
-  if (others.length) return { done: false, reason: "群組裡有 ww、gf 以外的人（或曾經有）：不是腳本建的樣子，請用畫面解散。" };
+  if (others.length) return { done: false, refused: true, reason: "群組裡有 ww、gf 以外的人（或曾經有）：不是腳本建的樣子，請用畫面解散。" };
   const used = await q("select 1 from group_invites where group_id = $1 and uses > 0", [id]);
-  if (used.length) return { done: false, reason: "這個群組的邀請有人用過：不是腳本建的樣子，請用畫面解散。" };
+  if (used.length) return { done: false, refused: true, reason: "這個群組的邀請有人用過：不是腳本建的樣子，請用畫面解散。" };
 
   await q("delete from group_events where group_id = $1", [id]);
   await q("delete from group_invites where group_id = $1", [id]);
@@ -113,6 +114,7 @@ async function main() {
   const out = await withTransaction((q) => (opts.undo ? undoGroup(q) : seedGroup(q, opts)));
   console.log(out.reason);
   if (out.failed) process.exitCode = 1;
+  if (out.refused) process.exitCode = 2; // --undo said no: a calling script must not read "nothing done" as "done"
   if (!opts.undo && opts.share && !out.done && !out.failed) console.log("（--share 只在建立群組的那一次生效；要改分享請到設定頁，或先 --undo 再重跑。）");
 }
 

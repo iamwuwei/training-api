@@ -239,13 +239,14 @@ function toSharedActivity(r: SharedActivityRow): ApiSharedActivity {
   };
 }
 
-/** Only the fields a viewer may see of a review: no model, no adjust_hint; a failed one has no comment (it holds the error text). */
+/** Only the fields a viewer may see of a review: no model, no adjust_hint; no comment when failed (it holds the error text) or manual (it is his own 心得). */
 function toSharedReview(r: { verdict: Verdict | null; reminders: string[] | null; comment: string | null; source: "manual" | "claude"; created_at: Date; corrected_at: Date | null }): ApiSharedReview {
   const failed = r.source === "claude" && r.verdict === null;
   return {
     verdict: r.verdict,
     reminders: r.reminders ?? [],
-    comment: failed ? null : r.comment,
+    // a manual review's comment is the athlete's own 心得 (PUT /activities/{id}/review): never shared (01 H2)
+    comment: failed || r.source === "manual" ? null : r.comment,
     source: r.source,
     failed,
     created_at: iso(r.created_at),
@@ -310,7 +311,8 @@ export async function groupUnread(viewerId: string, groupId?: string): Promise<M
             and e.created_at > now() - make_interval(days => $3)
             and (e.kind <> 'session_done' or exists (
                   select 1 from group_members a left join share_settings s on s.user_id = a.user_id
-                   where a.id = e.member_id and a.group_id = e.group_id and a.left_at is null and coalesce(s.events, true)))
+                   where a.id = e.member_id and a.group_id = e.group_id and a.left_at is null and coalesce(s.events, true)
+                     and exists (select 1 from activities pa where pa.session_id = e.session_id and pa.user_id = a.user_id and pa.match_status <> 'ignored')))
       where gm.user_id = $1 and gm.left_at is null and ($2::uuid is null or gm.group_id = $2::uuid)
       group by gm.group_id`,
     [viewerId, groupId ?? null, EVENTS_RETENTION_DAYS],
@@ -320,9 +322,15 @@ export async function groupUnread(viewerId: string, groupId?: string): Promise<M
 
 /** GET /plan's `groups_unread`: the sum over my groups (one SQL). */
 export async function unreadTotal(viewerId: string): Promise<number> {
-  let n = 0;
-  for (const v of (await groupUnread(viewerId)).values()) n += v;
-  return n;
+  try {
+    let n = 0;
+    for (const v of (await groupUnread(viewerId)).values()) n += v;
+    return n;
+  } catch (err) {
+    // GET /plan is the app's core call: a failing group query (the api deployed before `npm run migrate`) costs the tab dot, not the page.
+    console.error("groups_unread not computed", err instanceof Error ? err.message : err);
+    return 0;
+  }
 }
 
 /** GET /groups: my groups with their unread counts. */
@@ -340,7 +348,8 @@ type EventRow = {
 
 /**
  * The events of one group as `viewerId` may see them, newest first. A session_done is here only while its actor is a current
- * member and his `events` switch is on (his own always show to himself); joined / left always (they are facts about the group).
+ * member, his `events` switch is on (his own always show to himself) and the session still holds one of his recordings (an unbound or
+ * ignored one — 不是這堂, 選錯了 — takes the "he finished it" back, whatever was written when it was bound); joined / left always (facts about the group).
  * `verdict` is the current review's verdict on the session's primary recording; `judging` = recorded but no review row yet.
  * `id` narrows to one event (the detail), `before` is the cursor of the page (an event id of this group).
  */
@@ -361,7 +370,7 @@ async function queryEvents(viewerId: string, groupId: string, o: { id?: string; 
         and exists (select 1 from group_members v join groups g on g.id = v.group_id and g.disbanded_at is null
                      where v.group_id = $2 and v.user_id = $1 and v.left_at is null)
         and e.created_at > now() - make_interval(days => $6)
-        and (e.kind <> 'session_done' or (a.left_at is null and (a.user_id = $1 or coalesce(s.events, true))))
+        and (e.kind <> 'session_done' or (a.left_at is null and pr.id is not null and (a.user_id = $1 or coalesce(s.events, true))))
         and ($3::uuid is null or e.id = $3::uuid)
         and ($4::uuid is null or (e.created_at, e.id) < (select c.created_at, c.id from group_events c where c.id = $4::uuid and c.group_id = $2))
       order by e.created_at desc, e.id desc

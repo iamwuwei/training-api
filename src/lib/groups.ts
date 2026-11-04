@@ -12,8 +12,11 @@ import type { AcceptInviteResponse, ApiGroup, ApiGroupInvite, InvitePreviewRespo
 //
 // Membership is never deleted: `left_at` (+ `left_reason`) closes it, `groups.disbanded_at` closes a group. "A current member"
 // is always `left_at is null` AND the group not disbanded. A user may hold GROUP_MAX_PER_USER of them, a group has at most
-// GROUP_MAX_MEMBERS. Both limits are checked inside a transaction that first takes the user's advisory lock and then the
-// group row's lock (always in that order, so no deadlock): two tabs, or two people accepting at once, cannot overshoot.
+// GROUP_MAX_MEMBERS. Lock order, the same in every transaction that writes membership: the user's advisory lock (only create /
+// accept take it, to serialise one person's joins), then the group row (`for update`: accept, createInvite, disband, leave, remove),
+// then the invite or member rows. leave / remove / disband all start with the group row because their `group_events` insert takes a
+// KEY SHARE on it through the foreign key; taking the member row first (as leave / remove once did) deadlocked against disband
+// (40P01). Two tabs, or two people accepting at once, cannot overshoot the limits.
 
 export const GROUP_MAX_MEMBERS = 5;
 export const GROUP_MAX_PER_USER = 3;
@@ -25,17 +28,23 @@ export const RACE_NAME_MAX = 40;
 export const SHARE_DEFAULTS: ShareSettings = { progress: true, events: true, plan: false, runs: false, reviews: false };
 export const SHARE_KEYS = ["progress", "events", "plan", "runs", "reviews"] as const;
 
+/** A race day further away than this is a typo (9999-12-31 would make the countdown break the layout). */
+export const RACE_DATE_MAX_YEARS = 5;
+const maxRaceDate = () => { const t = todayJst(); return `${Number(t.slice(0, 4)) + RACE_DATE_MAX_YEARS}${t.slice(4)}`; };
+
 export const todayJst = () => new Date(Date.now() + 9 * 3600_000).toISOString().slice(0, 10);
 
 // ---- small pure helpers ----------------------------------------------------------------------
 
 /** C0 / C1 controls, zero-width and direction marks, the BOM: shown as nothing, so they are dropped. */
-const INVISIBLE = /[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁠-⁤⁦-⁩﻿]/g;
+const INVISIBLE = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/g;
+/** Line breaks and tabs are word gaps ("Fuji\nMountain" is two words), not invisible: they become a space before the controls are dropped. */
+const BREAKS = /[\t\n\r\u000b\u000c\u0085\u2028\u2029]/g;
 
 /** A group / race name: one line, no markup characters, 1..max characters. null = invalid (400). */
 export function cleanName(v: unknown, max: number): string | null {
   if (typeof v !== "string" || v.length > 1000) return null;
-  const s = v.replace(INVISIBLE, "").replace(/\s+/g, " ").trim().replace(/[*`#><]/g, "").replace(/\s+/g, " ").trim();
+  const s = v.replace(BREAKS, " ").replace(INVISIBLE, "").replace(/\s+/g, " ").trim().replace(/[*`#><]/g, "").replace(/\s+/g, " ").trim();
   if (!s || [...s].length > max) return null;
   return s;
 }
@@ -55,6 +64,7 @@ export function parseGroupBody(body: unknown): { ok: true; value: GroupBody } | 
   if (!race_name) return { ok: false, error: `race_name must be 1-${RACE_NAME_MAX} characters` };
   if (typeof b.race_date !== "string" || !isValidDate(b.race_date)) return { ok: false, error: "race_date must be YYYY-MM-DD" };
   if (b.race_date < todayJst()) return { ok: false, error: "race_date must not be in the past" };
+  if (b.race_date > maxRaceDate()) return { ok: false, error: `race_date must be within ${RACE_DATE_MAX_YEARS} years` };
   return { ok: true, value: { name, race_name, race_date: b.race_date } };
 }
 
@@ -130,6 +140,10 @@ export async function activeGroupCount(q: Querier, userId: string): Promise<numb
   );
   return r?.n ?? 0;
 }
+
+/** The group row, locked until the transaction ends; false = no such group or already disbanded. The first statement of leave / remove / disband. */
+const lockGroup = async (q: Querier, groupId: string): Promise<boolean> =>
+  (await q("select id from groups where id = $1 and disbanded_at is null for update", [groupId])).length > 0;
 
 const memberCountOf = async (q: Querier, groupId: string): Promise<number> =>
   (await q<{ n: number }>("select count(*)::int as n from group_members where group_id = $1 and left_at is null", [groupId]))[0]?.n ?? 0;
@@ -288,6 +302,7 @@ export async function leaveGroup(userId: string, groupId: string): Promise<"ok" 
   if (!mine) return "none";
   if (mine.member.role === "owner") return "owner";
   return withTransaction(async (q) => {
+    if (!(await lockGroup(q, groupId))) return "none" as const; // disbanded a moment ago
     const hit = await q<{ id: string }>(
       `update group_members set left_at = now(), left_reason = 'left'
         where id = $1 and group_id = $2 and user_id = $3 and left_at is null returning id`,
@@ -311,6 +326,7 @@ export async function removeMember(ownerId: string, groupId: string, memberId: s
   if (!target) return "not_found";
   if (target.user_id === ownerId) return "self";
   return withTransaction(async (q) => {
+    if (!(await lockGroup(q, groupId))) return "not_found" as const; // disbanded a moment ago
     const hit = await q<{ id: string }>(
       `update group_members set left_at = now(), left_reason = 'removed'
         where id = $1 and group_id = $2 and left_at is null returning id`,
