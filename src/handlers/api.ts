@@ -12,7 +12,7 @@ import { acceptInvite, createGroup, createInvite, disbandGroup, getShare, GROUP_
 import { countsWeekNo, shortDate, sportName, weeklyAskQuestion } from "../lib/labels";
 import { applyChange, applyProposal, changeConflict, postProposalApplied } from "../lib/proposals";
 import { deauthorize } from "../lib/strava";
-import { elapsedSql, loadGroup, combineGroup, MAX_PER_SESSION, overlaps, regroupReview, requeueReview, REVIEW_LIMIT_MARKER, REVIEW_LIMIT_TEXT, reviewLimitReached, SEGMENT_SELECT, sameKind } from "../lib/session-group";
+import { elapsedSql, loadGroup, combineGroup, MAX_PER_SESSION, overlaps, recordBinding, regroupReview, requeueReview, REVIEW_LIMIT_MARKER, REVIEW_LIMIT_TEXT, reviewLimitReached, SEGMENT_SELECT, sameKind } from "../lib/session-group";
 import { postRoutineDone } from "../lib/strength";
 import { COACH_STAGES } from "../lib/stage";
 import { requestWeeklyRerun, reviewMissingActivity, WEEKLY_REVIEW_SELECT } from "../lib/weekly";
@@ -1339,6 +1339,7 @@ async function postCheckinPick(userId: string, checkinId: string, raw: string) {
     await postMismatchAsk(userId, { from: "checkin", activity_id: activityId, session_id: sessionId, reason, checkin_id: checkin.id, pick_id: pick.id }, session.scheduled_date, session);
     await query("update coach_messages set status = 'sent' where id = $1", [pick.id]);
   } else {
+    await recordBinding(userId, activityId); // group-race: the pick is the binding; the verdict only comes after his answer to the feel question
     await queueCoachAsk(userId, pick.id);
   }
   const [c] = await query<CoachMessageRow>("select * from coach_messages where id = $1", [checkin.id]);
@@ -1472,6 +1473,7 @@ async function answerMismatch(userId: string, ask: CoachMessageRow, text: string
     if (am.pick_id) {
       // The pick goes back to pending so the worker's feel question runs for it (its redelivery guard is the status).
       await query("update coach_messages set status = 'pending' where id = $1 and user_id = $2 and kind = 'pick'", [am.pick_id, userId]);
+      await recordBinding(userId, am.activity_id); // group-race: the doubted pick stands, so the binding counts now
       await queueCoachAsk(userId, am.pick_id);
     } else {
       await requeueReview(userId, am.activity_id, "match confirmed");
