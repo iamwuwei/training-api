@@ -398,6 +398,7 @@ async function getPlan(userId: string) {
     unassigned: unassigned.map(toApiActivity),
     routines: routines.map(toApiRoutine),
     constraints: constraints.map(toApiConstraint),
+    groups_unread: 0, // placeholder until unreadTotal lands (group-race)
   });
 }
 
