@@ -243,15 +243,17 @@ function toSharedActivity(r: SharedActivityRow): ApiSharedActivity {
  * THE projection of a review for another member: every exit (the event detail, the member plan's activities) goes through here.
  * A whitelist: only a Woo-written review (`source = 'claude'`) shares its `comment` and `reminders`; any other source (manual, null, a
  * future one) shares the verdict only (comment null, reminders []), because such text may be the athlete's own words (01 H2).
- * A failed review has no comment either (it holds the error text). Never the model or adjust_hint.
+ * A failed review (claude, verdict null) shares neither comment (it holds the error text) nor reminders. Never the model or adjust_hint.
  */
 export function toSharedReview(r: { verdict: Verdict | null; reminders: string[] | null; comment: string | null; source: string | null; created_at: Date; corrected_at: Date | null }): ApiSharedReview {
   const woo = r.source === "claude";
   const failed = woo && r.verdict === null;
+  // comment and reminders only from a Woo-written review that actually judged (claude AND a verdict): a failed row shares neither
+  const text = woo && !failed;
   return {
     verdict: r.verdict,
-    reminders: woo ? r.reminders ?? [] : [],
-    comment: woo && !failed ? r.comment : null,
+    reminders: text ? r.reminders ?? [] : [],
+    comment: text ? r.comment : null,
     source: woo ? "claude" : "manual",
     failed,
     created_at: iso(r.created_at),

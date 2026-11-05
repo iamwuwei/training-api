@@ -125,6 +125,7 @@ alter table reviews add column if not exists reminders jsonb;                   
 alter table reviews add column if not exists source text not null default 'manual'; -- claude (every verdict now; `manual` is only the column default and old data)
 -- Hardening: PUT /activities/{id}/review is gone, so no review is manual any more; old manual rows (test data) become claude. Idempotent: runs on every
 -- migrate, finds nothing the second time. Sharing with a group only passes comment / reminders of source = 'claude' (group-view.ts toSharedReview).
+-- One-time repair; can be deleted once migrate has run (backlog #110).
 update reviews set source = 'claude' where source = 'manual';
 alter table reviews add column if not exists adjust_hint text;                      -- Claude's one-line plan-adjustment suggestion (weekly review input)
 
