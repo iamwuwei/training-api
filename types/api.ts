@@ -210,6 +210,8 @@ export interface PlanResponse {
    * prompts). The settings page lists them; 刪除 = POST /constraints/{id}/dismiss.
    */
   constraints: ApiConstraint[];
+  /** Unseen 消息中心 events over all my groups (the 群組 tab dot). 0 when I am in no group. */
+  groups_unread: number;
 }
 
 // ---- 肌力 day: Woo's checklist ---------------------------------------------------
@@ -811,6 +813,147 @@ export interface PutCoachSeenResponse {
 export interface PostCoachMessageResponse {
   message: ApiCoachMessage;
 }
+
+// ---- 群組 / group-race ---------------------------------------------------------------------
+// A user may be in up to `max_groups` groups. Every call about a group carries its id and is answered only when the
+// caller is a current member (otherwise 404, same as an unknown id). What one member sees of another is computed by
+// the api and filtered by that member's ShareSettings: a switched-off field is null (or the event is absent) and the
+// response carries nothing from which the hidden content could be inferred. Never sent about another member: users.id,
+// email, Strava ids, memo / RPE, the coach thread, constraints, raw data, gear, model names, his other groups.
+
+export interface ShareSettings {
+  progress: boolean;  // dashboard numbers              default true
+  events: boolean;    // my 完成了○○ events               default true
+  plan: boolean;      // my plan (weeks, sessions)       default false
+  runs: boolean;      // distance / time / pace / HR / splits of my runs   default false
+  reviews: boolean;   // Woo's verdict, reminders, comment                 default false
+}
+/** GET /me/share → { share } (defaults when never set). PUT /me/share { share: Partial<ShareSettings> } → { share }; non-boolean → 400. Takes effect on the next request of anyone. */
+export interface ShareResponse { share: ShareSettings }
+export interface PutShareRequest { share: Partial<ShareSettings> }
+
+export interface ApiGroup {
+  id: string;
+  name: string;          // <= 30
+  race_name: string;     // <= 40
+  race_date: string;     // 'YYYY-MM-DD'; the countdown
+  created_at: string;
+  joined_at: string;
+  my_role: "owner" | "member";
+  member_count: number;  // current members
+  max_members: number;   // 5
+  /** Events in this group I have not seen (not mine, not hidden by the actor's share). 0 after PUT /groups/{id}/seen. */
+  unread: number;
+}
+/** GET /groups: my groups, oldest membership first. */
+export interface GroupsResponse { groups: ApiGroup[]; max_groups: number /* 3 */ }
+
+/** Dashboard numbers (01 N): `runs` needs no plan; `plan` only when the group's race date lies inside his active plan. */
+export interface ApiGroupProgress {
+  runs: { week_start: string; week_actual_m: number; week_runs: number; longest_m: number | null; longest_date: string | null };
+  plan_state: "in_range" | "out_of_range" | "no_plan";
+  plan: {
+    race_date: string;
+    week: { week_no: number; plan_m: number; actual_m: number; done_count: number; plan_count: number } | null;
+    total: { actual_m: number; plan_to_date_m: number; pct: number; done_count: number; plan_count_to_date: number };
+  } | null;
+}
+
+/** Which of his switches are on, as seen by me (all true for myself). The page uses it for the fixed lines (沒有分享課表 …). */
+export type SharedFlags = ShareSettings;
+
+export interface ApiGroupMember {
+  id: string;            // group_members.id, only meaningful in this group
+  display_name: string;
+  is_me: boolean;
+  role: "owner" | "member";
+  joined_at: string;
+  shared: SharedFlags;
+  /** null when his `progress` switch is off: show 沒有分享進度. */
+  progress: ApiGroupProgress | null;
+}
+
+export interface ApiGroupInvite { token: string | null; expires_at: string; uses_left: number }  // token only in the POST response
+
+/** One line of 消息中心. session_done lines exist only while the actor is a member and his `events` switch is on. */
+export interface ApiGroupEvent {
+  id: string;
+  kind: "session_done" | "joined" | "left";
+  member: { id: string; display_name: string; is_me: boolean };
+  created_at: string;
+  /** session_done only. `verdict` is the current review's (null = not judged yet or failed; `judging` says which). */
+  session: { label: string; date: string; verdict: Verdict | null; judging: boolean } | null;
+}
+/** GET /groups/{id}/events?before=<event id>&limit=<1..50, default 30>; newest first; last 90 days. */
+export interface GroupEventsResponse { events: ApiGroupEvent[]; has_more: boolean }
+
+/** A run as another member may see it (his `runs` on). No memo, description, gear, device, weather, raw. */
+export interface ApiSharedActivity {
+  id: string;
+  session_id: string | null;
+  sport_type: string | null;
+  start_time: string;
+  distance_m: number;
+  moving_time_sec: number;
+  elapsed_time_sec: number | null;
+  avg_pace_sec_km: number | null;
+  avg_hr: number | null;
+  max_hr: number | null;
+  splits: ApiSplit[] | null;
+  segment: ApiSegment | null;
+}
+/** Woo's verdict as another member may see it (his `reviews` on). The current review of that session; no model, no adjust_hint. */
+export interface ApiSharedReview {
+  verdict: Verdict | null;
+  reminders: string[];
+  comment: string | null;
+  source: "manual" | "claude";
+  failed: boolean;          // true = Woo could not judge (verdict null)
+  created_at: string;
+  corrected_at: string | null;
+}
+
+/** GET /groups/{id}/events/{eid} → 200 | 404 (unknown, another group's, not a member) */
+export interface GroupEventDetailResponse {
+  event: ApiGroupEvent;
+  shared: SharedFlags;
+  activity: ApiSharedActivity | null;   // his `runs` on; the session's primary recording (plus `segments` when several)
+  segments: ApiSharedActivity[];        // every recording of that session, oldest first ([] when `runs` off)
+  review: ApiSharedReview | null;       // his `reviews` on
+}
+
+/** GET /groups/{id} → 200 | 404 */
+export interface GroupResponse {
+  group: ApiGroup;
+  members: ApiGroupMember[];    // me first, then by joined_at
+  recent_events: ApiGroupEvent[]; // newest 3
+  invite: ApiGroupInvite | null;  // owner only, while one is live (token null here)
+}
+
+/** A planned session as another member may see it (his `plan` on). Same fields the plan page draws, nothing else. */
+export type ApiSharedSession = Pick<ApiSession, "id" | "scheduled_date" | "week_no" | "phase" | "label" | "type" | "content" | "note" | "target" | "target_distance_m" | "target_pace_sec_km" | "target_pace_min_sec_km" | "target_pace_max_sec_km" | "target_hr_min" | "target_hr_max" | "brief" | "skipped_at" | "superseded" | "moved_to_session_id" | "moved_to_date" | "moved_from_session_id" | "moved_from_date" | "counts_in_week_no">;
+
+/**
+ * GET /groups/{id}/members/{mid}/plan → 200 | 404. A read-only subset of that member's active plan, by his switches:
+ * plan off → plan null, weeks [], sessions []; runs off → activities []; reviews off → every activity's review null.
+ * My own mid: everything regardless of switches. plan_state / race per 01 N8: the whole current plan, not scoped to this race.
+ */
+export interface MemberPlanResponse {
+  member: { id: string; display_name: string; is_me: boolean };
+  shared: SharedFlags;
+  plan: { race_name: string; race_date: string; goal_time_sec: number | null } | null;
+  weeks: ApiWeek[];
+  sessions: ApiSharedSession[];
+  activities: (ApiSharedActivity & { review: ApiSharedReview | null })[];
+}
+
+export interface PostGroupRequest { name: string; race_name: string; race_date: string }
+export interface PostGroupResponse { group: ApiGroup }
+export interface PostGroupInviteResponse { invite: ApiGroupInvite }
+export interface GroupOkResponse { ok: true }
+export type InviteState = "ok" | "expired" | "revoked" | "used_up" | "full" | "already_member" | "group_limit";
+export interface InvitePreviewResponse { state: InviteState; group: { id: string; name: string; race_name: string; race_date: string; member_count: number; invited_by: string } | null }
+export interface AcceptInviteResponse { group: ApiGroup }
 
 // ---- errors (any non-2xx) ----------------------------------------------------
 

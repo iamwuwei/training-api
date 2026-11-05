@@ -10,6 +10,7 @@
     "build": "tsc --noEmit",
     "migrate": "tsx scripts/migrate.ts",
     "seed": "tsx seed/seed.ts",
+    "seed-group": "tsx scripts/seed-group.ts",
     "backfill": "tsx scripts/backfill.ts",
     "sql": "tsx scripts/sql.ts",
     "fix-race-date": "tsx scripts/fix-race-date.ts",

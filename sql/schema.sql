@@ -216,3 +216,75 @@ create table if not exists constraints (
   decided_at timestamptz
 );
 create index if not exists constraints_user_id_status_idx on constraints (user_id, status);
+
+-- group-race: athletes training for the same race, each with his own plan. A user may be in up to 3 groups (checked in
+-- code). Everything one member sees of another is computed by src/lib/group-view.ts (the only reader of another user's
+-- rows) and filtered by the other member's share_settings.
+create table if not exists groups (
+  id uuid primary key,
+  name text not null,                       -- <= 30 chars
+  race_name text not null,                  -- <= 40 chars
+  race_date date not null,
+  owner_user_id uuid not null references users(id),
+  created_at timestamptz not null default now(),
+  disbanded_at timestamptz                  -- DELETE /groups/{id}; the row stays, every membership is closed
+);
+
+-- One row per (group, user) ever; left_at null = a current member. `id` is what other members see (never users.id)
+-- and differs per group. events_seen_at: when this member last opened the group's 消息中心 (unread count).
+create table if not exists group_members (
+  id uuid primary key,
+  group_id uuid not null references groups(id),
+  user_id uuid not null references users(id),
+  role text not null default 'member',      -- owner | member
+  joined_at timestamptz not null default now(),
+  left_at timestamptz,
+  left_reason text,                         -- left | removed | disbanded
+  events_seen_at timestamptz,
+  unique (group_id, user_id)
+);
+create index if not exists group_members_user_active_idx on group_members (user_id) where left_at is null;
+
+-- Invite links: token_hash = sha256(token) hex, the token itself is never stored. One live invite per group
+-- (a new one revokes the previous), multi-use until the group is full, 7 days.
+create table if not exists group_invites (
+  id uuid primary key,
+  group_id uuid not null references groups(id),
+  token_hash text unique not null,
+  created_by uuid not null references users(id),
+  expires_at timestamptz not null,
+  max_uses int not null,
+  uses int not null default 0,
+  revoked_at timestamptz,
+  created_at timestamptz not null default now()
+);
+create index if not exists group_invites_group_live_idx on group_invites (group_id) where revoked_at is null;
+
+-- What a user lets the members of all his groups see. Missing row = the defaults below (01 H1).
+-- Never shareable (no column): the coach thread, constraints, memo/RPE, raw Strava data, gear, email, ids, model names.
+create table if not exists share_settings (
+  user_id uuid primary key references users(id),
+  progress boolean not null default true,   -- dashboard numbers
+  events boolean not null default true,     -- my session_done events in 消息中心
+  plan boolean not null default false,      -- my plan's weeks and sessions (成員課表頁)
+  runs boolean not null default false,      -- distance / time / pace / HR / splits of my runs
+  reviews boolean not null default false,   -- Woo's verdict, reminders and comment
+  updated_at timestamptz not null default now()
+);
+
+-- 消息中心. Written once per group the actor is in at that moment (<= 3 rows per fact); never updated.
+-- session_done: the actor bound a recording to a planned session (one row per session per group, see the unique index);
+-- the verdict is not stored here — the reader joins the current reviews row. joined / left: membership facts.
+create table if not exists group_events (
+  id uuid primary key,
+  group_id uuid not null references groups(id),
+  member_id uuid not null references group_members(id),   -- the actor's membership in this group
+  kind text not null,                       -- session_done | joined | left
+  session_id uuid references planned_sessions(id),        -- session_done
+  activity_id uuid references activities(id),             -- session_done: the primary recording at the time
+  label text,                               -- session_done: the session's label snapshot ("Long 18 km"), <= 40
+  session_date date,                        -- session_done: scheduled_date
+  created_at timestamptz not null default now()
+);
+create index if not exists group_events_group_created_idx on group_events (group_id, created_at desc);
+create unique index if not exists group_events_session_once_idx on group_events (group_id, session_id) where session_id is not null;

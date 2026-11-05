@@ -8,6 +8,7 @@ import { answerCoachMessage, postCoachMessage } from "../lib/coach";
 import { loadReviewContext } from "../lib/context";
 import { CORRECTION_REASON_MAX, settleCorrection, supersedeReviewMessages } from "../lib/correction";
 import { isDbWaking, query, queryOne, withTransaction } from "../lib/db";
+import { recordSessionDone } from "../lib/group-events";
 import { sessionLabel, shortDate, sportName } from "../lib/labels";
 import { getActivity, refreshToken, StravaError } from "../lib/strava";
 import { combineGroup, loadGroup, reviewLimitReached, settleAnswerMessages, writeLimitedReview } from "../lib/session-group";
@@ -201,6 +202,9 @@ export async function processEvent(ev: Pick<StravaWebhookEvent, "object_id" | "o
       return;
     }
     const ids = group.map((g) => g.id);
+    // group-race 消息中心: an activity that was already bound when its event came in (the api records the same fact when the
+    // athlete binds; the unique index makes the second write a no-op).
+    await recordSessionDone(conn.user_id, row.session_id, row.id);
     const existing = await queryOne<{ id: string }>(
       "select id from reviews where activity_id = $1 and not (source = 'claude' and verdict is null)",
       [row.id],
