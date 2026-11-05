@@ -27,8 +27,6 @@ import type {
   Verdict,
   MeResponse,
   PlanResponse,
-  PutReviewRequest,
-  PutReviewResponse,
   PutSessionRequest,
   PutSessionResponse,
   PutMemoRequest,
@@ -85,7 +83,6 @@ import type {
 //   DELETE /me/strava                unlink Strava (revoke + drop strava_connections row)
 //   GET /plan                        active plan + weeks + sessions + matched activities (with reviews)
 //   GET /activities?status=<status>  all activities (with reviews), newest first
-//   PUT /activities/{id}/review      set a manual verdict
 //   PUT /activities/{id}/session     the athlete's pick: which planned session this activity was (+ memo/RPE), or ignore it;
 //                                    a pick that looks wrong gets Woo's 真的是這趟嗎 in the thread instead of a verdict
 //   PUT /activities/{id}/memo        athlete's own note + RPE (re-triggers the Claude review)
@@ -121,11 +118,10 @@ import type {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const STATUSES = new Set<string>(["auto", "confirmed", "unplanned", "ignored"] satisfies MatchStatus[]);
-const VERDICTS = new Set<string>(["達成", "達成但有提醒", "未達成"]);
 
 const sqs = new SQSClient({});
 
-const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutReviewResponse | PutSessionResponse | PutMemoResponse | PutDetailsResponse | DetailOptionsResponse | RereviewResponse | WeeklyResponse | PostAdjustmentResponse | CoachResponse | PostCoachMessageResponse | PutCoachSeenResponse | PostCheckinPickResponse | PostCheckinResetResponse | PostRoutineResponse | PutRoutineResponse | PostWeeklyAskResponse | PostProposalResponse | PostConstraintResponse | PlanChangedResponse | GroupsResponse | PostGroupResponse | GroupResponse | GroupOkResponse | PostGroupInviteResponse | MemberPlanResponse | GroupEventsResponse | GroupEventDetailResponse | InvitePreviewResponse | AcceptInviteResponse | ShareResponse | ErrorResponse>(
+const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutSessionResponse | PutMemoResponse | PutDetailsResponse | DetailOptionsResponse | RereviewResponse | WeeklyResponse | PostAdjustmentResponse | CoachResponse | PostCoachMessageResponse | PutCoachSeenResponse | PostCheckinPickResponse | PostCheckinResetResponse | PostRoutineResponse | PutRoutineResponse | PostWeeklyAskResponse | PostProposalResponse | PostConstraintResponse | PlanChangedResponse | GroupsResponse | PostGroupResponse | GroupResponse | GroupOkResponse | PostGroupInviteResponse | MemberPlanResponse | GroupEventsResponse | GroupEventDetailResponse | InvitePreviewResponse | AcceptInviteResponse | ShareResponse | ErrorResponse>(
   statusCode: number,
   body: T,
 ): APIGatewayProxyResultV2 => ({
@@ -190,9 +186,8 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
   if (method === "GET" && path === "/activities/detail-options") return getDetailOptions(user.id);
 
   const raw = event.isBase64Encoded ? Buffer.from(event.body ?? "", "base64").toString("utf8") : event.body ?? "";
-  const sub = /^\/activities\/([^/]+)\/(review|session|memo|details)$/.exec(path);
+  const sub = /^\/activities\/([^/]+)\/(session|memo|details)$/.exec(path);
   if (method === "PUT" && sub) {
-    if (sub[2] === "review") return putReview(user.id, sub[1], raw);
     if (sub[2] === "session") return putSession(user.id, sub[1], raw);
     if (sub[2] === "details") return putDetails(user.id, sub[1], raw);
     return putMemo(user.id, sub[1], raw);
@@ -498,32 +493,6 @@ async function getActivities(userId: string, status?: string) {
     [userId, status ?? null],
   );
   return json<ActivitiesResponse>(200, { activities: activities.map(toApiActivity) });
-}
-
-async function putReview(userId: string, activityId: string, raw: string) {
-  if (!UUID_RE.test(activityId)) return json(400, { error: "invalid activity id" });
-  let body: PutReviewRequest;
-  try {
-    body = JSON.parse(raw) as PutReviewRequest;
-  } catch {
-    return json(400, { error: "invalid json" });
-  }
-  if (body.verdict !== null && !VERDICTS.has(body.verdict)) return json(400, { error: "invalid verdict" });
-  const reminders = (body.reminders ?? []).filter((r): r is string => typeof r === "string" && r.trim() !== "");
-
-  const owned = await queryOne<{ id: string }>("select id from activities where id = $1 and user_id = $2", [activityId, userId]);
-  if (!owned) return json(404, { error: "activity not found" });
-
-  const [review] = await query<ReviewRow>(
-    `insert into reviews (id, activity_id, verdict, comment, reminders, source, model, adjust_hint)
-     values ($1, $2, $3, $4, $5, 'manual', null, null)
-     on conflict (activity_id) do update set
-       verdict = excluded.verdict, comment = excluded.comment, reminders = excluded.reminders,
-       source = 'manual', model = null, adjust_hint = null, created_at = now()
-     returning *`,
-    [randomUUID(), activityId, body.verdict, body.comment ?? null, JSON.stringify(reminders)],
-  );
-  return json<PutReviewResponse>(200, { review: toApiReview(review, null) });
 }
 
 type MemoFields = { memo: string | null; rpe: number | null };

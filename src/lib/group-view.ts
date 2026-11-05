@@ -223,7 +223,7 @@ type SharedActivityRow = {
   id: string; session_id: string | null; sport_type: string | null; start_time: Date; distance_m: number; moving_time_sec: number;
   elapsed_time_sec: number | null; avg_pace_sec_km: number | null; avg_hr: number | null; max_hr: number | null; splits: ApiSplit[] | null;
   seg_count: number | null; seg_index: number | null; seg_primary: string | null;
-  r_verdict: Verdict | null; r_comment: string | null; r_reminders: string[] | null; r_source: "manual" | "claude" | null; r_created_at: Date | null; r_corrected_at: Date | null;
+  r_verdict: Verdict | null; r_comment: string | null; r_reminders: string[] | null; r_source: string | null; r_created_at: Date | null; r_corrected_at: Date | null;
 };
 
 const CORRECTED_AT = `(select max(m.created_at) from coach_messages m
@@ -239,15 +239,20 @@ function toSharedActivity(r: SharedActivityRow): ApiSharedActivity {
   };
 }
 
-/** Only the fields a viewer may see of a review: no model, no adjust_hint; no comment when failed (it holds the error text) or manual (it is his own 心得). */
-function toSharedReview(r: { verdict: Verdict | null; reminders: string[] | null; comment: string | null; source: "manual" | "claude"; created_at: Date; corrected_at: Date | null }): ApiSharedReview {
-  const failed = r.source === "claude" && r.verdict === null;
+/**
+ * THE projection of a review for another member: every exit (the event detail, the member plan's activities) goes through here.
+ * A whitelist: only a Woo-written review (`source = 'claude'`) shares its `comment` and `reminders`; any other source (manual, null, a
+ * future one) shares the verdict only (comment null, reminders []), because such text may be the athlete's own words (01 H2).
+ * A failed review has no comment either (it holds the error text). Never the model or adjust_hint.
+ */
+export function toSharedReview(r: { verdict: Verdict | null; reminders: string[] | null; comment: string | null; source: string | null; created_at: Date; corrected_at: Date | null }): ApiSharedReview {
+  const woo = r.source === "claude";
+  const failed = woo && r.verdict === null;
   return {
     verdict: r.verdict,
-    reminders: r.reminders ?? [],
-    // a manual review's comment is the athlete's own 心得 (PUT /activities/{id}/review): never shared (01 H2)
-    comment: failed || r.source === "manual" ? null : r.comment,
-    source: r.source,
+    reminders: woo ? r.reminders ?? [] : [],
+    comment: woo && !failed ? r.comment : null,
+    source: woo ? "claude" : "manual",
     failed,
     created_at: iso(r.created_at),
     corrected_at: r.corrected_at ? iso(r.corrected_at) : null,
@@ -275,13 +280,13 @@ async function loadSharedActivities(c: Ctx, where: { sessionId: string } | { pla
   );
   return rows.map((r) => ({
     ...toSharedActivity(r),
-    review: r.r_created_at && r.r_source ? toSharedReview({ verdict: r.r_verdict, reminders: r.r_reminders, comment: r.r_comment, source: r.r_source, created_at: r.r_created_at, corrected_at: r.r_corrected_at }) : null,
+    review: r.r_created_at ? toSharedReview({ verdict: r.r_verdict, reminders: r.r_reminders, comment: r.r_comment, source: r.r_source, created_at: r.r_created_at, corrected_at: r.r_corrected_at }) : null,
   }));
 }
 
 /** The CURRENT review of his session (the one on its primary recording): a corrected verdict is the new one. null = none yet. */
 async function loadSharedReview(c: Ctx, sessionId: string): Promise<ApiSharedReview | null> {
-  const r = await queryOne<{ verdict: Verdict | null; reminders: string[] | null; comment: string | null; source: "manual" | "claude"; created_at: Date; corrected_at: Date | null }>(
+  const r = await queryOne<{ verdict: Verdict | null; reminders: string[] | null; comment: string | null; source: string | null; created_at: Date; corrected_at: Date | null }>(
     `select r.verdict, r.reminders, r.comment, r.source, r.created_at, ${CORRECTED_AT} as corrected_at
        from activities a
        join planned_sessions ps on ps.id = a.session_id
