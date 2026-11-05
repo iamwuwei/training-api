@@ -194,8 +194,7 @@ aws cognito-idp admin-set-user-password --user-pool-id $POOL --username you@exam
 - `DELETE <ApiUrl>/me/strava` → `{ ok: true }`：解除 Strava 連結。會先向 Strava 撤銷授權（失敗也照刪），再刪掉 `strava_connections` 那列；已匯入的 activities 保留。
 - `GET <ApiUrl>/plan` → `PlanResponse { plan, weeks, sessions, activities, unassigned }`：active plan、每週階段/重點、未 superseded 的 sessions（含原始 `label`、`content`、`target` 原文、配速/心拍上下限、`week_no`、`phase`；另含補課留下的「已改期」列〔superseded 但有 `moved_to_session_id`〕，每列都有 `counts_in_week_no`＝這列的計畫 km／堂數／活動算在哪一週，補課新列有 `moved_from_date`）、已對應的 activities、`unassigned`（最近 45 天還沒對應的活動，任何運動）（含 `review`、最高心拍、功率、卡路里、鞋、裝置、天氣、每公里分段）。
 - `GET <ApiUrl>/activities?status=unplanned` → `ActivitiesResponse`（所有運動；不會自動配對，`unplanned` 是等使用者選的），`status` 可為 `auto | confirmed | unplanned | ignored`，省略則全部。
-- `PUT <ApiUrl>/activities/{id}/review` body `PutReviewRequest { verdict, comment?, reminders?, rpe? }` → 手動判定，會覆蓋 Claude 的。
-- `POST <ApiUrl>/activities/{id}/rereview` → 刪掉 Claude 判定、丟回 SQS 重評（202）。沒有對應課表或有手動判定回 409。
+- `POST <ApiUrl>/activities/{id}/rereview` → 刪掉 Claude 判定、丟回 SQS 重評（202）。沒有對應課表回 409。
 - `GET <ApiUrl>/weekly` → `WeeklyResponse { reviews }`：每週總結（最新在前）與調整建議，每條建議有 `status: pending | applied | dismissed`。
 - `POST <ApiUrl>/weekly/{id}/adjustments/{index}` body `{ action: "apply" | "dismiss" }` → 採用會新增一筆 `version+1` 的 planned_session、舊的標 `superseded`、活動跟著搬；`/plan` 立刻反映。
 - `GET <ApiUrl>/coach?limit=10&before=<訊息 id>` → `CoachResponse { coach: { name: "Woo" }, messages, has_more }`：教練的對話串，一頁 `limit` 則（預設 10、最多 100，舊在前）；帶 `before` 回那則之前的一頁（keyset：`created_at` + `id`）。`limit` 或 `before` 不合法、`before` 不是自己的訊息都回 400。等回覆的訊息帶 `stage`（`preparing`／`thinking`／`searching`／`writing`／`reading`／`judging`，worker 邊做邊寫進 `coach_messages.meta`），回覆寫入後就是 null。週總結和每次判定由系統貼進來；跑者的訊息 `pending` 直到 Woo 回覆、失敗是 `failed`。
@@ -217,7 +216,7 @@ aws cognito-idp admin-set-user-password --user-pool-id $POOL --username you@exam
 
 ## 判定（reviews）
 
-- 來源兩種：`source = 'claude'`（worker 在 `AUTO_REVIEW=true` 且活動已被使用者對應到課表時寫，每筆 activity 只寫一次，不覆蓋既有）、`source = 'manual'`（`PUT …/review`，或 seed 從 xlsx V/L/W 欄帶入）。手動永遠贏。
+- 來源：`source = 'claude'`（worker 在 `AUTO_REVIEW=true` 且活動已被使用者對應到課表時寫，每筆 activity 只寫一次，不覆蓋既有；seed 從 xlsx V/L/W 欄帶入的也寫 `claude`）。沒有手動判定的 route 了（`PUT …/review` 已移除）；`manual` 只剩 schema 預設值與舊資料，`npm run migrate` 會把既有的 `manual` 改成 `claude`。群組分享判定的 comment／reminders 只給 `claude`（白名單）。
 - `verdict` 只有 `達成 / 達成但有提醒 / 未達成`；「跳過」是課表層級的狀態，前端用「過去的 session 沒有配對 activity」自己判斷。
 - 天氣沒有自動來源：`activities.weather` 只在 seed 帶歷史值，之後為 null，前端沒值就不顯示。
 

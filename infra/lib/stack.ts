@@ -254,7 +254,6 @@ export class TrainingApiStack extends cdk.Stack {
       ["/plan", [apigw.HttpMethod.GET]],
       ["/activities", [apigw.HttpMethod.GET]],
       ["/activities/detail-options", [apigw.HttpMethod.GET]],
-      ["/activities/{id}/review", [apigw.HttpMethod.PUT]],
       ["/activities/{id}/session", [apigw.HttpMethod.PUT]],
       ["/activities/{id}/memo", [apigw.HttpMethod.PUT]],
       ["/activities/{id}/details", [apigw.HttpMethod.PUT]],
@@ -272,6 +271,19 @@ export class TrainingApiStack extends cdk.Stack {
       ["/coach/checkins/{id}/reset", [apigw.HttpMethod.POST]],
       ["/coach/messages", [apigw.HttpMethod.POST]],
       ["/sessions/{id}/routine", [apigw.HttpMethod.POST, apigw.HttpMethod.PUT]],
+      // group-race
+      ["/groups", [apigw.HttpMethod.GET, apigw.HttpMethod.POST]],
+      ["/groups/{id}", [apigw.HttpMethod.GET, apigw.HttpMethod.DELETE]],
+      ["/groups/{id}/invite", [apigw.HttpMethod.POST, apigw.HttpMethod.DELETE]],
+      ["/groups/{id}/leave", [apigw.HttpMethod.POST]],
+      ["/groups/{id}/members/{mid}/remove", [apigw.HttpMethod.POST]],
+      ["/groups/{id}/members/{mid}/plan", [apigw.HttpMethod.GET]],
+      ["/groups/{id}/events", [apigw.HttpMethod.GET]],
+      ["/groups/{id}/events/{eid}", [apigw.HttpMethod.GET]],
+      ["/groups/{id}/seen", [apigw.HttpMethod.PUT]],
+      ["/invites/{token}", [apigw.HttpMethod.GET]],
+      ["/invites/{token}/accept", [apigw.HttpMethod.POST]],
+      ["/me/share", [apigw.HttpMethod.GET, apigw.HttpMethod.PUT]],
     ] as const) {
       httpApi.addRoutes({ path: p, methods: [...methods], integration, authorizer });
     }

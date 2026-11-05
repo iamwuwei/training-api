@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import { query, queryOne } from "./db";
+import { recordSessionDone } from "./group-events";
 import { isRunSport } from "./labels";
 import { mergeSplits } from "./splits";
 import type { StravaSplit } from "../types";
@@ -317,6 +318,23 @@ export async function writeNotQueuedReview(userId: string, sessionId: string): P
 }
 
 /**
+ * group-race 消息中心, for the binding paths that reach no re-judge at once: a check-in chip pick (the verdict waits for the
+ * athlete's answer to Woo's feel question) and 是，就是這趟 after a chip. The fact "he finished this session" is the binding, not the
+ * verdict, so it is recorded here, at the binding. Same single exit as requeueReview's (recordSessionDone: once per group and
+ * session, never throws). The activity's session may be none (nothing happens).
+ */
+export async function recordBinding(userId: string, activityId: string): Promise<void> {
+  try {
+    const act = await queryOne<{ session_id: string | null }>("select session_id from activities where id = $1 and user_id = $2", [activityId, userId]);
+    if (!act?.session_id) return;
+    const primary = (await loadGroup(userId, act.session_id))[0];
+    if (primary) await recordSessionDone(userId, act.session_id, primary.id);
+  } catch (err) {
+    console.error(`group event for activity ${activityId} not written`, err instanceof Error ? err.message : err);
+  }
+}
+
+/**
  * Have the worker write a new Claude review for the session `activityId` belongs to: the same fake Strava "update"
  * event the api always sent, for the group's PRIMARY activity (the worker reviews the whole session when it gets
  * the primary's event, and ignores any other segment's). Returns whether one was queued. Nothing is sent (false) when
@@ -330,6 +348,10 @@ export async function requeueReview(userId: string, activityId: string, reason: 
   const group = await loadGroup(userId, act.session_id);
   const primary = group[0];
   if (!primary) return false;
+  // group-race 消息中心: every in-app binding of an activity to a session gets here, so this is where "he finished the session"
+  // is recorded — once per group and session (a re-judge, a second segment write nothing more). Before the day's cap:
+  // the cap limits verdicts, not the fact. One SQL, never throws, no retry, no queue message.
+  await recordSessionDone(userId, act.session_id, primary.id);
   const conn = await queryOne<{ strava_athlete_id: string }>("select strava_athlete_id from strava_connections where user_id = $1", [userId]);
   if (!conn) return false;
   if (await reviewLimitReached(userId)) {
