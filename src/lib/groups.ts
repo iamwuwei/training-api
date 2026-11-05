@@ -314,7 +314,7 @@ export async function leaveGroup(userId: string, groupId: string): Promise<"ok" 
   });
 }
 
-/** Owner removes a member (`mid` is a group_members.id of THIS group). Same effect and event as leaving. */
+/** Owner removes a member (`mid` is a group_members.id of THIS group). Same effect and event as leaving, and the live invite is revoked with it. */
 export async function removeMember(ownerId: string, groupId: string, memberId: string): Promise<"ok" | "not_member" | "not_owner" | "not_found" | "self"> {
   const mine = await membership(ownerId, groupId);
   if (!mine) return "not_member";
@@ -334,6 +334,10 @@ export async function removeMember(ownerId: string, groupId: string, memberId: s
     );
     if (!hit.length) return "not_found" as const;
     await recordMembership(q, groupId, target.id, "left");
+    // Removing is not blocking unless the way back is closed: the removed person still holds the link he came in with. The group's live
+    // invite is revoked in the same transaction (the group row is already locked); the owner makes a new link when he wants one.
+    // Anyone using the old link then gets exactly what any revoked link gets (409 revoked / preview "revoked"). leave does not do this.
+    await q("update group_invites set revoked_at = now() where group_id = $1 and revoked_at is null", [groupId]);
     return "ok" as const;
   });
 }
