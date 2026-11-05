@@ -313,19 +313,6 @@ export interface PutSessionResponse {
   activity: ApiActivity;
 }
 
-// ---- PUT <ApiUrl>/activities/{id}/review ---------------------------------------
-
-/** Manual verdict; replaces any existing (manual or claude) review. */
-export interface PutReviewRequest {
-  verdict: Verdict | null;
-  comment?: string | null;
-  reminders?: string[];
-}
-
-export interface PutReviewResponse {
-  review: ApiReview;
-}
-
 // ---- PUT <ApiUrl>/activities/{id}/memo -----------------------------------------
 // The athlete's own note after a session. If the activity's review was written
 // by Claude it is regenerated with the memo as input (arrives a few seconds

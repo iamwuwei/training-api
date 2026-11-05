@@ -196,14 +196,14 @@ async function main() {
          where id = $1`,
         [activity.id, r.weather, r.shoes, r.device, r.memo],
       );
-      // V 判定 / W 提醒 are the coach side -> reviews (manual wins over claude)
+      // V 判定 / W 提醒 are the coach side -> reviews (written as claude like every verdict: there is no manual review any more)
       if (r.verdict || r.reminders.length) {
         await query(
           `insert into reviews (id, activity_id, verdict, comment, reminders, source, model)
-           values ($1, $2, $3, null, $4, 'manual', null)
+           values ($1, $2, $3, null, $4, 'claude', null)
            on conflict (activity_id) do update set
              verdict = excluded.verdict, reminders = excluded.reminders,
-             source = 'manual', model = null`,
+             source = 'claude', model = null`,
           [randomUUID(), activity.id, r.verdict, JSON.stringify(r.reminders)],
         );
         attached++;

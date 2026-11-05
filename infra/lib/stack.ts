@@ -254,7 +254,6 @@ export class TrainingApiStack extends cdk.Stack {
       ["/plan", [apigw.HttpMethod.GET]],
       ["/activities", [apigw.HttpMethod.GET]],
       ["/activities/detail-options", [apigw.HttpMethod.GET]],
-      ["/activities/{id}/review", [apigw.HttpMethod.PUT]],
       ["/activities/{id}/session", [apigw.HttpMethod.PUT]],
       ["/activities/{id}/memo", [apigw.HttpMethod.PUT]],
       ["/activities/{id}/details", [apigw.HttpMethod.PUT]],
