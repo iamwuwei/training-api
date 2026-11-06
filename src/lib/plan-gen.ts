@@ -51,8 +51,18 @@ export const daysBetween = (from: string, to: string) => Math.round((Date.parse(
 const mondayOf = (iso: string) => addDays(iso, -((weekdayOf(iso) + 6) % 7));
 export const mmss = (sec: number) => `${Math.floor(sec / 60)}:${String(Math.round(sec) % 60).padStart(2, "0")}`;
 
-/** Characters that hide text, written as escapes so no editor can swallow them: C0/C1 controls other than whitespace (\u0009-\u000d, \u0085), the Arabic letter mark \u061c, zero-width and direction marks \u200b-\u200f, bidi overrides \u202a-\u202e, word joiner \u2060, bidi isolates \u2066-\u2069. */
-const HIDDEN = /[\u0000-\u0008\u000e-\u001f\u007f-\u0084\u0086-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069]/g;
+/**
+ * Characters that hide text, as ONE regex of escapes (the `u` flag is what makes \p{...} and \u{...} work; never paste the characters themselves):
+ *  - every Unicode Default_Ignorable_Code_Point: soft hyphen \u00ad, combining grapheme joiner \u034f, Arabic letter mark \u061c, Hangul fillers
+ *    \u115f \u1160 \u3164 \uffa0, Mongolian selectors \u180b-\u180f, zero-width and direction marks \u200b-\u200f, bidi overrides \u202a-\u202e,
+ *    word joiner / invisible operators / the deprecated format controls \u2060-\u206f (bidi isolates \u2066-\u2069 are in there), variation selectors
+ *    \ufe00-\ufe0f and \u{e0100}-\u{e01ef}, BOM \ufeff, the Unicode "tag" block \u{e0000}-\u{e007f} (invisible ASCII smuggling);
+ *  - C0/C1 controls other than whitespace (\u0009-\u000d and \u0085 are handled as whitespace by oneLine);
+ *  - the interlinear annotation marks \ufff9-\ufffb, which are not default-ignorable but hide text the same way.
+ * Everything the athlete or the model writes goes through oneLine below.
+ * Side effect, accepted: a ZWJ emoji sequence falls apart into its parts and an emoji loses its \ufe0f; CJK text and plain emoji are untouched.
+ */
+const HIDDEN = /[\p{Default_Ignorable_Code_Point}\u0000-\u0008\u000e-\u001f\u007f-\u0084\u0086-\u009f\ufff9-\ufffb]/gu;
 /** One line of plain text from anything the athlete or the model wrote: no hiding characters, every kind of line break and run of whitespace one space. */
 export function oneLine(v: unknown): string {
   return typeof v === "string" ? v.replace(HIDDEN, "").replace(/[\s\u0085]+/g, " ").trim() : "";
@@ -60,7 +70,8 @@ export function oneLine(v: unknown): string {
 const MD = /[*`#><]/g;
 const URL_RE = /https?:\/\/\S+/gi;
 /** A model string as it may be stored and shown: one line, no markdown characters, no links. */
-export const modelText = (v: unknown): string => oneLine(typeof v === "string" ? v.replace(URL_RE, "") : v).replace(MD, "").replace(/ {2,}/g, " ").trim();
+// hidden characters first, then the link: "ht\u00adtps://x" must not slip past the link filter
+export const modelText = (v: unknown): string => oneLine(v).replace(URL_RE, "").replace(MD, "").replace(/ {2,}/g, " ").trim();
 const chars = (s: string) => [...s].length;
 const clip = (s: string, n: number) => (chars(s) > n ? [...s].slice(0, n).join("") : s);
 
@@ -380,14 +391,25 @@ export async function sendPlanGenJob(job: PlanGenJob): Promise<void> {
 
 const DRAFT_SELECT = "select * from plan_drafts";
 
-/** The status the app sees: a ready draft older than 7 days is expired, a pending one nobody touched for 15 minutes is a stalled failure. */
-export function effectiveState(d: Pick<PlanDraftRow, "status" | "error_code" | "updated_at" | "intake">, now: Date): { status: PlanDraftRow["status"]; error_code: PlanDraftRow["error_code"] } {
+/** 'YYYY-MM-DD' of an instant in JST. */
+const jstDate = (d: Date) => new Date(d.getTime() + 9 * 3600e3).toISOString().slice(0, 10);
+
+/**
+ * The status the app sees (the ONE place that decides it):
+ *  - a ready draft older than 7 days, or whose start day is over (JST), is expired (a preview of a plan that began in the past);
+ *  - a pending one nobody touched for 15 minutes is a stalled failure;
+ *  - a failed (or stalled) draft is only worth continuing on the day it was made, and while its start day is not over: otherwise expired.
+ *    That is what keeps "36 model calls a person a day" true: 「繼續」 spends on the day's own 3 drafts, never on an old pile of failed ones.
+ */
+export function effectiveState(d: Pick<PlanDraftRow, "status" | "error_code" | "updated_at" | "intake" | "created_at">, now: Date): { status: PlanDraftRow["status"]; error_code: PlanDraftRow["error_code"] } {
   const idle = now.getTime() - new Date(d.updated_at).getTime();
-  if (d.status === "ready" && idle > PLAN_GEN_READY_TTL_DAYS * 86_400_000) return { status: "expired", error_code: d.error_code };
-  // The plan starts on start_date: once that day is over (JST) the preview is a plan that began in the past, so it is expired like an old one
-  // (adopt answers 409 "draft is expired"; the app already has that screen). Starting today is still fine.
-  if (d.status === "ready" && d.intake?.start_date && d.intake.start_date < new Date(now.getTime() + 9 * 3600e3).toISOString().slice(0, 10)) return { status: "expired", error_code: d.error_code };
-  if (d.status === "pending" && idle > PLAN_GEN_STALL_MIN * 60_000) return { status: "failed", error_code: "stalled" };
+  const startOver = !!d.intake?.start_date && d.intake.start_date < jstDate(now);
+  if (d.status === "ready" && (idle > PLAN_GEN_READY_TTL_DAYS * 86_400_000 || startOver)) return { status: "expired", error_code: d.error_code };
+  const failed = d.status === "failed" || (d.status === "pending" && idle > PLAN_GEN_STALL_MIN * 60_000);
+  if (failed) {
+    if (startOver || jstDate(new Date(d.created_at)) !== jstDate(now)) return { status: "expired", error_code: d.error_code };
+    return { status: "failed", error_code: d.status === "failed" ? d.error_code : "stalled" };
+  }
   return { status: d.status, error_code: d.error_code };
 }
 
@@ -402,8 +424,11 @@ export async function createDraft(userId: string, intake: PlanIntake, today: str
     // A pending draft nobody touched for PLAN_GEN_STALL_MIN minutes is what the app already shows as "stalled": its job was lost. It must not
     // block a new one for ever (a stalled draft with no calls or no resumes left has no way out). Discarded, not failed: a failed one could still be
     // resumed next to the new draft, and one user would have two pending rows. It still counts in today's drafts.
+    // `for update skip locked`: this transaction holds the user's lock and must not also wait for a draft row, because adoptDraft holds a row and then
+    // waits for the user's lock (a wait in a circle = 40P01, a 500). A draft someone else is holding is simply left; it then counts as pending below.
     await q(
-      "update plan_drafts set status = 'discarded', updated_at = now() where user_id = $1 and status = 'pending' and updated_at < now() - make_interval(mins => $2)",
+      `update plan_drafts set status = 'discarded', updated_at = now()
+        where id in (select id from plan_drafts where user_id = $1 and status = 'pending' and updated_at < now() - make_interval(mins => $2) for update skip locked)`,
       [userId, PLAN_GEN_STALL_MIN],
     );
     if (!(await hasHistorySource(q, userId))) return { ok: false, status: 409, error: "strava not connected" };
@@ -438,25 +463,42 @@ export async function loadDraft(userId: string, id: string, now = new Date(Date.
 export async function loadLatestDraft(userId: string, now = new Date(Date.now())): Promise<PlanDraftRow | undefined> {
   const d = await queryOne<PlanDraftRow>(`${DRAFT_SELECT} where user_id = $1 and status in ('pending', 'ready', 'failed') order by created_at desc limit 1`, [userId]);
   if (!d) return undefined;
-  if (d.status === "ready" && effectiveState(d, now).status === "expired") {
-    await query("update plan_drafts set status = 'expired' where id = $1 and user_id = $2 and status = 'ready'", [d.id, userId]);
-    return undefined;
+  if (effectiveState(d, now).status === "expired") {
+    if (d.status === "ready") await query("update plan_drafts set status = 'expired' where id = $1 and user_id = $2 and status = 'ready'", [d.id, userId]);
+    return undefined; // an expired one is not worth showing (a failed one from an earlier day included)
   }
   return d;
 }
 
 export type ResumeResult =
   | { ok: true; draft: PlanDraftRow; job: PlanGenJob }
-  | { ok: false; status: 404 | 409; error: string };
+  | { ok: false; status: 404 | 409; error: string; draft_id?: string };
 
+/**
+ * 「繼續」. Like createDraft it works under the user's lock, so "one draft at a time" and "3 drafts a day" hold here too:
+ * only a failed draft made today whose start day is not over (effectiveState says so), only while nothing else of his is pending,
+ * and only while he has no plan in progress. Lock order: this draft's row, then the user's advisory lock (the order adoptDraft uses);
+ * createDraft takes the advisory lock first but never waits for a row (skip locked), so the three cannot wait for each other in a circle.
+ */
 export async function resumeDraft(userId: string, id: string, now = new Date(Date.now())): Promise<ResumeResult> {
   return withTransaction(async (q): Promise<ResumeResult> => {
     const [d] = await q<PlanDraftRow>(`${DRAFT_SELECT} where id = $1 and user_id = $2 for update`, [id, userId]);
     if (!d) return { ok: false, status: 404, error: "draft not found" };
+    await q("select pg_advisory_xact_lock(hashtext($1))", [`plan-draft:${userId}`]);
     const state = effectiveState(d, now);
     if (state.status !== "failed") return { ok: false, status: 409, error: `draft is ${state.status}` };
     if (d.calls >= PLAN_GEN_MAX_CALLS) return { ok: false, status: 409, error: "calls exhausted" };
     if (d.resumes >= PLAN_GEN_MAX_RESUMES) return { ok: false, status: 409, error: "resume limit" };
+    // Another stalled draft of his is dead (as createDraft treats it); a live one means he already has a draft being written.
+    await q(
+      `update plan_drafts set status = 'discarded', updated_at = now()
+        where id in (select id from plan_drafts where user_id = $1 and id <> $2 and status = 'pending' and updated_at < now() - make_interval(mins => $3) for update skip locked)`,
+      [userId, id, PLAN_GEN_STALL_MIN],
+    );
+    const [other] = await q<{ id: string }>("select id from plan_drafts where user_id = $1 and status = 'pending' and id <> $2 limit 1", [userId, id]);
+    if (other) return { ok: false, status: 409, error: "generating", draft_id: other.id };
+    const [active] = await q<{ id: string }>("select id from plans where user_id = $1 and status = 'active' and race_date >= $2 limit 1", [userId, jstDate(now)]);
+    if (active) return { ok: false, status: 409, error: "has active plan" };
     const job = stepJob(d);
     if (!job) return { ok: false, status: 409, error: "draft is failed" };
     const [next] = await q<PlanDraftRow>(
