@@ -1784,7 +1784,7 @@ async function adoptPlanDraft(userId: string, id: string) {
 async function resumePlanDraft(userId: string, id: string) {
   if (!UUID_RE.test(id)) return draftNotFound();
   const r = await resumeDraft(userId, id);
-  if (!r.ok) return r.status === 404 ? draftNotFound() : json(409, { error: r.error });
+  if (!r.ok) return r.status === 404 ? draftNotFound() : json<ErrorResponse>(409, (r.draft_id ? { error: r.error, draft_id: r.draft_id } : { error: r.error }) as ErrorResponse); // generating also carries draft_id, as POST /plan-drafts does
   if (!(await queueOrFail(r.job))) return json(500, { error: "伺服器錯誤" });
   return json<PlanDraftResponse>(202, { draft: toApiDraft(r.draft, new Date(Date.now())) });
 }
