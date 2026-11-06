@@ -1758,18 +1758,18 @@ async function postPlanDraft(userId: string, raw: string) {
   if (!made.ok) return json<ErrorResponse>(made.status, (made.draft_id ? { error: made.error, draft_id: made.draft_id } : { error: made.error }) as ErrorResponse);
   const job = stepJob(made.draft)!;
   if (!(await queueOrFail(job))) return json(500, { error: "伺服器錯誤" });
-  return json<PlanDraftResponse>(202, { draft: toApiDraft(made.draft, new Date()) });
+  return json<PlanDraftResponse>(202, { draft: toApiDraft(made.draft, new Date(Date.now())) });
 }
 
 async function getLatestPlanDraft(userId: string) {
   const d = await loadLatestDraft(userId);
-  return json<LatestPlanDraftResponse>(200, { draft: d ? toApiDraft(d, new Date()) : null });
+  return json<LatestPlanDraftResponse>(200, { draft: d ? toApiDraft(d, new Date(Date.now())) : null });
 }
 
 async function getPlanDraft(userId: string, id: string) {
   if (!UUID_RE.test(id)) return draftNotFound();
   const d = await loadDraft(userId, id);
-  return d ? json<PlanDraftResponse>(200, { draft: toApiDraft(d, new Date()) }) : draftNotFound();
+  return d ? json<PlanDraftResponse>(200, { draft: toApiDraft(d, new Date(Date.now())) }) : draftNotFound();
 }
 
 async function adoptPlanDraft(userId: string, id: string) {
@@ -1786,7 +1786,7 @@ async function resumePlanDraft(userId: string, id: string) {
   const r = await resumeDraft(userId, id);
   if (!r.ok) return r.status === 404 ? draftNotFound() : json(409, { error: r.error });
   if (!(await queueOrFail(r.job))) return json(500, { error: "伺服器錯誤" });
-  return json<PlanDraftResponse>(202, { draft: toApiDraft(r.draft, new Date()) });
+  return json<PlanDraftResponse>(202, { draft: toApiDraft(r.draft, new Date(Date.now())) });
 }
 
 async function discardPlanDraft(userId: string, id: string) {

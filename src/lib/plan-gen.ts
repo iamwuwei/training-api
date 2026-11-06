@@ -425,7 +425,7 @@ export async function createDraft(userId: string, intake: PlanIntake, today: str
 }
 
 /** The user's own draft, expired ones written back as expired. Someone else's id and an unknown id are the same answer: undefined. */
-export async function loadDraft(userId: string, id: string, now = new Date()): Promise<PlanDraftRow | undefined> {
+export async function loadDraft(userId: string, id: string, now = new Date(Date.now())): Promise<PlanDraftRow | undefined> {
   const d = await queryOne<PlanDraftRow>(`${DRAFT_SELECT} where id = $1 and user_id = $2`, [id, userId]);
   if (d && d.status === "ready" && effectiveState(d, now).status === "expired") {
     await query("update plan_drafts set status = 'expired' where id = $1 and user_id = $2 and status = 'ready'", [id, userId]); // updated_at stays: it is when the draft was ready
@@ -435,7 +435,7 @@ export async function loadDraft(userId: string, id: string, now = new Date()): P
 }
 
 /** The newest pending / ready / failed draft, or undefined when there is none worth showing (an expired one is not). */
-export async function loadLatestDraft(userId: string, now = new Date()): Promise<PlanDraftRow | undefined> {
+export async function loadLatestDraft(userId: string, now = new Date(Date.now())): Promise<PlanDraftRow | undefined> {
   const d = await queryOne<PlanDraftRow>(`${DRAFT_SELECT} where user_id = $1 and status in ('pending', 'ready', 'failed') order by created_at desc limit 1`, [userId]);
   if (!d) return undefined;
   if (d.status === "ready" && effectiveState(d, now).status === "expired") {
@@ -449,7 +449,7 @@ export type ResumeResult =
   | { ok: true; draft: PlanDraftRow; job: PlanGenJob }
   | { ok: false; status: 404 | 409; error: string };
 
-export async function resumeDraft(userId: string, id: string, now = new Date()): Promise<ResumeResult> {
+export async function resumeDraft(userId: string, id: string, now = new Date(Date.now())): Promise<ResumeResult> {
   return withTransaction(async (q): Promise<ResumeResult> => {
     const [d] = await q<PlanDraftRow>(`${DRAFT_SELECT} where id = $1 and user_id = $2 for update`, [id, userId]);
     if (!d) return { ok: false, status: 404, error: "draft not found" };
@@ -506,7 +506,7 @@ export type AdoptResult = { ok: true; plan_id: string } | { ok: false; status: 4
  * weeks and every day are inserted, the fixed rest weekdays become constraints (once), the draft becomes `adopted`. Nothing is deleted
  * (group_events point at planned_sessions). Adopting an adopted draft again answers the same plan id.
  */
-export async function adoptDraft(d: Pick<PlanDraftRow, "id" | "user_id">, today: string, now = new Date()): Promise<AdoptResult> {
+export async function adoptDraft(d: Pick<PlanDraftRow, "id" | "user_id">, today: string, now = new Date(Date.now())): Promise<AdoptResult> {
   return withTransaction(async (q): Promise<AdoptResult> => {
     await q("set local lock_timeout = '5s'");
     let locked: PlanDraftRow | undefined;
