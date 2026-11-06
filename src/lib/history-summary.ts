@@ -10,7 +10,7 @@ import type { AthleteProfile } from "../types";
 // every place that needs his history — the skeleton prompt, the chunks, the flags, GET /plan-drafts' `profile` — calls
 // loadHistorySummary(). It first asks syncHistory() to make sure the table is fresh (today: importStravaHistory, one file that
 // talks to Strava), then computes the summary from `activities` with plain SQL + TS: 0 model calls. plan-gen*.ts and this file
-// never name a Strava table, column or call (reviewer: grep strava_activity_id|strava_connections|getActivities).
+// never name a Strava table, column or API call (the reviewer greps both for the Strava table names and the list call).
 //
 // Future work, NOT done here (01b §2.6): a second source (Apple Health) means `activities` gets a source + external id, the
 // connection table becomes per-source, history-import-health.ts joins history-import-strava.ts and syncHistory() dispatches on
