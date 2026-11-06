@@ -1754,6 +1754,7 @@ async function postPlanDraft(userId: string, raw: string) {
   const limit = parseDailyLimit(process.env.PLAN_GEN_DAILY_LIMIT);
   if (limit === 0) return json(503, { error: "plan generation is off" });
   const made = await createDraft(userId, intake, today, limit);
+  // 409 generating also carries draft_id (01b §4c); ErrorResponse has only `error`, and types/api.ts is not touched for it, so the cast is deliberate.
   if (!made.ok) return json<ErrorResponse>(made.status, (made.draft_id ? { error: made.error, draft_id: made.draft_id } : { error: made.error }) as ErrorResponse);
   const job = stepJob(made.draft)!;
   if (!(await queueOrFail(job))) return json(500, { error: "伺服器錯誤" });

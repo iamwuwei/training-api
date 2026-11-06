@@ -51,8 +51,8 @@ export const daysBetween = (from: string, to: string) => Math.round((Date.parse(
 const mondayOf = (iso: string) => addDays(iso, -((weekdayOf(iso) + 6) % 7));
 export const mmss = (sec: number) => `${Math.floor(sec / 60)}:${String(Math.round(sec) % 60).padStart(2, "0")}`;
 
-/** Characters that hide text: C0/C1 controls other than whitespace, bidi overrides and isolates, zero-width. */
-const HIDDEN = /[\u0000-\u0008\u000e-\u001f\u007f-\u0084\u0086-\u009f​-‏‪-‮⁠⁦-⁩]/g;
+/** Characters that hide text, written as escapes so no editor can swallow them: C0/C1 controls other than whitespace (\u0009-\u000d, \u0085), the Arabic letter mark \u061c, zero-width and direction marks \u200b-\u200f, bidi overrides \u202a-\u202e, word joiner \u2060, bidi isolates \u2066-\u2069. */
+const HIDDEN = /[\u0000-\u0008\u000e-\u001f\u007f-\u0084\u0086-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069]/g;
 /** One line of plain text from anything the athlete or the model wrote: no hiding characters, every kind of line break and run of whitespace one space. */
 export function oneLine(v: unknown): string {
   return typeof v === "string" ? v.replace(HIDDEN, "").replace(/[\s\u0085]+/g, " ").trim() : "";
@@ -256,7 +256,7 @@ export function validateChunk(raw: unknown, ctx: ChunkContext): DraftSession[] |
     const rest = type === "rest";
     out.push({
       date, type: type as SessionType, label: clip(label, DRAFT_LIMITS.label), content: clip(content, DRAFT_LIMITS.content), note: note || null,
-      distance_m: rest || distance === 0 ? null : distance,
+      distance_m: rest || distance === 0 ? null : type === "race" ? ctx.raceDistance : distance, // the race is the race's distance (01b §3d), not the model's +-1%
       pace_min_sec_km: rest || !pMin ? null : pMin, pace_max_sec_km: rest || !pMax ? null : pMax,
       hr_min: rest || !hMin ? null : hMin, hr_max: rest || !hMax ? null : hMax,
       week_no: week.week_no,
