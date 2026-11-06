@@ -28,19 +28,19 @@ export const CHUNK_MAX_TOKENS = 6000;
 type FailCode = "model_failed" | "validation_failed" | "calls_exhausted";
 
 /** Take one of the draft's calls. false = none left (calls_exhausted) or the draft is not pending any more. */
-export async function spendCall(draftId: string): Promise<"ok" | "exhausted" | "gone"> {
+export async function spendCall(draftId: string, userId: string): Promise<"ok" | "exhausted" | "gone"> {
   const rows = await query<{ calls: number }>(
-    "update plan_drafts set calls = calls + 1, updated_at = now() where id = $1 and status = 'pending' and calls < $2 returning calls",
-    [draftId, PLAN_GEN_MAX_CALLS],
+    "update plan_drafts set calls = calls + 1, updated_at = now() where id = $1 and user_id = $3 and status = 'pending' and calls < $2 returning calls",
+    [draftId, PLAN_GEN_MAX_CALLS, userId],
   );
   if (rows.length) return "ok";
-  const d = await queryOne<{ status: string }>("select status from plan_drafts where id = $1", [draftId]);
+  const d = await queryOne<{ status: string }>("select status from plan_drafts where id = $1 and user_id = $2", [draftId, userId]);
   return d?.status === "pending" ? "exhausted" : "gone";
 }
 
-export async function failDraft(id: string, code: FailCode, detail: string): Promise<void> {
+export async function failDraft(id: string, userId: string, code: FailCode, detail: string): Promise<void> {
   console.warn(`plan_gen draft ${id} failed: ${code}: ${detail.slice(0, 300)}`);
-  await query("update plan_drafts set status = 'failed', error_code = $2, last_error = $3, updated_at = now() where id = $1 and status = 'pending'", [id, code, detail.slice(0, 500)]);
+  await query("update plan_drafts set status = 'failed', error_code = $2, last_error = $3, updated_at = now() where id = $1 and user_id = $4 and status = 'pending'", [id, code, detail.slice(0, 500), userId]);
 }
 
 /** One structured-output call. `data` is undefined when the answer was not JSON (cut off at max_tokens): the caller treats that as a failed check. Provider errors throw. */
@@ -71,31 +71,31 @@ export async function askModel(user: string, schema: Record<string, unknown>, ma
  * model errors, the checks fail twice, the draft has no calls left, or there is no time left in the Lambda for another call.
  */
 async function modelStep<T>(
-  draftId: string, started: number, user: string, schema: Record<string, unknown>, maxTokens: number, timeoutMs: number,
+  draftId: string, userId: string, started: number, user: string, schema: Record<string, unknown>, maxTokens: number, timeoutMs: number,
   validate: (raw: unknown) => T | string,
 ): Promise<{ value: T; model: string } | null> {
   let tail = "";
   let lastError = "";
   for (let attempt = 0; attempt <= PLAN_GEN_RETRY_PER_STEP; attempt++) {
     const left = STEP_BUDGET_MS - (Date.now() - started);
-    if (attempt > 0 && left < MIN_CALL_MS) { await failDraft(draftId, "validation_failed", `${lastError}; no time left to ask again`); return null; }
-    const spent = await spendCall(draftId);
+    if (attempt > 0 && left < MIN_CALL_MS) { await failDraft(draftId, userId, "validation_failed", `${lastError}; no time left to ask again`); return null; }
+    const spent = await spendCall(draftId, userId);
     if (spent === "gone") return null; // discarded while we worked
-    if (spent === "exhausted") { await failDraft(draftId, "calls_exhausted", "the draft has used all its calls"); return null; }
+    if (spent === "exhausted") { await failDraft(draftId, userId, "calls_exhausted", "the draft has used all its calls"); return null; }
     let answer;
     try {
       answer = await askModel(user + tail, schema, maxTokens, Math.min(timeoutMs, Math.max(left, MIN_CALL_MS)));
     } catch (err) {
-      await failDraft(draftId, "model_failed", err instanceof Error ? err.message : "model error");
+      await failDraft(draftId, userId, "model_failed", err instanceof Error ? err.message : "model error");
       return null;
     }
     const checked = answer.data === undefined ? (answer.note ?? "the answer was not valid JSON") : validate(answer.data);
     if (typeof checked !== "string") return { value: checked, model: answer.model };
     lastError = checked;
-    await query("update plan_drafts set last_error = $2 where id = $1 and status = 'pending'", [draftId, checked.slice(0, 500)]);
+    await query("update plan_drafts set last_error = $2 where id = $1 and user_id = $3 and status = 'pending'", [draftId, checked.slice(0, 500), userId]);
     tail = buildRetryTail(checked);
   }
-  await failDraft(draftId, "validation_failed", lastError);
+  await failDraft(draftId, userId, "validation_failed", lastError);
   return null;
 }
 
@@ -105,7 +105,7 @@ async function queueNext(d: Pick<PlanDraftRow, "id" | "user_id">, job: Omit<Plan
     await sendPlanGenJob({ type: "plan_gen", user_id: d.user_id, draft_id: d.id, ...job });
   } catch (err) {
     console.error(`plan_gen draft ${d.id}: could not queue ${job.step}`, err);
-    await markSendFailed(d.id);
+    await markSendFailed(d.id, d.user_id);
   }
 }
 
@@ -132,7 +132,7 @@ export async function runPlanGenStep(job: PlanGenJob): Promise<void> {
   const today = todayJst();
   if (step === "profile") {
     const profile = await loadHistorySummary(d.user_id, today);
-    const done = await query("update plan_drafts set profile = $2::jsonb, stage = 'skeleton', updated_at = now() where id = $1 and status = 'pending' and profile is null returning id", [d.id, JSON.stringify(profile)]);
+    const done = await query("update plan_drafts set profile = $2::jsonb, stage = 'skeleton', updated_at = now() where id = $1 and user_id = $3 and status = 'pending' and profile is null returning id", [d.id, JSON.stringify(profile), d.user_id]);
     if (done.length) await queueNext(d, { step: "skeleton" });
     return;
   }
@@ -143,11 +143,11 @@ export async function runPlanGenStep(job: PlanGenJob): Promise<void> {
   if (!d.profile) return; // unreachable: nextStep says profile first
 
   if (step === "skeleton") {
-    const made = await modelStep(d.id, started, buildSkeletonPrompt(d.intake, d.profile, constraints, weeks), SKELETON_SCHEMA, SKELETON_MAX_TOKENS, SKELETON_TIMEOUT_MS, (raw) => validateSkeleton(raw, weeks));
+    const made = await modelStep(d.id, d.user_id, started, buildSkeletonPrompt(d.intake, d.profile, constraints, weeks), SKELETON_SCHEMA, SKELETON_MAX_TOKENS, SKELETON_TIMEOUT_MS, (raw) => validateSkeleton(raw, weeks));
     if (!made) return;
     const done = await query(
-      "update plan_drafts set skeleton = $2::jsonb, chunks_total = $3, stage = 'chunk', model = $4, updated_at = now() where id = $1 and status = 'pending' and skeleton is null returning id",
-      [d.id, JSON.stringify(made.value), chunkRanges(made.value.weeks).length, made.model],
+      "update plan_drafts set skeleton = $2::jsonb, chunks_total = $3, stage = 'chunk', model = $4, updated_at = now() where id = $1 and user_id = $5 and status = 'pending' and skeleton is null returning id",
+      [d.id, JSON.stringify(made.value), chunkRanges(made.value.weeks).length, made.model, d.user_id],
     );
     if (done.length) await queueNext(d, { step: "chunk", chunk: 0 });
     return;
@@ -157,31 +157,31 @@ export async function runPlanGenStep(job: PlanGenJob): Promise<void> {
   const skeleton = d.skeleton!;
   const n = d.chunks_done;
   const range = chunkRanges(skeleton.weeks)[n];
-  if (!range) { await failDraft(d.id, "validation_failed", `chunk ${n} is not in the skeleton`); return; }
+  if (!range) { await failDraft(d.id, d.user_id, "validation_failed", `chunk ${n} is not in the skeleton`); return; }
   const mine = skeleton.weeks.filter((w) => w.week_no >= range.from && w.week_no <= range.to);
   const dates = dateRange(mine[0].week_start, mine[mine.length - 1].week_end);
   const ctx: ChunkContext = {
     dates, fixedRest: restDates(d.intake, constraints, dates), raceDate: goal.race_date, raceDistance: goal.distance_m,
     maxDistance: Math.max(45_000, goal.distance_m), weeks: mine,
   };
-  const made = await modelStep<DraftSession[]>(d.id, started, buildChunkPrompt(d.intake, d.profile, constraints, skeleton, skeleton.weeks, range, d.sessions), CHUNK_SCHEMA, CHUNK_MAX_TOKENS, CHUNK_TIMEOUT_MS, (raw) => validateChunk(raw, ctx));
+  const made = await modelStep<DraftSession[]>(d.id, d.user_id, started, buildChunkPrompt(d.intake, d.profile, constraints, skeleton, skeleton.weeks, range, d.sessions), CHUNK_SCHEMA, CHUNK_MAX_TOKENS, CHUNK_TIMEOUT_MS, (raw) => validateChunk(raw, ctx));
   if (!made) return;
 
   const last = n + 1 === d.chunks_total;
   if (!last) {
     const done = await query(
-      "update plan_drafts set sessions = sessions || $2::jsonb, chunks_done = chunks_done + 1, model = $4, updated_at = now() where id = $1 and status = 'pending' and chunks_done = $3 returning id",
-      [d.id, JSON.stringify(made.value), n, made.model],
+      "update plan_drafts set sessions = sessions || $2::jsonb, chunks_done = chunks_done + 1, model = $4, updated_at = now() where id = $1 and user_id = $5 and status = 'pending' and chunks_done = $3 returning id",
+      [d.id, JSON.stringify(made.value), n, made.model, d.user_id],
     );
     if (done.length) await queueNext(d, { step: "chunk", chunk: n + 1 });
     return;
   }
   const all = [...d.sessions, ...made.value];
   const totalDays = (Date.parse(`${goal.race_date}T00:00:00Z`) - Date.parse(`${d.intake.start_date}T00:00:00Z`)) / 86_400_000 + 1;
-  if (all.length !== totalDays) { await failDraft(d.id, "validation_failed", `${all.length} sessions for ${totalDays} days`); return; }
+  if (all.length !== totalDays) { await failDraft(d.id, d.user_id, "validation_failed", `${all.length} sessions for ${totalDays} days`); return; }
   const flags = computeDraftFlags(all, skeleton.weeks as DraftWeek[], d.intake, d.profile);
   await query(
-    "update plan_drafts set sessions = $2::jsonb, chunks_done = chunks_done + 1, flags = $3::jsonb, status = 'ready', stage = null, model = $5, updated_at = now() where id = $1 and status = 'pending' and chunks_done = $4",
-    [d.id, JSON.stringify(all), JSON.stringify(flags), n, made.model],
+    "update plan_drafts set sessions = $2::jsonb, chunks_done = chunks_done + 1, flags = $3::jsonb, status = 'ready', stage = null, model = $5, updated_at = now() where id = $1 and user_id = $6 and status = 'pending' and chunks_done = $4",
+    [d.id, JSON.stringify(all), JSON.stringify(flags), n, made.model, d.user_id],
   );
 }

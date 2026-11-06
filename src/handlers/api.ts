@@ -1738,7 +1738,7 @@ async function queueOrFail(job: Parameters<typeof sendPlanGenJob>[0]): Promise<b
     return true;
   } catch (err) {
     console.error(`plan_gen: could not queue ${job.step} for draft ${job.draft_id}`, err);
-    await markSendFailed(job.draft_id);
+    await markSendFailed(job.draft_id, job.user_id);
     return false;
   }
 }

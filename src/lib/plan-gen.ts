@@ -31,11 +31,13 @@ export const MAX_FLAGS = 60;
 export const MANY_FLAGS = 8;
 
 /** Unset = 3; "0" = the feature is off; a whole number = that cap. A bad value ("abc", "-1", "1.5") is 3, never "off" and never "unlimited". */
+let warnedLimit: string | undefined;
 export function parseDailyLimit(raw: string | undefined): number {
   if (raw === undefined) return PLAN_GEN_DAILY_LIMIT_DEFAULT;
   const n = Number(raw);
   if (raw.trim() === "" || !Number.isInteger(n) || n < 0 || n > 1000) {
-    console.warn(`PLAN_GEN_DAILY_LIMIT=${JSON.stringify(raw).slice(0, 40)} is not a whole number, using ${PLAN_GEN_DAILY_LIMIT_DEFAULT}`);
+    if (warnedLimit !== raw) console.warn(`PLAN_GEN_DAILY_LIMIT=${JSON.stringify(raw).slice(0, 40)} is not a whole number, using ${PLAN_GEN_DAILY_LIMIT_DEFAULT}`);
+    warnedLimit = raw;
     return PLAN_GEN_DAILY_LIMIT_DEFAULT;
   }
   return n;
@@ -409,7 +411,7 @@ export async function createDraft(userId: string, intake: PlanIntake, today: str
 export async function loadDraft(userId: string, id: string, now = new Date()): Promise<PlanDraftRow | undefined> {
   const d = await queryOne<PlanDraftRow>(`${DRAFT_SELECT} where id = $1 and user_id = $2`, [id, userId]);
   if (d && d.status === "ready" && effectiveState(d, now).status === "expired") {
-    await query("update plan_drafts set status = 'expired' where id = $1 and status = 'ready'", [id]); // updated_at stays: it is when the draft was ready
+    await query("update plan_drafts set status = 'expired' where id = $1 and user_id = $2 and status = 'ready'", [id, userId]); // updated_at stays: it is when the draft was ready
     return { ...d, status: "expired" };
   }
   return d;
@@ -420,7 +422,7 @@ export async function loadLatestDraft(userId: string, now = new Date()): Promise
   const d = await queryOne<PlanDraftRow>(`${DRAFT_SELECT} where user_id = $1 and status in ('pending', 'ready', 'failed') order by created_at desc limit 1`, [userId]);
   if (!d) return undefined;
   if (d.status === "ready" && effectiveState(d, now).status === "expired") {
-    await query("update plan_drafts set status = 'expired' where id = $1 and status = 'ready'", [d.id]);
+    await query("update plan_drafts set status = 'expired' where id = $1 and user_id = $2 and status = 'ready'", [d.id, userId]);
     return undefined;
   }
   return d;
@@ -441,8 +443,8 @@ export async function resumeDraft(userId: string, id: string, now = new Date()):
     const job = stepJob(d);
     if (!job) return { ok: false, status: 409, error: "draft is failed" };
     const [next] = await q<PlanDraftRow>(
-      "update plan_drafts set status = 'pending', resumes = resumes + 1, error_code = null, updated_at = now() where id = $1 returning *",
-      [id],
+      "update plan_drafts set status = 'pending', resumes = resumes + 1, error_code = null, updated_at = now() where id = $1 and user_id = $2 returning *",
+      [id, userId],
     );
     return { ok: true, draft: next, job };
   });
@@ -456,8 +458,8 @@ export async function discardDraft(userId: string, id: string): Promise<{ ok: tr
 }
 
 /** The sending failed after the row was written: do not leave a draft pending that no job will ever move. */
-export async function markSendFailed(id: string): Promise<void> {
-  await query("update plan_drafts set status = 'failed', error_code = 'model_failed', last_error = 'queue send failed', updated_at = now() where id = $1 and status = 'pending'", [id]);
+export async function markSendFailed(id: string, userId: string): Promise<void> {
+  await query("update plan_drafts set status = 'failed', error_code = 'model_failed', last_error = 'queue send failed', updated_at = now() where id = $1 and user_id = $2 and status = 'pending'", [id, userId]);
 }
 
 // ---- adopting ------------------------------------------------------------------------------------------------------------
@@ -538,7 +540,7 @@ export async function adoptDraft(d: Pick<PlanDraftRow, "id" | "user_id">, today:
         [randomUUID(), d.user_id, `每週${WEEKDAY_ZH[weekday]}固定休息（排課表時說的）`, weekday],
       );
     }
-    await q("update plan_drafts set status = 'adopted', adopted_plan_id = $2, updated_at = now() where id = $1", [d.id, planId]);
+    await q("update plan_drafts set status = 'adopted', adopted_plan_id = $2, updated_at = now() where id = $1 and user_id = $3", [d.id, planId, d.user_id]);
     return { ok: true, plan_id: planId };
   });
 }
