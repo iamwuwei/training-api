@@ -421,8 +421,11 @@ export async function createDraft(userId: string, intake: PlanIntake, today: str
     // A pending draft nobody touched for PLAN_GEN_STALL_MIN minutes is what the app already shows as "stalled": its job was lost. It must not
     // block a new one for ever (a stalled draft with no calls or no resumes left has no way out). Discarded, not failed: a failed one could still be
     // resumed next to the new draft, and one user would have two pending rows. It still counts in today's drafts.
+    // `for update skip locked`: this transaction holds the user's lock and must not also wait for a draft row, because adoptDraft holds a row and then
+    // waits for the user's lock (a wait in a circle = 40P01, a 500). A draft someone else is holding is simply left; it then counts as pending below.
     await q(
-      "update plan_drafts set status = 'discarded', updated_at = now() where user_id = $1 and status = 'pending' and updated_at < now() - make_interval(mins => $2)",
+      `update plan_drafts set status = 'discarded', updated_at = now()
+        where id in (select id from plan_drafts where user_id = $1 and status = 'pending' and updated_at < now() - make_interval(mins => $2) for update skip locked)`,
       [userId, PLAN_GEN_STALL_MIN],
     );
     if (!(await hasHistorySource(q, userId))) return { ok: false, status: 409, error: "strava not connected" };
@@ -485,7 +488,8 @@ export async function resumeDraft(userId: string, id: string, now = new Date(Dat
     if (d.resumes >= PLAN_GEN_MAX_RESUMES) return { ok: false, status: 409, error: "resume limit" };
     // Another stalled draft of his is dead (as createDraft treats it); a live one means he already has a draft being written.
     await q(
-      "update plan_drafts set status = 'discarded', updated_at = now() where user_id = $1 and id <> $2 and status = 'pending' and updated_at < now() - make_interval(mins => $3)",
+      `update plan_drafts set status = 'discarded', updated_at = now()
+        where id in (select id from plan_drafts where user_id = $1 and id <> $2 and status = 'pending' and updated_at < now() - make_interval(mins => $3) for update skip locked)`,
       [userId, id, PLAN_GEN_STALL_MIN],
     );
     const [other] = await q<{ id: string }>("select id from plan_drafts where user_id = $1 and status = 'pending' and id <> $2 limit 1", [userId, id]);
