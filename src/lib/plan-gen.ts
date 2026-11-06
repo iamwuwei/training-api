@@ -51,8 +51,15 @@ export const daysBetween = (from: string, to: string) => Math.round((Date.parse(
 const mondayOf = (iso: string) => addDays(iso, -((weekdayOf(iso) + 6) % 7));
 export const mmss = (sec: number) => `${Math.floor(sec / 60)}:${String(Math.round(sec) % 60).padStart(2, "0")}`;
 
-/** Characters that hide text, written as escapes so no editor can swallow them: C0/C1 controls other than whitespace (\u0009-\u000d, \u0085), the Arabic letter mark \u061c, zero-width and direction marks \u200b-\u200f, bidi overrides \u202a-\u202e, word joiner \u2060, bidi isolates \u2066-\u2069. */
-const HIDDEN = /[\u0000-\u0008\u000e-\u001f\u007f-\u0084\u0086-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069]/g;
+/**
+ * Characters that hide text, as ONE regex of \u escapes (the `u` flag is what makes \u{E0000} work; never paste the characters themselves):
+ * C0/C1 controls other than whitespace (\u0009-\u000d and \u0085 are handled as whitespace), soft hyphen \u00ad, Arabic letter mark \u061c,
+ * Mongolian vowel separator \u180e, zero-width and direction marks \u200b-\u200f, bidi overrides \u202a-\u202e, word joiner and the invisible
+ * math operators \u2060-\u2064, bidi isolates \u2066-\u2069, variation selectors \ufe00-\ufe0f (emoji presentation too), BOM \ufeff, and the
+ * Unicode "tag" block \u{E0000}-\u{E007F} (invisible ASCII smuggling). Everything the athlete or the model writes goes through oneLine below.
+ * Side effect, accepted: a ZWJ emoji sequence falls apart into its parts and an emoji loses its \ufe0f; CJK text and plain emoji are untouched.
+ */
+const HIDDEN = /[\u0000-\u0008\u000e-\u001f\u007f-\u0084\u0086-\u009f\u00ad\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufe00-\ufe0f\ufeff\u{e0000}-\u{e007f}]/gu;
 /** One line of plain text from anything the athlete or the model wrote: no hiding characters, every kind of line break and run of whitespace one space. */
 export function oneLine(v: unknown): string {
   return typeof v === "string" ? v.replace(HIDDEN, "").replace(/[\s\u0085]+/g, " ").trim() : "";
@@ -60,7 +67,8 @@ export function oneLine(v: unknown): string {
 const MD = /[*`#><]/g;
 const URL_RE = /https?:\/\/\S+/gi;
 /** A model string as it may be stored and shown: one line, no markdown characters, no links. */
-export const modelText = (v: unknown): string => oneLine(typeof v === "string" ? v.replace(URL_RE, "") : v).replace(MD, "").replace(/ {2,}/g, " ").trim();
+// hidden characters first, then the link: "ht\u00adtps://x" must not slip past the link filter
+export const modelText = (v: unknown): string => oneLine(v).replace(URL_RE, "").replace(MD, "").replace(/ {2,}/g, " ").trim();
 const chars = (s: string) => [...s].length;
 const clip = (s: string, n: number) => (chars(s) > n ? [...s].slice(0, n).join("") : s);
 
