@@ -10,6 +10,7 @@ import { EVENTS_PAGE_MAX } from "../lib/group-events";
 import { eventDetail, groupEvents, groupsList, groupView, memberPlanView, unreadTotal } from "../lib/group-view";
 import { acceptInvite, createGroup, createInvite, disbandGroup, getShare, GROUP_MAX_PER_USER, INVITE_TOKEN_RE, leaveGroup, markSeen, membership, parseGroupBody, previewInvite, putShare, removeMember, revokeInvite, SHARE_KEYS } from "../lib/groups";
 import { countsWeekNo, shortDate, sportName, weeklyAskQuestion } from "../lib/labels";
+import { adoptDraft, createDraft, discardDraft, loadDraft, loadLatestDraft, markSendFailed, parseDailyLimit, resumeDraft, sendPlanGenJob, stepJob, toApiDraft, validateIntake } from "../lib/plan-gen";
 import { applyChange, applyProposal, changeConflict, postProposalApplied } from "../lib/proposals";
 import { deauthorize } from "../lib/strava";
 import { elapsedSql, loadGroup, combineGroup, MAX_PER_SESSION, overlaps, recordBinding, regroupReview, requeueReview, REVIEW_LIMIT_MARKER, REVIEW_LIMIT_TEXT, reviewLimitReached, SEGMENT_SELECT, sameKind } from "../lib/session-group";
@@ -73,6 +74,10 @@ import type {
   PostGroupResponse,
   PutShareRequest,
   ShareResponse,
+  AdoptPlanDraftResponse,
+  LatestPlanDraftResponse,
+  PlanDraftOkResponse,
+  PlanDraftResponse,
 } from "../../types/api";
 
 // Lambda training-api-prod. Behind API Gateway (HTTP API) with a Cognito JWT authorizer: by the time we
@@ -115,13 +120,23 @@ import type {
 //   PUT  /groups/{id}/seen                    the 消息中心 was opened (clears unread)
 //   GET  /invites/{token}                     invite preview                                   POST …/accept   join
 //   GET|PUT /me/share                         what the members of my groups may see
+//
+// ai-plan-generation (src/lib/plan-gen*.ts, history-summary.ts). Woo writes a whole plan from an intake form + the last 12 weeks; the worker
+// does the model work in steps (plan_gen jobs), these routes only validate, read and write plan_drafts. A draft that is not the caller's is
+// answered exactly like one that does not exist: 404 "draft not found".
+//   POST /plan-drafts                         { intake } -> 202 { draft }; 400 codes | 409 generating / has active plan / strava not connected | 429 daily limit | 503 off
+//   GET  /plan-drafts/latest                  the newest pending / ready / failed draft, or { draft: null }
+//   GET  /plan-drafts/{id}                    one draft (the app polls it while pending)
+//   POST /plan-drafts/{id}/adopt              write it as the plan (one transaction); again on an adopted draft: the same plan_id
+//   POST /plan-drafts/{id}/resume             pick a failed draft up where it stopped (at most 2 times, calls <= 12)
+//   POST /plan-drafts/{id}/discard            drop it
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const STATUSES = new Set<string>(["auto", "confirmed", "unplanned", "ignored"] satisfies MatchStatus[]);
 
 const sqs = new SQSClient({});
 
-const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutSessionResponse | PutMemoResponse | PutDetailsResponse | DetailOptionsResponse | RereviewResponse | WeeklyResponse | PostAdjustmentResponse | CoachResponse | PostCoachMessageResponse | PutCoachSeenResponse | PostCheckinPickResponse | PostCheckinResetResponse | PostRoutineResponse | PutRoutineResponse | PostWeeklyAskResponse | PostProposalResponse | PostConstraintResponse | PlanChangedResponse | GroupsResponse | PostGroupResponse | GroupResponse | GroupOkResponse | PostGroupInviteResponse | MemberPlanResponse | GroupEventsResponse | GroupEventDetailResponse | InvitePreviewResponse | AcceptInviteResponse | ShareResponse | ErrorResponse>(
+const json = <T extends MeResponse | DeleteStravaResponse | PlanResponse | ActivitiesResponse | PutSessionResponse | PutMemoResponse | PutDetailsResponse | DetailOptionsResponse | RereviewResponse | WeeklyResponse | PostAdjustmentResponse | CoachResponse | PostCoachMessageResponse | PutCoachSeenResponse | PostCheckinPickResponse | PostCheckinResetResponse | PostRoutineResponse | PutRoutineResponse | PostWeeklyAskResponse | PostProposalResponse | PostConstraintResponse | PlanChangedResponse | GroupsResponse | PostGroupResponse | GroupResponse | GroupOkResponse | PostGroupInviteResponse | MemberPlanResponse | GroupEventsResponse | GroupEventDetailResponse | InvitePreviewResponse | AcceptInviteResponse | ShareResponse | PlanDraftResponse | LatestPlanDraftResponse | AdoptPlanDraftResponse | PlanDraftOkResponse | ErrorResponse>(
   statusCode: number,
   body: T,
 ): APIGatewayProxyResultV2 => ({
@@ -217,6 +232,16 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
   const invitePath = /^\/invites\/([^/]+)(\/accept)?$/.exec(path);
   if (method === "GET" && invitePath && !invitePath[2]) return getInvitePreview(user.id, invitePath[1]);
   if (method === "POST" && invitePath?.[2]) return postInviteAccept(user.id, invitePath[1]);
+
+  if (method === "POST" && path === "/plan-drafts") return postPlanDraft(user.id, raw);
+  if (method === "GET" && path === "/plan-drafts/latest") return getLatestPlanDraft(user.id);
+  const draftPath = /^\/plan-drafts\/([^/]+)(?:\/(adopt|resume|discard))?$/.exec(path);
+  if (draftPath) {
+    if (method === "GET" && !draftPath[2]) return getPlanDraft(user.id, draftPath[1]);
+    if (method === "POST" && draftPath[2] === "adopt") return adoptPlanDraft(user.id, draftPath[1]);
+    if (method === "POST" && draftPath[2] === "resume") return resumePlanDraft(user.id, draftPath[1]);
+    if (method === "POST" && draftPath[2] === "discard") return discardPlanDraft(user.id, draftPath[1]);
+  }
 
   if (method === "GET" && path === "/weekly") return getWeekly(user.id);
   if (method === "GET" && path === "/coach") return getCoach(user.id, q);
@@ -1698,4 +1723,74 @@ async function postInviteAccept(userId: string, token: string) {
   if (!r) return json(404, { error: "invite not found" });
   if (!r.ok) return json(409, { error: r.state });
   return json<AcceptInviteResponse>(200, { group: r.group });
+}
+
+// ---- ai-plan-generation ---------------------------------------------------------------------------------------------------
+// Each handler: parse / validate, call src/lib/plan-gen.ts, map the answer to a status. The notes and the name go to the model only through
+// the worker's prompt (quoted); nothing of the form is logged.
+
+const draftNotFound = () => json(404, { error: "draft not found" });
+
+/** The queue refused the job after the row was written: the draft must not stay pending with nobody to move it. */
+async function queueOrFail(job: Parameters<typeof sendPlanGenJob>[0]): Promise<boolean> {
+  try {
+    await sendPlanGenJob(job);
+    return true;
+  } catch (err) {
+    console.error(`plan_gen: could not queue ${job.step} for draft ${job.draft_id}`, err);
+    await markSendFailed(job.draft_id);
+    return false;
+  }
+}
+
+async function postPlanDraft(userId: string, raw: string) {
+  const body = parseJson(raw);
+  if (!body.ok) return badBody("invalid json");
+  const b = body.value;
+  if (!b || typeof b !== "object" || Array.isArray(b) || !(b as { intake?: unknown }).intake || typeof (b as { intake?: unknown }).intake !== "object") return badBody("invalid intake");
+  const today = todayJst();
+  const intake = validateIntake((b as { intake: unknown }).intake, today);
+  if (typeof intake === "string") return badBody(intake);
+  const limit = parseDailyLimit(process.env.PLAN_GEN_DAILY_LIMIT);
+  if (limit === 0) return json(503, { error: "plan generation is off" });
+  const made = await createDraft(userId, intake, today, limit);
+  if (!made.ok) return json<ErrorResponse>(made.status, (made.draft_id ? { error: made.error, draft_id: made.draft_id } : { error: made.error }) as ErrorResponse);
+  const job = stepJob(made.draft)!;
+  if (!(await queueOrFail(job))) return json(500, { error: "伺服器錯誤" });
+  return json<PlanDraftResponse>(202, { draft: toApiDraft(made.draft, new Date()) });
+}
+
+async function getLatestPlanDraft(userId: string) {
+  const d = await loadLatestDraft(userId);
+  return json<LatestPlanDraftResponse>(200, { draft: d ? toApiDraft(d, new Date()) : null });
+}
+
+async function getPlanDraft(userId: string, id: string) {
+  if (!UUID_RE.test(id)) return draftNotFound();
+  const d = await loadDraft(userId, id);
+  return d ? json<PlanDraftResponse>(200, { draft: toApiDraft(d, new Date()) }) : draftNotFound();
+}
+
+async function adoptPlanDraft(userId: string, id: string) {
+  if (!UUID_RE.test(id)) return draftNotFound();
+  const d = await loadDraft(userId, id);
+  if (!d) return draftNotFound();
+  const r = await adoptDraft(d, todayJst());
+  if (!r.ok) return json(r.status, { error: r.error });
+  return json<AdoptPlanDraftResponse>(200, { plan_id: r.plan_id });
+}
+
+async function resumePlanDraft(userId: string, id: string) {
+  if (!UUID_RE.test(id)) return draftNotFound();
+  const r = await resumeDraft(userId, id);
+  if (!r.ok) return r.status === 404 ? draftNotFound() : json(409, { error: r.error });
+  if (!(await queueOrFail(r.job))) return json(500, { error: "伺服器錯誤" });
+  return json<PlanDraftResponse>(202, { draft: toApiDraft(r.draft, new Date()) });
+}
+
+async function discardPlanDraft(userId: string, id: string) {
+  if (!UUID_RE.test(id)) return draftNotFound();
+  const r = await discardDraft(userId, id);
+  if (!r.ok) return r.status === 404 ? draftNotFound() : json(409, { error: r.error });
+  return json<PlanDraftOkResponse>(200, { ok: true });
 }

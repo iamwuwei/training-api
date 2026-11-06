@@ -131,6 +131,8 @@ export class TrainingApiStack extends cdk.Stack {
     });
 
     // 180 s: a chat reply with two full cards plus up to three web searches does not fit in 90 s.
+    // plan_gen (ai-plan-generation): one message per step, each step <= 90 s of model time (two calls at most, the second only while the
+    // 170 s budget lasts); the worker queues the next step itself (QUEUE_URL below, grantSendMessages).
     const worker = fn("worker", {
       timeout: cdk.Duration.seconds(180),
       environment: {
@@ -148,7 +150,7 @@ export class TrainingApiStack extends cdk.Stack {
     // messages to a function that is full, they get throttled and every throttle counts as a
     // receive towards the DLQ's maxReceiveCount.
     worker.addEventSource(new SqsEventSource(queue, { batchSize: 1, maxConcurrency: 2 }));
-    queue.grantSendMessages(worker); // coach-correct-review: the re-judge a correction asks for (requeueReview), the only message the worker sends
+    queue.grantSendMessages(worker); // the messages the worker sends to itself: coach-correct-review's re-judge (requeueReview) and the next plan_gen step
     weekly.grantInvoke(worker); // a late activity: regenerate the week's review there, not in the worker's 90 s
 
     const oauth = fn("oauth", { environment: stravaEnv, retryAttempts: 0 });
@@ -163,6 +165,7 @@ export class TrainingApiStack extends cdk.Stack {
         WEEKLY_FUNCTION_NAME: weekly.functionName,
         COACH_DAILY_LIMIT: process.env.COACH_DAILY_LIMIT ?? "0", // 0 = no cap (two known athletes)
         REVIEW_DAILY_LIMIT: process.env.REVIEW_DAILY_LIMIT ?? "20", // 0 = no cap; finished verdicts per user and JST day: asked before a job is queued (requeueReview; "重新分析" gets a 429) and again by the worker right before the model is called
+        PLAN_GEN_DAILY_LIMIT: process.env.PLAN_GEN_DAILY_LIMIT ?? "3", // plan drafts per user and JST day (a discarded one counts); 0 = the feature is off (POST /plan-drafts answers 503)
       },
     });
     queue.grantSendMessages(api); // re-review after a manual session assignment
@@ -284,6 +287,13 @@ export class TrainingApiStack extends cdk.Stack {
       ["/invites/{token}", [apigw.HttpMethod.GET]],
       ["/invites/{token}/accept", [apigw.HttpMethod.POST]],
       ["/me/share", [apigw.HttpMethod.GET, apigw.HttpMethod.PUT]],
+      // ai-plan-generation
+      ["/plan-drafts", [apigw.HttpMethod.POST]],
+      ["/plan-drafts/latest", [apigw.HttpMethod.GET]],
+      ["/plan-drafts/{id}", [apigw.HttpMethod.GET]],
+      ["/plan-drafts/{id}/adopt", [apigw.HttpMethod.POST]],
+      ["/plan-drafts/{id}/resume", [apigw.HttpMethod.POST]],
+      ["/plan-drafts/{id}/discard", [apigw.HttpMethod.POST]],
     ] as const) {
       httpApi.addRoutes({ path: p, methods: [...methods], integration, authorizer });
     }
