@@ -301,7 +301,9 @@ export function computeDraftFlags(sessions: DraftSession[], weeks: DraftWeek[], 
     const cur = volume.get(w.week_no) ?? 0, prev = volume.get(w.week_no - 1) ?? 0;
     if (prev > 0 && cur * 100 >= prev * (100 + WEEK_UP_PCT)) weekFlags.push({ scope: "week", week_no: w.week_no, text: `這週 ${km1(cur)} km，比上週多 ${Math.round(((cur - prev) / prev) * 100)}%` });
     if (w.taper && w.week_no > 1 && cur > prev) weekFlags.push({ scope: "week", week_no: w.week_no, text: `這週是減量週，卻比上週多 ${km1(cur - prev)} km` });
-    if (w.week_no !== raceWeek && (runDays.get(w.week_no) ?? 0) !== intake.days_per_week) {
+    // A week that starts mid-week (the first one) has fewer days to train on: ask for min(what he said, the days it has that are not his rest days).
+    const canTrain = dateRange(w.week_start, w.week_end).filter((d) => !intake.fixed_rest_weekdays.includes(weekdayOf(d))).length;
+    if (w.week_no !== raceWeek && (runDays.get(w.week_no) ?? 0) !== Math.min(intake.days_per_week, canTrain)) {
       weekFlags.push({ scope: "week", week_no: w.week_no, text: `這週排 ${runDays.get(w.week_no) ?? 0} 天，你說每週 ${intake.days_per_week} 天` });
     }
   }
