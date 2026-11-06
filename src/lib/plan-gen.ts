@@ -52,14 +52,17 @@ const mondayOf = (iso: string) => addDays(iso, -((weekdayOf(iso) + 6) % 7));
 export const mmss = (sec: number) => `${Math.floor(sec / 60)}:${String(Math.round(sec) % 60).padStart(2, "0")}`;
 
 /**
- * Characters that hide text, as ONE regex of \u escapes (the `u` flag is what makes \u{E0000} work; never paste the characters themselves):
- * C0/C1 controls other than whitespace (\u0009-\u000d and \u0085 are handled as whitespace), soft hyphen \u00ad, Arabic letter mark \u061c,
- * Mongolian vowel separator \u180e, zero-width and direction marks \u200b-\u200f, bidi overrides \u202a-\u202e, word joiner and the invisible
- * math operators \u2060-\u2064, bidi isolates \u2066-\u2069, variation selectors \ufe00-\ufe0f (emoji presentation too), BOM \ufeff, and the
- * Unicode "tag" block \u{E0000}-\u{E007F} (invisible ASCII smuggling). Everything the athlete or the model writes goes through oneLine below.
+ * Characters that hide text, as ONE regex of escapes (the `u` flag is what makes \p{...} and \u{...} work; never paste the characters themselves):
+ *  - every Unicode Default_Ignorable_Code_Point: soft hyphen \u00ad, combining grapheme joiner \u034f, Arabic letter mark \u061c, Hangul fillers
+ *    \u115f \u1160 \u3164 \uffa0, Mongolian selectors \u180b-\u180f, zero-width and direction marks \u200b-\u200f, bidi overrides \u202a-\u202e,
+ *    word joiner / invisible operators / the deprecated format controls \u2060-\u206f (bidi isolates \u2066-\u2069 are in there), variation selectors
+ *    \ufe00-\ufe0f and \u{e0100}-\u{e01ef}, BOM \ufeff, the Unicode "tag" block \u{e0000}-\u{e007f} (invisible ASCII smuggling);
+ *  - C0/C1 controls other than whitespace (\u0009-\u000d and \u0085 are handled as whitespace by oneLine);
+ *  - the interlinear annotation marks \ufff9-\ufffb, which are not default-ignorable but hide text the same way.
+ * Everything the athlete or the model writes goes through oneLine below.
  * Side effect, accepted: a ZWJ emoji sequence falls apart into its parts and an emoji loses its \ufe0f; CJK text and plain emoji are untouched.
  */
-const HIDDEN = /[\u0000-\u0008\u000e-\u001f\u007f-\u0084\u0086-\u009f\u00ad\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufe00-\ufe0f\ufeff\u{e0000}-\u{e007f}]/gu;
+const HIDDEN = /[\p{Default_Ignorable_Code_Point}\u0000-\u0008\u000e-\u001f\u007f-\u0084\u0086-\u009f\ufff9-\ufffb]/gu;
 /** One line of plain text from anything the athlete or the model wrote: no hiding characters, every kind of line break and run of whitespace one space. */
 export function oneLine(v: unknown): string {
   return typeof v === "string" ? v.replace(HIDDEN, "").replace(/[\s\u0085]+/g, " ").trim() : "";
