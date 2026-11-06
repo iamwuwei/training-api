@@ -389,6 +389,13 @@ export type CreateResult =
 export async function createDraft(userId: string, intake: PlanIntake, today: string, dailyLimit: number): Promise<CreateResult> {
   return withTransaction(async (q): Promise<CreateResult> => {
     await q("select pg_advisory_xact_lock(hashtext($1))", [`plan-draft:${userId}`]);
+    // A pending draft nobody touched for PLAN_GEN_STALL_MIN minutes is what the app already shows as "stalled": its job was lost. It must not
+    // block a new one for ever (a stalled draft with no calls or no resumes left has no way out). Discarded, not failed: a failed one could still be
+    // resumed next to the new draft, and one user would have two pending rows. It still counts in today's drafts.
+    await q(
+      "update plan_drafts set status = 'discarded', updated_at = now() where user_id = $1 and status = 'pending' and updated_at < now() - make_interval(mins => $2)",
+      [userId, PLAN_GEN_STALL_MIN],
+    );
     if (!(await hasHistorySource(q, userId))) return { ok: false, status: 409, error: "strava not connected" };
     const [{ n }] = await q<{ n: number }>(
       "select count(*)::int as n from plan_drafts where user_id = $1 and (created_at at time zone 'Asia/Tokyo')::date = (now() at time zone 'Asia/Tokyo')::date",
