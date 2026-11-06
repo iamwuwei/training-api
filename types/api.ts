@@ -809,13 +809,18 @@ export interface PostCoachMessageResponse {
 // email, Strava ids, memo / RPE, the coach thread, constraints, raw data, gear, model names, his other groups.
 
 export interface ShareSettings {
-  progress: boolean;  // dashboard numbers              default true
-  events: boolean;    // my 完成了○○ events               default true
-  plan: boolean;      // my plan (weeks, sessions)       default false
-  runs: boolean;      // distance / time / pace / HR / splits of my runs   default false
-  reviews: boolean;   // Woo's verdict, reminders, comment                 default false
+  progress: boolean;  // dashboard numbers
+  events: boolean;    // my 完成了○○ events
+  plan: boolean;      // my plan (weeks, sessions)
+  runs: boolean;      // distance / time / pace / HR / splits of my runs
+  reviews: boolean;   // Woo's verdict, reminders, comment
 }
-/** GET /me/share → { share } (defaults when never set). PUT /me/share { share: Partial<ShareSettings> } → { share }; non-boolean → 400. Takes effect on the next request of anyone. */
+/**
+ * GET /me/share → { share }. PUT /me/share { share: Partial<ShareSettings> } → { share }; non-boolean → 400. Takes effect on the next request of anyone.
+ * Defaults: the first time a user becomes a member of any group (POST /groups, POST /invites/{token}/accept) the api writes his row with
+ * all five true (since 2026-11-06; never overwrites a row). A user with no row (joined before that, or never joined) reads as
+ * progress / events true, plan / runs / reviews false.
+ */
 export interface ShareResponse { share: ShareSettings }
 export interface PutShareRequest { share: Partial<ShareSettings> }
 
@@ -954,3 +959,88 @@ export interface AcceptInviteResponse { group: ApiGroup }
 export interface ErrorResponse {
   error: string;
 }
+
+// ---- ai-plan-generation: Woo writes a whole plan from an intake form + the athlete's Strava history ---------------
+// POST /plan-drafts starts one (the worker generates it in steps: profile → skeleton → 4-week chunks); the app polls
+// GET /plan-drafts/{id}; when `ready` it previews `weeks` + `sessions` with the plan page's layout and POST …/adopt
+// writes the plan. Caps: PLAN_GEN_DAILY_LIMIT drafts a day (JST), one pending at a time, max_calls model calls a draft.
+
+export interface PlanGoalInput {
+  kind: "race";                 // Phase 1: | "performance" | "habit"
+  priority: "A";                // Phase 1: | "B" | "C" (exactly one A)
+  name: string;                 // 1–40 chars
+  race_date: string;            // 'YYYY-MM-DD'; 28–140 days after start_date
+  distance_m: number;           // 5000 | 10000 | 21097 | 42195 | any 1000–100000
+  target_time_sec: number | null; // null = 完賽就好; implied pace must be 150–720 s/km
+}
+
+export interface PlanIntake {
+  goals: PlanGoalInput[];       // Phase 0: exactly one
+  days_per_week: number;        // 2–6
+  fixed_rest_weekdays: number[]; // 0 = Sunday … 6; unique; length ≤ 7 − days_per_week; [] = none (the athlete said nothing)
+  experience: "first" | "finished" | "several";
+  weekday_minutes: 30 | 45 | 60 | 90 | null; // longest weekday session; null = no limit
+  notes: string;                // ≤ 200 chars, one line; "" = none. Injuries, preferences ("長跑想排週六")
+  start_date: string;           // 'YYYY-MM-DD'; today … today + 14 (JST); the app defaults to next Monday
+}
+
+export interface ApiAthleteProfile {
+  from: string; to: string;
+  weeks: { week_start: string; runs: number; km: number; longest_km: number }[];
+  last4: { runs_per_week: number; km_per_week: number };
+  longest: { date: string; km: number; pace_sec_km: number | null; avg_hr: number | null } | null;
+  avg_pace_sec_km: number | null;
+  avg_hr: number | null;
+  total_runs: number;
+  import_error: boolean;        // the history source (Strava today) could not be read: numbers come from what the app already had
+  hr_zones: { lt140: number; z140_155: number; z155_170: number; gte170: number } | null; // share of running time by avg HR
+  pace_bands: { lt6: number; p6_7: number; p7_8: number; gte8: number } | null;            // share of distance by avg pace (min/km)
+  /** A plan race day in the last 28 days: the next plan opens with recovery (Phase 0 rule; Phase 1 fills it from the goal list). */
+  last_race: { name: string; date: string; distance_m: number; actual_time_sec: number | null; days_ago: number } | null;
+}
+
+export interface ApiDraftWeek {
+  week_no: number; week_start: string; week_end: string; phase: string; focus: string; km: number; long_km: number; key: string; taper: boolean;
+  flags: string[];              // amber lines hung on this week ("這週排 5 天，你說每週 4 天"; no week number in the text); [] until ready
+}
+
+/** One day of the draft. Same fields the plan page needs to draw a row (ApiSession minus ids / versions). */
+export interface ApiDraftSession {
+  date: string; week_no: number; type: SessionType; label: string; content: string; note: string | null;
+  target: string | null;        // "7:15〜7:45 / 心拍 140〜150", as planned_sessions.target will be
+  target_distance_m: number | null; target_pace_sec_km: number | null;
+  target_pace_min_sec_km: number | null; target_pace_max_sec_km: number | null; target_hr_min: number | null; target_hr_max: number | null;
+  flags: string[];              // amber lines hung on this session (computed by the api; no date in the text); [] until ready
+}
+
+export interface ApiPlanDraft {
+  id: string;
+  mode: "new" | "replan";
+  /** expired: ready for more than 7 days. failed with can_resume: 繼續 picks up where it stopped. */
+  status: "pending" | "ready" | "failed" | "adopted" | "discarded" | "expired";
+  /** pending only: profile (reading Strava), skeleton (the week structure), chunk (weeks progress.from–to). */
+  stage: "profile" | "skeleton" | "chunk" | null;
+  progress: { chunks_done: number; chunks_total: number | null; from_week: number | null; to_week: number | null };
+  intake: PlanIntake;
+  profile: ApiAthleteProfile | null;
+  summary: string | null;       // Woo's 思路 (≤ 600 chars, plain text)
+  weeks: ApiDraftWeek[];        // [] until the skeleton is in
+  sessions: ApiDraftSession[];  // grows chunk by chunk; complete when ready
+  flags: string[];              // plan-level lines only ("旗標比較多，採用前看一下每週的量"); week lines are weeks[].flags, session lines sessions[].flags
+  calls: number; max_calls: number;
+  can_resume: boolean;          // failed and calls < max_calls and resumes < 2
+  /** failed: one of four fixed lines (model_failed 「Woo 這次沒有回完」, validation_failed 「Woo 排的格式沒過檢查」, calls_exhausted 「這份用掉的次數到上限了」, stalled 「產生中斷了」; §6c); the provider's wording stays in the logs. */
+  error: string | null;
+  adopted_plan_id: string | null;
+  created_at: string; updated_at: string;
+}
+
+/** POST /plan-drafts { intake } → 202 { draft } | 400 { error } | 409 generating | has active plan | strava not connected | 429 daily limit | 503 plan generation is off */
+export interface PostPlanDraftRequest { intake: PlanIntake }
+export interface PlanDraftResponse { draft: ApiPlanDraft }
+/** GET /plan-drafts/latest → { draft: null } when there is none worth showing (none, or discarded / expired / adopted) */
+export interface LatestPlanDraftResponse { draft: ApiPlanDraft | null }
+/** POST /plan-drafts/{id}/adopt → 200 { plan_id } (again on the same adopted draft: the same plan_id) | 409 { error } */
+export interface AdoptPlanDraftResponse { plan_id: string }
+/** POST /plan-drafts/{id}/resume → 202 { draft } | 409 ; POST …/discard → 200 { ok: true } */
+export interface PlanDraftOkResponse { ok: true }

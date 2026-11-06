@@ -264,7 +264,11 @@ create table if not exists group_invites (
 );
 create index if not exists group_invites_group_live_idx on group_invites (group_id) where revoked_at is null;
 
--- What a user lets the members of all his groups see. Missing row = the defaults below (01 H1).
+-- What a user lets the members of all his groups see. Missing row = the conservative defaults in code (groups.ts SHARE_DEFAULTS:
+-- progress and events on, plan / runs / reviews off) — users from before 2026-11-06 and the seed-group pair. Since 2026-11-06 the
+-- FIRST time a user becomes a member (createGroup / acceptInvite) a row with all five true is written in that transaction
+-- (groups.ts shareAllOnFirstJoin, `on conflict do nothing`), so a later change of defaults never silently changes anyone.
+-- The column defaults below are not used by any code path (every insert names all five columns); they stay as documentation.
 -- Never shareable (no column): the coach thread, constraints, memo/RPE, raw Strava data, gear, email, ids, model names.
 create table if not exists share_settings (
   user_id uuid primary key references users(id),
@@ -292,3 +296,32 @@ create table if not exists group_events (
 );
 create index if not exists group_events_group_created_idx on group_events (group_id, created_at desc);
 create unique index if not exists group_events_session_once_idx on group_events (group_id, session_id) where session_id is not null;
+
+-- ai-plan-generation: a plan draft Woo writes from the intake form and the athlete's Strava history (worker, plan_gen job),
+-- adopted into plans / plan_weeks / planned_sessions in one transaction. Never read by the coach prompts.
+create table if not exists plan_drafts (
+  id uuid primary key,
+  user_id uuid not null references users(id),
+  mode text not null default 'new',                  -- new (no active plan) | replan (Phase 0b: the active plan from start_date on)
+  status text not null default 'pending',            -- pending | ready | failed | adopted | discarded | expired
+  stage text,                                        -- profile | skeleton | chunk  (pending: what the worker is on)
+  intake jsonb not null,                             -- PlanIntake (validated)
+  profile jsonb,                                     -- AthleteProfile
+  skeleton jsonb,                                    -- { summary, weeks: DraftWeek[] }
+  sessions jsonb not null default '[]',              -- DraftSession[] (validated), appended chunk by chunk
+  chunks_total int,                                  -- ceil(weeks / 4)
+  chunks_done int not null default 0,
+  flags jsonb not null default '[]',                 -- DraftFlag[] (computed when ready)
+  calls int not null default 0,                      -- model calls spent on this draft (hard cap PLAN_GEN_MAX_CALLS)
+  resumes int not null default 0,                    -- POST …/resume count (cap PLAN_GEN_MAX_RESUMES)
+  last_error text,                                   -- validation feedback for the retry / provider wording for the log; never shown
+  error_code text,                                   -- fixed code for the app: model_failed | validation_failed | calls_exhausted | stalled
+  model text,
+  adopted_plan_id uuid references plans(id),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists plan_drafts_user_created_idx on plan_drafts (user_id, created_at);
+create index if not exists plan_drafts_user_pending_idx on plan_drafts (user_id) where status = 'pending';
+alter table users add column if not exists history_imported_at timestamptz;   -- last Strava history import (plan_gen profile step)
+-- plans.status: 'active' | 'finished' (an adopted draft replaced a plan whose race_date had passed). No schema change.

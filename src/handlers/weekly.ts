@@ -53,17 +53,25 @@ export const handler = async (event: WeeklyEvent = {}) => {
   const weekStart = event.week_start ?? lastWeekStartJst();
   const regenerate = event.week_start !== undefined && event.regenerate === true;
 
-  const plans = await query<PlanRow & { display_name: string }>(
-    `select p.*, to_char(p.race_date, 'YYYY-MM-DD') as race_date, u.display_name
+  const plans = await query<PlanRow & { display_name: string; first_week_start: string | null }>(
+    `select p.*, to_char(p.race_date, 'YYYY-MM-DD') as race_date, u.display_name,
+            (select to_char(min(w.week_start), 'YYYY-MM-DD') from plan_weeks w where w.plan_id = p.id) as first_week_start
        from plans p join users u on u.id = p.user_id
       where p.status = 'active'`,
   );
+  const weekEnd = isoDate(new Date(Date.parse(`${weekStart}T00:00:00Z`) + 6 * 86_400_000));
 
   const results: Result[] = [];
 
   // One plan failing (model error, timeout) must not stop the others; the failures are
   // collected and thrown together below so the retry only redoes those plans.
   for (const plan of plans) {
+    // An adopted plan (ai-plan-generation) can start next week: the week that just ended is before its first week, there is nothing to review.
+    if (plan.first_week_start && plan.first_week_start > weekEnd) {
+      console.log(`weekly review: plan ${plan.id} (${plan.display_name}) has not started (first week ${plan.first_week_start}), skipping week ${weekStart}`);
+      results.push({ plan_id: plan.id, skipped: true });
+      continue;
+    }
     try {
       const existing = await queryOne<WeeklyReviewRow>(
         `${WEEKLY_REVIEW_SELECT} where plan_id = $1 and week_start = $2 order by created_at desc limit 1`,
