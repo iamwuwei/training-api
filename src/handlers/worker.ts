@@ -71,7 +71,7 @@ export const handler: SQSHandler = async (event) => {
   }
 };
 
-async function getFreshConnection(athleteId: number): Promise<StravaConnectionRow | undefined> {
+export async function getFreshConnection(athleteId: number): Promise<StravaConnectionRow | undefined> {
   const conn = await queryOne<StravaConnectionRow>(
     "select * from strava_connections where strava_athlete_id = $1",
     [athleteId],
