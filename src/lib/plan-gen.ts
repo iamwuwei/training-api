@@ -307,18 +307,23 @@ export function computeDraftFlags(sessions: DraftSession[], weeks: DraftWeek[], 
   }
 
   let lastLong: DraftSession | undefined;
+  /** The longest run he has done or this draft has already planned: a long run is only "longer than he has done" against this, so a plan that builds 2 km a week is not flagged every week. */
+  let longestSoFar: number | null = profile?.longest ? profile.longest.km * 1000 : null;
   const lastRace = profile?.last_race ?? null;
   const recoveryDays = lastRace ? (lastRace.distance_m >= 40000 ? 14 : lastRace.distance_m >= 20000 ? 7 : 4) : 0;
   for (const s of sorted) {
     const mine: string[] = [];
     if (s.type === "long" && s.distance_m != null) {
-      const ref = profile?.longest ? profile.longest.km * 1000 : lastLong?.distance_m ?? null;
+      const ref = longestSoFar;
       if (ref != null && s.distance_m - ref >= LONG_UP_M) mine.push(`比你目前最長多 ${km1(s.distance_m - ref)} km（${km1(ref)} → ${km1(s.distance_m)} km）`);
       const d = daysBetween(s.date, goal.race_date);
       if (s.distance_m >= NEAR_RACE_LONG_M && d <= NEAR_RACE_DAYS) mine.push(`離比賽只剩 ${d} 天，這天有 ${km1(s.distance_m)} km 的長跑`);
       if (lastLong && daysBetween(lastLong.date, s.date) < 6) mine.push(`跟上一次長跑只隔 ${daysBetween(lastLong.date, s.date)} 天`);
     }
-    if (s.type === "long") lastLong = s;
+    if (s.type === "long") {
+      lastLong = s;
+      if (s.distance_m != null) longestSoFar = Math.max(longestSoFar ?? 0, s.distance_m);
+    }
     if (isRunDay(s) && s.distance_m != null && s.distance_m > goal.distance_m) mine.push(`這堂 ${km1(s.distance_m)} km 超過比賽距離`);
     if (lastRace && ["long", "tempo", "interval"].includes(s.type) && daysBetween(lastRace.date, s.date) <= recoveryDays) {
       mine.push(`${shortDate(lastRace.date)} 剛比完${distanceName(lastRace.distance_m)}，這天就有${s.label}`);
