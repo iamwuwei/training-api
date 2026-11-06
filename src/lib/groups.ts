@@ -17,6 +17,7 @@ import type { AcceptInviteResponse, ApiGroup, ApiGroupInvite, InvitePreviewRespo
 // then the invite or member rows. leave / remove / disband all start with the group row because their `group_events` insert takes a
 // KEY SHARE on it through the foreign key; taking the member row first (as leave / remove once did) deadlocked against disband
 // (40P01). Two tabs, or two people accepting at once, cannot overshoot the limits.
+// settings-privacy: the first join (create / accept) also writes the caller's own share_settings row, all five on (shareAllOnFirstJoin).
 
 export const GROUP_MAX_MEMBERS = 5;
 export const GROUP_MAX_PER_USER = 3;
@@ -24,8 +25,13 @@ export const INVITE_TTL_DAYS = 7;
 export const INVITE_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 export const NAME_MAX = 30;
 export const RACE_NAME_MAX = 40;
-/** A user with no share_settings row: progress and finished-session events on, everything else off (01 H1). */
+/**
+ * A user with no share_settings row (joined before 2026-11-06, the seed-group pair, or never joined): progress and finished-session
+ * events on, everything else off (01 H1). The FIRST join writes all five on as his own row (`shareAllOnFirstJoin`).
+ */
 export const SHARE_DEFAULTS: ShareSettings = { progress: true, events: true, plan: false, runs: false, reviews: false };
+/** What `shareAllOnFirstJoin` writes (the SQL spells the five trues out; this is the same thing in code, for readers and tests). */
+export const SHARE_ON_FIRST_JOIN: ShareSettings = { progress: true, events: true, plan: true, runs: true, reviews: true };
 export const SHARE_KEYS = ["progress", "events", "plan", "runs", "reviews"] as const;
 
 /** A race day further away than this is a typo (9999-12-31 would make the countdown break the layout). */
@@ -154,6 +160,7 @@ export async function createGroup(userId: string, body: GroupBody): Promise<{ ok
   const out = await withTransaction(async (q) => {
     await lockUser(q, userId);
     if ((await activeGroupCount(q, userId)) >= GROUP_MAX_PER_USER) return undefined;
+    await shareAllOnFirstJoin(q, userId);
     const groupId = randomUUID();
     const memberId = randomUUID();
     const [g] = await q<GroupRow>(
@@ -279,6 +286,7 @@ export async function acceptInvite(viewerId: string, token: string): Promise<Acc
     const [mine] = await q("select 1 from group_members where group_id = $1 and user_id = $2 and left_at is null", [g.id, viewerId]);
     const state = inviteState(inv, !!mine, await activeGroupCount(q, viewerId), await memberCountOf(q, g.id));
     if (state !== "ok") return { ok: false, state };
+    await shareAllOnFirstJoin(q, viewerId);
     // a returning member reuses his row (left_at back to null, a fresh joined_at, nothing seen yet)
     const [m] = await q<GroupMemberRow>(
       `insert into group_members (id, group_id, user_id, role) values ($1, $2, $3, 'member')
@@ -376,6 +384,22 @@ export async function putShare(userId: string, patch: Partial<ShareSettings>): P
     [userId, ...given],
   );
   return row;
+}
+
+/**
+ * The FIRST time a user becomes a member of any group (no group_members row for him yet, left or not) his share row is written with
+ * every switch on, inside the membership transaction, before his member row. Never overwrites (pk conflict -> nothing): someone who
+ * set his switches before joining keeps them; the seed-group pair and anyone from before 2026-11-06 already have a member row and
+ * are never touched. Call after the limit checks (a 409 writes nothing).
+ */
+export async function shareAllOnFirstJoin(q: Querier, userId: string): Promise<void> {
+  await q(
+    `insert into share_settings (user_id, progress, events, plan, runs, reviews)
+     select $1::uuid, true, true, true, true, true
+      where not exists (select 1 from group_members where user_id = $1::uuid)
+     on conflict (user_id) do nothing`,
+    [userId],
+  );
 }
 
 // ---- the ai-plan-generation hook -------------------------------------------------------------

@@ -264,7 +264,11 @@ create table if not exists group_invites (
 );
 create index if not exists group_invites_group_live_idx on group_invites (group_id) where revoked_at is null;
 
--- What a user lets the members of all his groups see. Missing row = the defaults below (01 H1).
+-- What a user lets the members of all his groups see. Missing row = the conservative defaults in code (groups.ts SHARE_DEFAULTS:
+-- progress and events on, plan / runs / reviews off) — users from before 2026-11-06 and the seed-group pair. Since 2026-11-06 the
+-- FIRST time a user becomes a member (createGroup / acceptInvite) a row with all five true is written in that transaction
+-- (groups.ts shareAllOnFirstJoin, `on conflict do nothing`), so a later change of defaults never silently changes anyone.
+-- The column defaults below are not used by any code path (every insert names all five columns); they stay as documentation.
 -- Never shareable (no column): the coach thread, constraints, memo/RPE, raw Strava data, gear, email, ids, model names.
 create table if not exists share_settings (
   user_id uuid primary key references users(id),
