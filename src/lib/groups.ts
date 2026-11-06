@@ -30,8 +30,6 @@ export const RACE_NAME_MAX = 40;
  * events on, everything else off (01 H1). The FIRST join writes all five on as his own row (`shareAllOnFirstJoin`).
  */
 export const SHARE_DEFAULTS: ShareSettings = { progress: true, events: true, plan: false, runs: false, reviews: false };
-/** What `shareAllOnFirstJoin` writes (the SQL spells the five trues out; this is the same thing in code, for readers and tests). */
-export const SHARE_ON_FIRST_JOIN: ShareSettings = { progress: true, events: true, plan: true, runs: true, reviews: true };
 export const SHARE_KEYS = ["progress", "events", "plan", "runs", "reviews"] as const;
 
 /** A race day further away than this is a typo (9999-12-31 would make the countdown break the layout). */
