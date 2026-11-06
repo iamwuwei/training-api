@@ -381,9 +381,12 @@ export async function sendPlanGenJob(job: PlanGenJob): Promise<void> {
 const DRAFT_SELECT = "select * from plan_drafts";
 
 /** The status the app sees: a ready draft older than 7 days is expired, a pending one nobody touched for 15 minutes is a stalled failure. */
-export function effectiveState(d: Pick<PlanDraftRow, "status" | "error_code" | "updated_at">, now: Date): { status: PlanDraftRow["status"]; error_code: PlanDraftRow["error_code"] } {
+export function effectiveState(d: Pick<PlanDraftRow, "status" | "error_code" | "updated_at" | "intake">, now: Date): { status: PlanDraftRow["status"]; error_code: PlanDraftRow["error_code"] } {
   const idle = now.getTime() - new Date(d.updated_at).getTime();
   if (d.status === "ready" && idle > PLAN_GEN_READY_TTL_DAYS * 86_400_000) return { status: "expired", error_code: d.error_code };
+  // The plan starts on start_date: once that day is over (JST) the preview is a plan that began in the past, so it is expired like an old one
+  // (adopt answers 409 "draft is expired"; the app already has that screen). Starting today is still fine.
+  if (d.status === "ready" && d.intake?.start_date && d.intake.start_date < new Date(now.getTime() + 9 * 3600e3).toISOString().slice(0, 10)) return { status: "expired", error_code: d.error_code };
   if (d.status === "pending" && idle > PLAN_GEN_STALL_MIN * 60_000) return { status: "failed", error_code: "stalled" };
   return { status: d.status, error_code: d.error_code };
 }
