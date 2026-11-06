@@ -13,8 +13,9 @@ import { sessionLabel, shortDate, sportName } from "../lib/labels";
 import { getActivity, refreshToken, StravaError } from "../lib/strava";
 import { combineGroup, loadGroup, reviewLimitReached, settleAnswerMessages, writeLimitedReview } from "../lib/session-group";
 import { stageWriterAll, stageWriterByActivities, stageWriterByCorrection } from "../lib/stage";
+import { runPlanGenStep } from "../lib/plan-gen-run";
 import { maybeRerunWeeklyReview } from "../lib/weekly";
-import type { BriefsJob, CoachAskJob, CoachReplyJob, PlannedSessionRow, RoutineJob, StravaConnectionRow, StravaWebhookEvent } from "../types";
+import type { BriefsJob, CoachAskJob, CoachReplyJob, PlanGenJob, PlannedSessionRow, RoutineJob, StravaConnectionRow, StravaWebhookEvent } from "../types";
 
 // Any thrown error => SQS redelivers (visibility 90 s, 3 tries, then DLQ).
 // Aurora resuming from 0 ACU is the usual first failure: wait inside this run
@@ -26,7 +27,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const todayJst = () => new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
 
-type Job = StravaWebhookEvent | CoachReplyJob | CoachAskJob | RoutineJob | BriefsJob;
+type Job = StravaWebhookEvent | CoachReplyJob | CoachAskJob | RoutineJob | BriefsJob | PlanGenJob;
 
 async function handleJob(body: Job): Promise<void> {
   if ("type" in body && (body as { type: string }).type === "weekly_rerun") {
@@ -54,6 +55,12 @@ async function handleJob(body: Job): Promise<void> {
     }
     return;
   }
+  if ("type" in body && body.type === "plan_gen") {
+    // ai-plan-generation: one step per message (profile / skeleton / chunk n), each queues the next. Model and validation failures are
+    // written to the draft inside runPlanGenStep; only a database error comes out here and SQS redelivers it.
+    await runPlanGenStep(body);
+    return;
+  }
   await processEvent(body as StravaWebhookEvent);
 }
 
@@ -71,7 +78,7 @@ export const handler: SQSHandler = async (event) => {
   }
 };
 
-async function getFreshConnection(athleteId: number): Promise<StravaConnectionRow | undefined> {
+export async function getFreshConnection(athleteId: number): Promise<StravaConnectionRow | undefined> {
   const conn = await queryOne<StravaConnectionRow>(
     "select * from strava_connections where strava_athlete_id = $1",
     [athleteId],

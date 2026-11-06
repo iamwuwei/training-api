@@ -58,9 +58,10 @@ export function authorizeUrl(opts: { redirectUri: string; state: string }): stri
   return `https://www.strava.com/oauth/authorize?${q}`;
 }
 
-async function get<T>(accessToken: string, path: string): Promise<T> {
+async function get<T>(accessToken: string, path: string, signal?: AbortSignal): Promise<T> {
   const res = await fetch(`${API}${path}`, {
     headers: { authorization: `Bearer ${accessToken}` },
+    signal,
   });
   if (!res.ok) throw new StravaError(res.status, await res.text());
   return (await res.json()) as T;
@@ -75,9 +76,10 @@ export function getActivity(accessToken: string, id: number | string): Promise<S
 export function getActivities(
   accessToken: string,
   opts: { after?: number; before?: number; page?: number; per_page?: number } = {},
+  signal?: AbortSignal,
 ): Promise<StravaActivity[]> {
   const q = new URLSearchParams();
   for (const [k, v] of Object.entries(opts)) if (v !== undefined) q.set(k, String(v));
   const qs = q.toString();
-  return get<StravaActivity[]>(accessToken, `/athlete/activities${qs ? `?${qs}` : ""}`);
+  return get<StravaActivity[]>(accessToken, `/athlete/activities${qs ? `?${qs}` : ""}`, signal);
 }

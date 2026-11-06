@@ -446,10 +446,10 @@ function validateCard(b: PlanBriefing, raw: RawCard, today: string): CardDraft |
 
 // ---- flags: computed, not asked of the model -------------------------------------------
 
-const WEEK_UP_PCT = 15;     // weekly volume vs the week before
-const LONG_UP_M = 3000;     // long run vs the longest run so far
-const NEAR_RACE_DAYS = 14;  // a long run this close to the race ...
-const NEAR_RACE_LONG_M = 25_000; // ... of this length or more
+export const WEEK_UP_PCT = 15;     // weekly volume vs the week before
+export const LONG_UP_M = 3000;     // long run vs the longest run so far
+export const NEAR_RACE_DAYS = 14;  // a long run this close to the race ...
+export const NEAR_RACE_LONG_M = 25_000; // ... of this length or more
 
 /** A session as the flags and the one-a-day check see it. `counts`: the week a make-up row is booked in (undefined = the week of its date). */
 interface Sim { date: string; type: SessionType; label: string | null; dist: number | null; counts?: number | null }

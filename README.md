@@ -63,6 +63,7 @@ npm run seed      # 再跑一次：把 xlsx 裡手打的 判定／心得／提�
   課表改了就重跑這個再 `npm run seed`。
 - 兩個 user 的 uuid、`display_name`、`email` 寫死在 `seed/seed.ts` 的 `USERS`。`email` 填 Apple ID 的 email（或 private relay 位址）：第一次 Apple 登入會用 email 對到這一列並記下 `apple_sub`，之後只認 `apple_sub`。沒對到的人登入會拿到 403（封閉系統）。
 - 類型正規化表在 `scripts/xlsx-to-plans.py` 的 `TYPE_MAP`；遇到沒看過的類型會直接報錯列出來。
+- **`npm run seed` 只在空庫用。** 採用 AI 課表（見下面「AI 排課表」）後，舊的 seed 課表會被標成 `finished`；這時再跑 `seed` 會把它重新 insert 成第二份 active 課表。要補 Wei／Sara 的活動請用 `npm run backfill`。
 
 ## 3. 部署
 
@@ -256,6 +257,15 @@ Woo 拿到的：目標、課表階段、本週與下週課表（含完成狀況�
 
 範圍只限跑步、課表、比賽、恢復、睡眠補給、傷痛；離題一句話帶回來，叫它換角色或忘記規則也不理。它不能改課表，只能說明要在週回顧裡提出。回覆失敗時跑者的訊息標 `failed`（`meta.error`），前端顯示可以重送。
 
+## AI 排課表（`src/lib/plan-gen*.ts`、`history-summary.ts`、`history-import-strava.ts`）
+
+Woo 依一張表單（目標比賽、每週天數、固定休息日、經驗、注意事項）和跑者最近 12 週的紀錄，排一份從開始日到比賽日的完整課表，先預覽、採用才生效。草稿存在 `plan_drafts`，由 worker 的 `plan_gen` job 分步產生（`profile` 匯入 Strava 最近 84 天並算彙總，0 次模型呼叫 → `skeleton` 週骨架與思路，1 次 → `chunk` 每 4 週 1 次）；每步驗證不過重試 1 次，每份最多 12 次呼叫，「繼續」最多 2 次，每人每天最多 `PLAN_GEN_DAILY_LIMIT`（預設 3，0 = 關閉，POST 回 503）份，同時只有 1 份在產生。要 `npm run migrate`（新表 `plan_drafts`、`users.history_imported_at`）。
+
+- `POST <ApiUrl>/plan-drafts` body `PostPlanDraftRequest { intake }` → 202 `{ draft }`；400（表單哪裡不對，固定碼）、409（`generating`〔另帶 `draft_id`〕／`has active plan`／`strava not connected`）、429 `daily limit`、503 `plan generation is off`。
+- `GET <ApiUrl>/plan-drafts/latest` → `{ draft }`（最近一份產生中／排好／失敗的，沒有就 `null`）；`GET <ApiUrl>/plan-drafts/{id}` → `{ draft }`（輪詢用；排好 7 天沒採用視為 `expired`，產生中 15 分鐘沒動靜視為失敗〔`stalled`〕）。別人的草稿與不存在的 id 回一模一樣的 404 `draft not found`。
+- `POST <ApiUrl>/plan-drafts/{id}/adopt` → `{ plan_id }`：一個交易寫 `plans`／`plan_weeks`／`planned_sessions`／固定休息日的 `constraints`，已過期的舊課表標 `finished`（不刪任何東西）；再按一次回同一個 `plan_id`。409 `has active plan`／`draft is <status>`，鎖不到 503 `busy`。
+- `POST <ApiUrl>/plan-drafts/{id}/resume` → 202 `{ draft }`（從斷掉的那一步接著做）；409 `draft is <status>`／`calls exhausted`／`resume limit`。`POST …/discard` → `{ ok: true }`。
+
 ## 週總結（`src/handlers/weekly.ts`）
 
 每週日 21:00 JST（EventBridge Scheduler）對每個 active plan 跑一次，用 `CLAUDE_MODEL_WEEKLY`。輸入：目標、課表階段、上週總結、本週課表、本週每筆活動（含判定、RPE、心得）、單次判定留下的 `adjust_hint`、接下來三週的課表。輸出 `summary` 和 `adjustments`，存進 `weekly_reviews`，每條建議 `status = pending`。
@@ -271,7 +281,7 @@ training-api/
 ├── infra/        CDK（bin/app.ts, lib/stack.ts）
 ├── src/
 │   ├── handlers/ webhook / worker / oauth / weekly / api
-│   ├── lib/      db（pg Pool → Supabase）、supabase-ca（憑證鏈）、strava、claude
+│   ├── lib/      db（pg Pool → Supabase）、supabase-ca（憑證鏈）、strava、claude、plan-gen*（AI 排課表）、history-summary／history-import-strava（歷史彙總與 Strava 匯入）
 │   └── types.ts  內部 row / Strava 型別
 ├── types/        api.ts — API request/response 型別（前端直接複製用）
 ├── sql/          schema.sql

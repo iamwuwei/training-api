@@ -292,3 +292,32 @@ create table if not exists group_events (
 );
 create index if not exists group_events_group_created_idx on group_events (group_id, created_at desc);
 create unique index if not exists group_events_session_once_idx on group_events (group_id, session_id) where session_id is not null;
+
+-- ai-plan-generation: a plan draft Woo writes from the intake form and the athlete's Strava history (worker, plan_gen job),
+-- adopted into plans / plan_weeks / planned_sessions in one transaction. Never read by the coach prompts.
+create table if not exists plan_drafts (
+  id uuid primary key,
+  user_id uuid not null references users(id),
+  mode text not null default 'new',                  -- new (no active plan) | replan (Phase 0b: the active plan from start_date on)
+  status text not null default 'pending',            -- pending | ready | failed | adopted | discarded | expired
+  stage text,                                        -- profile | skeleton | chunk  (pending: what the worker is on)
+  intake jsonb not null,                             -- PlanIntake (validated)
+  profile jsonb,                                     -- AthleteProfile
+  skeleton jsonb,                                    -- { summary, weeks: DraftWeek[] }
+  sessions jsonb not null default '[]',              -- DraftSession[] (validated), appended chunk by chunk
+  chunks_total int,                                  -- ceil(weeks / 4)
+  chunks_done int not null default 0,
+  flags jsonb not null default '[]',                 -- DraftFlag[] (computed when ready)
+  calls int not null default 0,                      -- model calls spent on this draft (hard cap PLAN_GEN_MAX_CALLS)
+  resumes int not null default 0,                    -- POST …/resume count (cap PLAN_GEN_MAX_RESUMES)
+  last_error text,                                   -- validation feedback for the retry / provider wording for the log; never shown
+  error_code text,                                   -- fixed code for the app: model_failed | validation_failed | calls_exhausted | stalled
+  model text,
+  adopted_plan_id uuid references plans(id),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists plan_drafts_user_created_idx on plan_drafts (user_id, created_at);
+create index if not exists plan_drafts_user_pending_idx on plan_drafts (user_id) where status = 'pending';
+alter table users add column if not exists history_imported_at timestamptz;   -- last Strava history import (plan_gen profile step)
+-- plans.status: 'active' | 'finished' (an adopted draft replaced a plan whose race_date had passed). No schema change.

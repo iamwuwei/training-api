@@ -1,7 +1,7 @@
 // Internal row + Strava types. Keep in sync with sql/schema.sql.
 // Public API request/response types live in ../types/api.ts.
 
-import type { MatchStatus, ProposalField, SessionType, Verdict } from "../types/api";
+import type { MatchStatus, PlanIntake, ProposalField, SessionType, Verdict } from "../types/api";
 export type { MatchStatus, ProposalField, SessionType, Verdict };
 
 export interface UserRow {
@@ -474,3 +474,71 @@ export interface GroupEventRow {
   session_date: string | null; // 'YYYY-MM-DD'
   created_at: Date;
 }
+
+// ---- ai-plan-generation -----------------------------------------------------
+
+/** SQS message for one step of a plan draft (the worker does the step, then queues the next). */
+export interface PlanGenJob {
+  type: "plan_gen";
+  user_id: string;
+  draft_id: string;
+  step: "profile" | "skeleton" | "chunk";
+  chunk?: number;
+}
+
+export interface DraftWeek { week_no: number; week_start: string; week_end: string; phase: string; focus: string; km: number; long_km: number; key: string; taper: boolean }
+
+export interface DraftSession {
+  date: string; type: SessionType; label: string; content: string; note: string | null;
+  distance_m: number | null; pace_min_sec_km: number | null; pace_max_sec_km: number | null; hr_min: number | null; hr_max: number | null;
+  week_no: number;
+}
+
+/** text has no week number and no date of its own (the flag hangs on a week / a day); toApiDraft projects by scope. */
+export interface DraftFlag { scope: "plan" | "week" | "session"; week_no?: number; date?: string; text: string }
+
+/** The athlete's last 12 weeks as the plan generator reads them (history-summary.ts is the only code that builds it). */
+export interface AthleteProfile {
+  from: string; to: string;
+  weeks: { week_start: string; runs: number; km: number; longest_km: number }[];
+  last4: { runs_per_week: number; km_per_week: number };
+  prev8: { runs_per_week: number; km_per_week: number };
+  change_pct: number | null;
+  longest: { date: string; km: number; pace_sec_km: number | null; avg_hr: number | null } | null;
+  avg_pace_sec_km: number | null;
+  avg_hr: number | null;
+  recent: { date: string; km: number; pace_sec_km: number | null; avg_hr: number | null; label: string | null }[];
+  previous_plan: { race_name: string; race_date: string; verdicts: { ok: number; warn: number; bad: number }; missed: number; trend: string[] } | null;
+  import_error: boolean;
+  total_runs: number;
+  hr_zones: { lt140: number; z140_155: number; z155_170: number; gte170: number } | null;
+  pace_bands: { lt6: number; p6_7: number; p7_8: number; gte8: number } | null;
+  last_race: { name: string; date: string; distance_m: number; actual_time_sec: number | null; days_ago: number } | null;
+}
+
+export interface PlanDraftRow {
+  id: string;
+  user_id: string;
+  mode: "new" | "replan";
+  status: "pending" | "ready" | "failed" | "adopted" | "discarded" | "expired";
+  stage: "profile" | "skeleton" | "chunk" | null;
+  intake: PlanIntake;
+  profile: AthleteProfile | null;
+  skeleton: { summary: string; weeks: DraftWeek[] } | null;
+  sessions: DraftSession[];
+  chunks_total: number | null;
+  chunks_done: number;
+  flags: DraftFlag[];
+  calls: number;
+  resumes: number;
+  last_error: string | null;
+  error_code: "model_failed" | "validation_failed" | "calls_exhausted" | "stalled" | null;
+  model: string | null;
+  adopted_plan_id: string | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
+/** The model's skeleton / chunk as it comes back, before validation (every field may be missing or the wrong type). */
+export interface RawSkeleton { summary?: unknown; weeks?: unknown }
+export interface RawChunk { sessions?: unknown }
