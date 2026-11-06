@@ -809,13 +809,18 @@ export interface PostCoachMessageResponse {
 // email, Strava ids, memo / RPE, the coach thread, constraints, raw data, gear, model names, his other groups.
 
 export interface ShareSettings {
-  progress: boolean;  // dashboard numbers              default true
-  events: boolean;    // my 完成了○○ events               default true
-  plan: boolean;      // my plan (weeks, sessions)       default false
-  runs: boolean;      // distance / time / pace / HR / splits of my runs   default false
-  reviews: boolean;   // Woo's verdict, reminders, comment                 default false
+  progress: boolean;  // dashboard numbers
+  events: boolean;    // my 完成了○○ events
+  plan: boolean;      // my plan (weeks, sessions)
+  runs: boolean;      // distance / time / pace / HR / splits of my runs
+  reviews: boolean;   // Woo's verdict, reminders, comment
 }
-/** GET /me/share → { share } (defaults when never set). PUT /me/share { share: Partial<ShareSettings> } → { share }; non-boolean → 400. Takes effect on the next request of anyone. */
+/**
+ * GET /me/share → { share }. PUT /me/share { share: Partial<ShareSettings> } → { share }; non-boolean → 400. Takes effect on the next request of anyone.
+ * Defaults: the first time a user becomes a member of any group (POST /groups, POST /invites/{token}/accept) the api writes his row with
+ * all five true (since 2026-11-06; never overwrites a row). A user with no row (joined before that, or never joined) reads as
+ * progress / events true, plan / runs / reviews false.
+ */
 export interface ShareResponse { share: ShareSettings }
 export interface PutShareRequest { share: Partial<ShareSettings> }
 
