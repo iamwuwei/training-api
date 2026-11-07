@@ -243,6 +243,8 @@ export interface ProposalItem {
   makeup?: boolean;
   /** After apply, a make-up row: the week its numbers are booked in. */
   counts_in_week_no?: number | null;
+  /** coach-correct-plan: a change to a completed session's target_distance_m / note (set by validateCard, not by the model). */
+  correction?: boolean;
 }
 
 export interface ProposalWeek { week_no: number; phase: string | null; focus: string | null }

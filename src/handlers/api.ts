@@ -1005,6 +1005,7 @@ function toApiProposal(p: ProposalRow): ApiProposal {
       applied_session_id: i.applied_session_id ?? null,
       makeup: i.makeup === true,
       counts_in_week_no: i.counts_in_week_no ?? null,
+      correction: i.correction === true,
     })),
     weeks: Array.isArray(p.weeks) ? p.weeks : [],
     why: p.why,
