@@ -301,9 +301,9 @@ export function touchedWeekNos(weeks: PlanWeekRow[], items: ProposalItem[]): Set
  * length limits. A pair with one bad card keeps the good one as a single card (no letter, no group); `dropped` says which
  * card went and why. `error` is set (and `drafts` empty) when nothing is left: the text of the reply is kept either way.
  */
-export function checkCards(b: PlanBriefing, raws: RawCard[], today: string, maxCards = 2): { drafts: CardDraft[]; dropped: string[]; error: string | null } {
+export function checkCards(b: PlanBriefing, raws: RawCard[], today: string, maxCards = 2, allowCorrections = true): { drafts: CardDraft[]; dropped: string[]; error: string | null } {
   if (!Array.isArray(raws) || raws.length < 1 || raws.length > maxCards) return { drafts: [], dropped: [], error: `expected 1 to ${maxCards} cards, got ${Array.isArray(raws) ? raws.length : "none"}` };
-  const checked = raws.map((raw, i) => ({ i, raw, d: validateCard(b, raw, today) }));
+  const checked = raws.map((raw, i) => ({ i, raw, d: validateCard(b, raw, today, allowCorrections) }));
   const bad = checked.filter((c): c is typeof c & { d: string } => typeof c.d === "string");
   const good = checked.filter((c): c is typeof c & { d: CardDraft } => typeof c.d !== "string");
   const dropped = bad.map((c) => `card ${c.i + 1}: ${c.d}`);
@@ -324,19 +324,23 @@ export function checkCards(b: PlanBriefing, raws: RawCard[], today: string, maxC
 }
 
 /** `checkCards` as the old shape: the cards, or a string saying why none is left. */
-export function validateCards(b: PlanBriefing, raws: RawCard[], today: string, maxCards = 2): CardDraft[] | string {
-  const r = checkCards(b, raws, today, maxCards);
+export function validateCards(b: PlanBriefing, raws: RawCard[], today: string, maxCards = 2, allowCorrections = true): CardDraft[] | string {
+  const r = checkCards(b, raws, today, maxCards, allowCorrections);
   return r.error ?? r.drafts;
 }
 
-function validateCard(b: PlanBriefing, raw: RawCard, today: string): CardDraft | string {
+/**
+ * `allowCorrections` false (the weekly review): a completed session is not a card target at all, the same sentence develop gives
+ * ("session X is completed"). The coach chat allows corrections of completed sessions (target_distance_m / note).
+ */
+function validateCard(b: PlanBriefing, raw: RawCard, today: string, allowCorrections = true): CardDraft | string {
   if (!raw || typeof raw !== "object") return "not an object";
   const race = b.plan.race_date;
   const lastDay = addDays(race, -1);
   const inRange = (d: string) => d >= today && d <= lastDay;
   const changeable = new Map(changeableSessions(b, today).map((s) => [s.id, s]));
   const past = new Map(catchUpSessions(b, today).map((s) => [s.id, s])); // not run, before today: may only be moved forward (補課)
-  const completed = new Map(completedSessions(b, today).map((s) => [s.id, s])); // done, this week or last: only target_distance_m / note (更正)
+  const completed = new Map((allowCorrections ? completedSessions(b, today) : []).map((s) => [s.id, s])); // done, this week or last: only target_distance_m / note (更正)
   const correctedIds = new Set<string>();
   const byId = new Map(b.sessions.map((s) => [s.id, s]));
   const fixed = fixedWeekdays(b.constraints);

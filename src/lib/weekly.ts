@@ -303,7 +303,7 @@ async function generate(
   let drafts: CardDraft[] = [];
   let rejected = false;
   if (review.proposals.length) {
-    const checked = validateCards(scope, review.proposals, today, 1);
+    const checked = validateCards(scope, review.proposals, today, 1, false); // the weekly review does not open correction cards (chat only)
     if (typeof checked === "string") {
       console.warn(`weekly review for plan ${plan.id} week ${weekStart}: proposals dropped (${checked})`);
       rejected = true;

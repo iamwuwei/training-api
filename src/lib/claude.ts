@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { CARD_SCHEMA, MARKDOWN_SUBSET, NOTE_RULE, PROPOSAL_RULES } from "./card-schema";
+import { CARD_SCHEMA, MARKDOWN_SUBSET, NOTE_RULE, PROPOSAL_RULES_WEEKLY } from "./card-schema";
 import { constraintLine } from "./constraints";
 import { CORRECTION_NOTE_MAX, CORRECTION_TEXT_MAX, type CorrectionNote } from "./correction";
 import { FIELD_NAMES, isApproxDistance, isRunSport, shortDate, targetKmText } from "./labels";
@@ -395,7 +395,7 @@ const WEEKLY_SYSTEM = `你是 Woo，一位務實的馬拉松教練，長期帶�
 - ${NOTE_RULE}
 - 提案（proposals）最多一張（週回顧不出 A／B，option_title 給空字串、recommended 給 false），只在有明確理由時附（受傷風險、連續未達成、明顯超前或落後、連續漏課）。落後或超前時，連接下來幾週一起調，不要只調下週。沒有需要調整就回空陣列。每張卡都會先給跑者看，他按「採用整張」才會生效，所以要寫清楚理由。
 
-${PROPOSAL_RULES}
+${PROPOSAL_RULES_WEEKLY}
 
 ${appNotes("Woo")}`;
 
