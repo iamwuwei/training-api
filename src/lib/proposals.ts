@@ -783,6 +783,15 @@ export async function applyProposal(p: ProposalRow, today: string): Promise<Appl
     if (hard) return { ok: false, status: 400, error: hard };
     if ((p.weeks ?? []).some((w) => !touchedWeekNos(weeks, p.items).has(w.week_no))) return { ok: false, status: 400, error: "a week description for a week this card does not touch" };
 
+    // The completed sessions this card corrects. The `correction` flag alone is not trusted (it is a jsonb key): a session counts only
+    // when EVERY row of it is a change of target_distance_m / note; anything else on a completed session is the old rule
+    // (409 completed, as on develop), and a card of more than CORRECTIONS_PER_CARD such sessions is refused.
+    const correctionOf = new Set(ids.filter((id) => {
+      const mine = p.items.filter((i) => i.session_id === id);
+      return mine.length > 0 && mine.every((i) => i.correction === true && (i.op ?? "change") === "change" && COMPLETED_FIELDS.has(i.field as string));
+    }));
+    if (correctionOf.size > CORRECTIONS_PER_CARD) return { ok: false, status: 400, error: `more than ${CORRECTIONS_PER_CARD} completed sessions corrected in one card` };
+
     // Anything that moved under the card since it was written?
     const changed: (PlanChanged & { text: string })[] = [];
     for (const id of ids) {
@@ -792,7 +801,7 @@ export async function applyProposal(p: ProposalRow, today: string): Promise<Appl
       const to = dateItemOf(id)?.new;
       // coach-correct-plan: a correction row is for a session that IS completed; it goes stale when that stopped being true (the
       // activity was unbound). Cards written before this feature have no `correction` and keep the old rule (completed = stale).
-      const corr = p.items.some((i) => i.session_id === id && i.correction === true);
+      const corr = correctionOf.has(id);
       let why: "changed" | "completed" | null = null, text = "";
       if (!row || row.superseded) { why = "changed"; text = `${day} 在這張卡之後被改過`; }
       else if (corr && !row.done) { why = "changed"; text = `${day} 已不是已完成的課`; }
