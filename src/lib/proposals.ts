@@ -399,11 +399,15 @@ function validateCard(b: PlanBriefing, raw: RawCard, today: string, allowCorrect
       if (!isStr(field) || !COMPLETED_FIELDS.has(field)) return `session ${id} is completed: only target_distance_m and note can be corrected`;
       if (seen.has(field)) return `session ${id}: ${field} changed twice`;
       // A note is the model's string that later lands in the verdict prompt: one line, like every other string of a card.
-      const value = field === "note" && isStr(c.new) ? text(c.new) : c.new ?? null;
+      // An empty note after that is "no note" (null): clearing a note is a valid correction, "nothing → nothing" is not.
+      const value = field === "note" ? (isStr(c.new) ? text(c.new) || null : c.new ?? null) : c.new ?? null;
       const bad = validateChangeValue(field, value);
       if (bad) return bad;
+      // The distance of a completed session is a real, whole number of metres, never 0 (a 0 drops the km from the title); the
+      // plain change path of an unfinished session keeps its own, looser check.
+      if (field === "target_distance_m" && !(Number.isInteger(value) && (value as number) > 0)) return "target_distance_m of a completed session must be a whole number of metres above 0";
       const current = s[field as "target_distance_m" | "note"] as string | number | null;
-      if (current === value) return `${field} unchanged`;
+      if ((field === "note" ? (isStr(current) ? text(current) || null : null) : current) === value) return `${field} unchanged`;
       correctedIds.add(id);
       if (correctedIds.size > CORRECTIONS_PER_CARD) return `more than ${CORRECTIONS_PER_CARD} completed sessions corrected in one card`;
       seen.add(field);

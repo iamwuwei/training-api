@@ -374,7 +374,7 @@ export function buildPlanBriefing(b: PlanBriefing, today: string): string {
     "## 每週階段",
     ...b.weeks.map((w) => `- 第 ${w.week_no} 週 ${w.week_start}〜${w.week_end}${w.phase ? ` ${w.phase}` : ""}${w.focus ? `：${w.focus}` : ""}${cur?.week_no === w.week_no ? "　← 本週" : w.week_end < today ? `　（已過，${b.reviewedWeeks.has(w.week_no) ? "週回顧已產生" : "沒有週回顧"}）` : ""}`),
     "",
-    "## 今天到比賽日的逐日課表（每一堂；id 在每行中間；提案只能動今天（含）到比賽日前一天、還沒完成的課）",
+    "## 今天到比賽日的逐日課表（每一堂；id 在每行中間；提案只能動今天（含）到比賽日前一天、還沒完成的課；已完成的只能更正目標距離與備註）",
     upcoming.length ? upcoming.map((s) => sessionLine(s, today, plan.race_date)).join("\n") : "（沒有了）",
     "",
     "## 已過的課（本週與上週每一堂；更早只列漏跑的。補課只能用標「漏跑」「他說沒跑」的；更正只能用標「已完成」的；都用它的 id）",

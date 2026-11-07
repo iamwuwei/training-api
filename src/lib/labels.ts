@@ -28,8 +28,8 @@ export function sessionLabel(s: Pick<PlannedSessionRow, "label" | "type" | "targ
 export const isApproxDistance = (s: Pick<PlannedSessionRow, "type" | "content">) => s.type === "interval" || /×|秒/.test(s.content ?? "");
 
 /** "8.0 km（估計）" / "16.0 km" / "" for a briefing line: the planned distance, marked when it is an estimate. */
-export const targetKmText = (s: Pick<PlannedSessionRow, "type" | "content" | "target_distance_m">, digits = 1) =>
-  s.target_distance_m ? `${(s.target_distance_m / 1000).toFixed(digits)} km${isApproxDistance(s) ? "（估計）" : ""}` : "";
+export const targetKmText = (s: Pick<PlannedSessionRow, "type" | "content" | "target_distance_m">) =>
+  s.target_distance_m ? `${(s.target_distance_m / 1000).toFixed(1)} km${isApproxDistance(s) ? "（估計）" : ""}` : "";
 
 /** "10/25" from 'YYYY-MM-DD'. */
 export const shortDate = (iso: string) => iso.slice(5).replace("-", "/");
