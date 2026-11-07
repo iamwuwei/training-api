@@ -658,6 +658,13 @@ export interface ApiProposalChange {
   makeup: boolean;
   /** After apply, a make-up row: the week its numbers are booked in (same as ApiSession.counts_in_week_no). null before apply and on other rows. */
   counts_in_week_no: number | null;
+  /**
+   * coach-correct-plan: op = change on a session that is already completed (an activity is bound), correcting one of its
+   * estimated fields (target_distance_m or note only). Computed by the api, the model does not fill it. Draw the row with a
+   * 更正 badge (like 補課). Applying writes a new version of the session (the activity follows) and re-judges it once
+   * (the report page's verdict and the thread's review message are replaced). false on every other row.
+   */
+  correction: boolean;
 }
 
 export interface ApiProposalWeek {
@@ -714,6 +721,12 @@ export interface ApiProposal {
 //        proposal, completed, its date has passed since the card was written (a session that is not a make-up),
 //        or the date a session / make-up is moved to has passed ("10/27 Easy 5 km 要移到的 10/28 已經過了").
 //        The card is now `stale` (stale_reason says which); show 課表已變, offer 請 Woo 重看 (re_propose) / 算了 (dismiss).
+//        coach-correct-plan: a correction row (`correction: true`) whose session was unbound since the card was written
+//        (no longer a completed session) is also a 409: `changed[].why = "changed"`, stale_reason "11/4 坡跑 8 km 已不是已完成的課".
+//        A correction row is not refused for being completed; a card written before coach-correct-plan still is (why "completed").
+//   200 (coach-correct-plan): every session a correction row touched is queued for one re-judge (REVIEW_DAILY_LIMIT applies):
+//        the report page shows "分析中" for a moment and the thread gets a new review message; when the day's limit is used up
+//        it is the existing failed row and fixed line.
 //   409  { error: "already <status>" } — not pending any more (also a stale card).
 //   400  { error } — the card breaks a hard rule: it touches the race day, a date is outside today …
 //        the day before the race, a session (not a make-up) moves off a day the athlete said is fixed, a value is

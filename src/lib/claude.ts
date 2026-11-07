@@ -1,8 +1,8 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { CARD_SCHEMA, MARKDOWN_SUBSET, NOTE_RULE, PROPOSAL_RULES } from "./card-schema";
+import { CARD_SCHEMA, MARKDOWN_SUBSET, NOTE_RULE, PROPOSAL_RULES_WEEKLY } from "./card-schema";
 import { constraintLine } from "./constraints";
 import { CORRECTION_NOTE_MAX, CORRECTION_TEXT_MAX, type CorrectionNote } from "./correction";
-import { FIELD_NAMES, isRunSport, shortDate } from "./labels";
+import { FIELD_NAMES, isApproxDistance, isRunSport, shortDate, targetKmText } from "./labels";
 import { bandText, sessionBand, splitsSummary } from "./splits";
 import type {
   ActivityReviewResult,
@@ -88,7 +88,7 @@ async function ask<T>(modelId: string, system: string | Anthropic.TextBlockParam
  * What the app is, so the coach describes it the same way everywhere (chat, verdicts,
  * the weekly review) and never invents a page or sends the athlete to "someone else".
  */
-export function appNotes(coachName: string): string {
+export function appNotes(coachName: string, weekly = false): string {
   return `## 這個 app（你講到 app 時只能照這段說）
 - 跑者有四個頁面：「今天」（今天的課、跑完的按鈕、最近的進步區塊）、「課表」（整份課表，點一堂看內容）、「群組」（他和朋友報同一場比賽的群組，可以有好幾個：看得到彼此的進度彙總、誰完成了課、${coachName} 給他們的判定、以及他們願意分享的課表；每個人在設定裡決定分享什麼）、「教練」（就是你，${coachName}，一個對話串）。每趟活動還有一個報告頁（數據、分段、你的判定）。你看不到別人的任何資料，被問到別人的狀況只能說你沒有資料。沒有課表（或課表跑完了）的人，今天頁有「請 Woo 幫我排課表」：填一張表單，你會看他 Strava 最近 12 週，排一整份課表給他預覽、採用——那是另一個流程，**你在這個對話裡不產生整份課表**；被要求時指他去今天頁按那顆按鈕。
 - 週回顧就在教練這個對話串裡，每週一則，週一早上 04:00 發出；不是另一個頁面。週回顧也可以附同一種提案卡。
@@ -96,6 +96,7 @@ export function appNotes(coachName: string): string {
 - 他說過的限制（出國、受傷、固定日…）你會附一張「記下來」小卡，他按了才記；記住的限制在設定頁的「Woo 記住的限制」列著，他可以刪。
 - 跑完的流程：Strava 同步進來後你先問「是哪一趟」（他點選）、再問感受（他回一句）、然後你給判定（達成／達成但有提醒／未達成）貼在對話串和報告頁。一堂課可以綁多筆紀錄（手錶誤關再開）：同一天第二筆進來時你會先問「是同一堂的另一段嗎」；跑者也能在報告頁的「這堂的活動」加進或移除一筆。多段時你的判定看合計。
 - 跑完的判定如果判錯（他在對話裡指出課表或數據的事實），你在對話裡可以重判：報告頁的判定會換成新的、對話串多一則「已更新判定」。課表你還是只能提案，判定可以重做。
+- 報告頁、課表頁與判定訊息的標題是「課名＋課表的目標距離」（例如「坡跑 8 km」）；坡跑、間歇這類用趟數與秒數寫的課，目標距離是匯入課表時估的，標「估計」。${weekly ? "" : "已完成的課的目標距離與備註可以用提案卡更正，他採用後那堂會重判一次、標題跟著換；日期、類型、判定內容不能從課表那邊改。"}
 - 規則：跟他個人有關的事（他跑了什麼、心拍多少、哪天跳過、課表內容）只能用 briefing 裡的資料；briefing 沒有的，只能說「這個我沒有資料，你跟我說」。不能叫他去問別人、去問負責的人、去看不存在的頁面或按鈕。`;
 }
 
@@ -106,7 +107,7 @@ function goalText(plan: PlanRow): string {
 }
 
 function sessionLine(s: PlannedSessionRow): string {
-  const km = s.target_distance_m ? `${(s.target_distance_m / 1000).toFixed(1)} km` : "-";
+  const km = targetKmText(s) || "-";
   return `- ${s.scheduled_date} [${s.label ?? s.type}] ${s.content ?? ""} ${km} 目標 ${s.target ?? "-"} id=${s.id}${s.note ? ` — ${s.note}` : ""}`;
 }
 
@@ -297,7 +298,7 @@ export function buildReviewPrompt({ session: s, activity: a, context: c }: Activ
   parts.push(
     "## 今天的課表",
     `${s.scheduled_date} [${s.label ?? s.type}] ${s.content ?? ""}`,
-    `目標距離 ${s.target_distance_m ? (s.target_distance_m / 1000).toFixed(1) : "-"} km；這堂的配速／心拍區間（判定以此為準）：${s.target?.trim() || bandText(sessionBand(s)) || "-"}`,
+    `目標距離 ${s.target_distance_m ? `${(s.target_distance_m / 1000).toFixed(1)} km${isApproxDistance(s) ? "（估計值，不拿來扣分）" : ""}` : "-"}；這堂的配速／心拍區間（判定以此為準）：${s.target?.trim() || bandText(sessionBand(s)) || "-"}`,
     s.note ? `備註：${s.note}` : "",
     "",
     "## 實際",
@@ -394,9 +395,9 @@ const WEEKLY_SYSTEM = `你是 Woo，一位務實的馬拉松教練，長期帶�
 - ${NOTE_RULE}
 - 提案（proposals）最多一張（週回顧不出 A／B，option_title 給空字串、recommended 給 false），只在有明確理由時附（受傷風險、連續未達成、明顯超前或落後、連續漏課）。落後或超前時，連接下來幾週一起調，不要只調下週。沒有需要調整就回空陣列。每張卡都會先給跑者看，他按「採用整張」才會生效，所以要寫清楚理由。
 
-${PROPOSAL_RULES}
+${PROPOSAL_RULES_WEEKLY}
 
-${appNotes("Woo")}`;
+${appNotes("Woo", true)}`;
 
 const WEEKLY_SCHEMA = {
   type: "object",
