@@ -316,7 +316,9 @@ export function pastSessionLines(b: Pick<PlanBriefing, "weeks" | "sessions" | "a
     else if (rest) state = isStrength(s) ? "肌力日（沒有活動紀錄，不補課）" : "休息";
     else if (s.skipped_at) state = `他說沒跑｜id=${s.id}`;
     else state = `漏跑（沒有紀錄）｜id=${s.id}`;
-    rows.push({ date: s.scheduled_date, label: s.label ?? s.type, line: head(s.scheduled_date, s.label, s.type, [what, state].filter(Boolean).join("｜")) });
+    // The note as it is now (the same form as the day-by-day list): a correction card may rewrite it, and Woo has to see the old words.
+    const note = isRunSession(s) && s.note ? `備註：${s.note.replace(/\s+/g, " ")}` : "";
+    rows.push({ date: s.scheduled_date, label: s.label ?? s.type, line: head(s.scheduled_date, s.label, s.type, [what, note, state].filter(Boolean).join("｜")) });
   }
   for (const m of b.moved) {
     if (m.scheduled_date >= today || m.scheduled_date < recentFrom) continue;
