@@ -1,6 +1,6 @@
 import { loadLiveConstraints, constraintLine, WEEKDAY_ZH, weekdayOf } from "./constraints";
 import { query } from "./db";
-import { countsWeekNo, isRunSport, isStrength, shortDate, sportName, weekOf } from "./labels";
+import { countsWeekNo, isApproxDistance, isRunSport, isStrength, sessionLabel, shortDate, sportName, targetKmText, weekOf } from "./labels";
 import { fullSplits, splitPace } from "./splits";
 import { trendLines, type TrendRun } from "./trend";
 import { loadPlanWeeks } from "./context";
@@ -170,6 +170,15 @@ export function catchUpSessions(b: Pick<PlanBriefing, "sessions">, today: string
   return b.sessions.filter((s) => s.scheduled_date < today && !s.done && isRunSession(s));
 }
 
+/**
+ * Completed sessions Woo may correct (target_distance_m / note only): a run, done, this week or last week (the same window as
+ * pastSessionLines), up to today. Today's completed session is in the day-by-day list, with its id.
+ */
+export function completedSessions(b: Pick<PlanBriefing, "sessions">, today: string): SessionWithDone[] {
+  const recentFrom = addDays(mondayOf(today), -7);
+  return b.sessions.filter((s) => s.done && isRunSession(s) && s.scheduled_date >= recentFrom && s.scheduled_date <= today);
+}
+
 function sessionLine(s: SessionWithDone, today: string, raceDate: string): string {
   const marks = [
     s.type === "race" || s.scheduled_date === raceDate ? "比賽日，不能動" : "",
@@ -180,7 +189,7 @@ function sessionLine(s: SessionWithDone, today: string, raceDate: string): strin
   ].filter(Boolean);
   const parts = [
     `${s.content ?? ""}`.trim(),
-    s.target_distance_m ? `${km1(s.target_distance_m)} km` : "",
+    targetKmText(s),
     s.target ? `配速／心拍 ${s.target}` : s.target_pace_sec_km ? `配速 ${pace(s.target_pace_sec_km)}` : "",
     s.note ? `備註：${s.note.replace(/\s+/g, " ")}` : "",
     `id=${s.id}`,
@@ -208,7 +217,7 @@ function activityLine(a: BriefActivity, detail: boolean): string {
   const what = isRunSport(a.sport_type)
     ? `${(a.distance_m / 1000).toFixed(2)} km ${pace(a.avg_pace_sec_km)} 心拍 ${a.avg_hr ?? "-"}`
     : `${sportName(a.sport_type)} ${Math.round(a.moving_time_sec / 60)} 分 心拍 ${a.avg_hr ?? "-"}`;
-  const to = a.session ? `${a.session.label ?? a.session.type}${a.session.scheduled_date !== a.date ? `（${shortDate(a.session.scheduled_date)} 的課）` : ""}` : "未排課";
+  const to = a.session ? `${sessionLabel(a.session)}${isApproxDistance(a.session) ? "（估計）" : ""}${a.session.scheduled_date !== a.date ? `（${shortDate(a.session.scheduled_date)} 的課）` : ""}` : "未排課";
   const own = a.rpe || (detail && a.memo) ? `｜自述：${a.rpe ? `RPE ${a.rpe} ` : ""}${detail ? (a.memo ?? "").replace(/\s+/g, " ").slice(0, 80) : ""}`.trimEnd() : "";
   const line = `- ${a.date} 配 ${to}｜${what}${segmentsText(a)}｜${verdictText(a)}${own}`;
   if (!detail) return line;
@@ -295,11 +304,14 @@ export function pastSessionLines(b: Pick<PlanBriefing, "weeks" | "sessions" | "a
     const rest = !isRunSession(s) && s.type !== "race"; // a rest day or a strength day: nothing to miss
     if (!recent && (s.done || rest || s.type === "race")) continue;
     const content = `${s.content ?? ""}`.replace(/\s+/g, " ").trim();
-    const what = rest && !isStrength(s) ? "" : [content, /km/i.test(content) ? "" : sessionKm(s).trim()].filter(Boolean).join(" "); // the content often names the distance already
+    // The target distance is always printed (and marked 估計 when it is an estimate), even when the content names a distance
+    // already: "2 km Easy + 6×90 秒上坡 + 2 km Easy" does not say what the title "坡跑 8 km" came from.
+    const what = rest && !isStrength(s) ? "" : [content, s.target_distance_m ? `目標距離 ${targetKmText(s)}` : ""].filter(Boolean).join(" ");
     let state: string;
     if (s.done) {
       const a = b.activities.find((x) => x.session?.id === s.id);
-      state = `已完成${a ? `（配 ${shortDate(a.date)} 的 ${isRunSport(a.sport_type) ? `${(a.distance_m / 1000).toFixed(1)} km` : sportName(a.sport_type)}）` : ""}`;
+      // A completed run carries its id: Woo may correct its estimated fields (completedSessions).
+      state = `已完成${a ? `（配 ${shortDate(a.date)} 的 ${isRunSport(a.sport_type) ? `${(a.distance_m / 1000).toFixed(1)} km` : sportName(a.sport_type)}）` : ""}${isRunSession(s) ? `｜id=${s.id}` : ""}`;
     } else if (s.type === "race") state = "比賽日";
     else if (rest) state = isStrength(s) ? "肌力日（沒有活動紀錄，不補課）" : "休息";
     else if (s.skipped_at) state = `他說沒跑｜id=${s.id}`;
@@ -352,6 +364,7 @@ export function buildPlanBriefing(b: PlanBriefing, today: string): string {
   return [
     `今天 ${today}（${weekday(today)}）。跑者 ${plan.display_name}，目標 ${plan.race_name}（${plan.race_date}，${weekday(plan.race_date)}），目標完賽 ${goalText(plan)}，距離比賽 ${d} 天（約 ${Math.max(0, Math.round(d / 7))} 週）。`,
     makeupRuleLine(b, today),
+    "課名後面的距離（例如「坡跑 8 km」）是課表的目標距離欄位（匯入課表時填的）；標「估計」的是估計值（坡跑、間歇這類以趟數和秒數寫的課），判定不拿它扣分。報告頁的標題與判定訊息的標題顯示的就是這個數字；已完成的課的目標距離與備註可以用更正卡改（見提案規則）。",
     "",
     "## 記住的限制（他說過的；排課不能違反）",
     ...(b.constraints.length ? b.constraints.map(constraintLine) : ["（沒有）"]),
@@ -362,7 +375,7 @@ export function buildPlanBriefing(b: PlanBriefing, today: string): string {
     "## 今天到比賽日的逐日課表（每一堂；id 在每行中間；提案只能動今天（含）到比賽日前一天、還沒完成的課）",
     upcoming.length ? upcoming.map((s) => sessionLine(s, today, plan.race_date)).join("\n") : "（沒有了）",
     "",
-    "## 已過的課（本週與上週每一堂；更早只列漏跑的。補課只能用標「漏跑」「他說沒跑」的，用它的 id）",
+    "## 已過的課（本週與上週每一堂；更早只列漏跑的。補課只能用標「漏跑」「他說沒跑」的；更正只能用標「已完成」的；都用它的 id）",
     ...(past.length ? past : ["（沒有）"]),
     "",
     "## 過去每週（一週一行）",

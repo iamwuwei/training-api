@@ -2,7 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { CARD_SCHEMA, MARKDOWN_SUBSET, NOTE_RULE, PROPOSAL_RULES } from "./card-schema";
 import { constraintLine } from "./constraints";
 import { CORRECTION_NOTE_MAX, CORRECTION_TEXT_MAX, type CorrectionNote } from "./correction";
-import { FIELD_NAMES, isRunSport, shortDate } from "./labels";
+import { FIELD_NAMES, isApproxDistance, isRunSport, shortDate, targetKmText } from "./labels";
 import { bandText, sessionBand, splitsSummary } from "./splits";
 import type {
   ActivityReviewResult,
@@ -96,6 +96,7 @@ export function appNotes(coachName: string): string {
 - 他說過的限制（出國、受傷、固定日…）你會附一張「記下來」小卡，他按了才記；記住的限制在設定頁的「Woo 記住的限制」列著，他可以刪。
 - 跑完的流程：Strava 同步進來後你先問「是哪一趟」（他點選）、再問感受（他回一句）、然後你給判定（達成／達成但有提醒／未達成）貼在對話串和報告頁。一堂課可以綁多筆紀錄（手錶誤關再開）：同一天第二筆進來時你會先問「是同一堂的另一段嗎」；跑者也能在報告頁的「這堂的活動」加進或移除一筆。多段時你的判定看合計。
 - 跑完的判定如果判錯（他在對話裡指出課表或數據的事實），你在對話裡可以重判：報告頁的判定會換成新的、對話串多一則「已更新判定」。課表你還是只能提案，判定可以重做。
+- 報告頁、課表頁與判定訊息的標題是「課名＋課表的目標距離」（例如「坡跑 8 km」）；坡跑、間歇這類用趟數與秒數寫的課，目標距離是匯入課表時估的，標「估計」。已完成的課的目標距離與備註可以用提案卡更正，他採用後那堂會重判一次、標題跟著換；日期、類型、判定內容不能從課表那邊改。
 - 規則：跟他個人有關的事（他跑了什麼、心拍多少、哪天跳過、課表內容）只能用 briefing 裡的資料；briefing 沒有的，只能說「這個我沒有資料，你跟我說」。不能叫他去問別人、去問負責的人、去看不存在的頁面或按鈕。`;
 }
 
@@ -106,7 +107,7 @@ function goalText(plan: PlanRow): string {
 }
 
 function sessionLine(s: PlannedSessionRow): string {
-  const km = s.target_distance_m ? `${(s.target_distance_m / 1000).toFixed(1)} km` : "-";
+  const km = targetKmText(s) || "-";
   return `- ${s.scheduled_date} [${s.label ?? s.type}] ${s.content ?? ""} ${km} 目標 ${s.target ?? "-"} id=${s.id}${s.note ? ` — ${s.note}` : ""}`;
 }
 
@@ -297,7 +298,7 @@ export function buildReviewPrompt({ session: s, activity: a, context: c }: Activ
   parts.push(
     "## 今天的課表",
     `${s.scheduled_date} [${s.label ?? s.type}] ${s.content ?? ""}`,
-    `目標距離 ${s.target_distance_m ? (s.target_distance_m / 1000).toFixed(1) : "-"} km；這堂的配速／心拍區間（判定以此為準）：${s.target?.trim() || bandText(sessionBand(s)) || "-"}`,
+    `目標距離 ${s.target_distance_m ? `${(s.target_distance_m / 1000).toFixed(1)} km${isApproxDistance(s) ? "（估計值，不拿來扣分）" : ""}` : "-"}；這堂的配速／心拍區間（判定以此為準）：${s.target?.trim() || bandText(sessionBand(s)) || "-"}`,
     s.note ? `備註：${s.note}` : "",
     "",
     "## 實際",

@@ -21,6 +21,16 @@ export function sessionLabel(s: Pick<PlannedSessionRow, "label" | "type" | "targ
   return `${s.label ?? s.type}${km}`;
 }
 
+/**
+ * The planned distance is an estimate: hill repeats / intervals (type interval) or any content written in reps × seconds.
+ * Same rule as the web's approxDistance (the report page), so the verdict prompt, the briefing and the page agree.
+ */
+export const isApproxDistance = (s: Pick<PlannedSessionRow, "type" | "content">) => s.type === "interval" || /×|秒/.test(s.content ?? "");
+
+/** "8.0 km（估計）" / "16.0 km" / "" for a briefing line: the planned distance, marked when it is an estimate. */
+export const targetKmText = (s: Pick<PlannedSessionRow, "type" | "content" | "target_distance_m">, digits = 1) =>
+  s.target_distance_m ? `${(s.target_distance_m / 1000).toFixed(digits)} km${isApproxDistance(s) ? "（估計）" : ""}` : "";
+
 /** "10/25" from 'YYYY-MM-DD'. */
 export const shortDate = (iso: string) => iso.slice(5).replace("-", "/");
 
