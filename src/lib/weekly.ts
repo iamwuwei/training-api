@@ -256,7 +256,7 @@ async function generate(
   await stage?.("preparing");
   const today = todayJst();
   const scope = await loadPlanBriefing(plan, today);
-  const briefing = buildPlanBriefing(scope, today);
+  const briefing = buildPlanBriefing(scope, today, true);
   const weeks = scope.weeks;
 
   // Key sessions (Long / MP / 坡跑) with no record: ask, don't conclude.

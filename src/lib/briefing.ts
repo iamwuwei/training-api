@@ -353,7 +353,8 @@ export function trendRuns(b: Pick<PlanBriefing, "activities">): TrendRun[] {
 }
 
 /** The briefing text. Pure: the same data gives the same text, so it can sit behind a cache breakpoint. */
-export function buildPlanBriefing(b: PlanBriefing, today: string): string {
+export function buildPlanBriefing(b: PlanBriefing, today: string, forWeekly = false): string {
+  // The weekly review does not open correction cards (the chat does): its copy leaves the sentences about them out.
   const { plan } = b;
   const d = daysBetween(today, plan.race_date);
   const cur = b.weeks.find((w) => today >= w.week_start && today <= w.week_end);
@@ -366,7 +367,7 @@ export function buildPlanBriefing(b: PlanBriefing, today: string): string {
   return [
     `今天 ${today}（${weekday(today)}）。跑者 ${plan.display_name}，目標 ${plan.race_name}（${plan.race_date}，${weekday(plan.race_date)}），目標完賽 ${goalText(plan)}，距離比賽 ${d} 天（約 ${Math.max(0, Math.round(d / 7))} 週）。`,
     makeupRuleLine(b, today),
-    "課名後面的距離（例如「坡跑 8 km」）是課表的目標距離欄位（匯入課表時填的）；標「估計」的是估計值（坡跑、間歇這類以趟數和秒數寫的課），判定不拿它扣分。報告頁的標題與判定訊息的標題顯示的就是這個數字；已完成的課的目標距離與備註可以用更正卡改（見提案規則）。",
+    `課名後面的距離（例如「坡跑 8 km」）是課表的目標距離欄位（匯入課表時填的）；標「估計」的是估計值（坡跑、間歇這類以趟數和秒數寫的課），判定不拿它扣分。報告頁的標題與判定訊息的標題顯示的就是這個數字${forWeekly ? "" : "；已完成的課的目標距離與備註可以用更正卡改（見提案規則）"}。`,
     "",
     "## 記住的限制（他說過的；排課不能違反）",
     ...(b.constraints.length ? b.constraints.map(constraintLine) : ["（沒有）"]),
@@ -374,10 +375,10 @@ export function buildPlanBriefing(b: PlanBriefing, today: string): string {
     "## 每週階段",
     ...b.weeks.map((w) => `- 第 ${w.week_no} 週 ${w.week_start}〜${w.week_end}${w.phase ? ` ${w.phase}` : ""}${w.focus ? `：${w.focus}` : ""}${cur?.week_no === w.week_no ? "　← 本週" : w.week_end < today ? `　（已過，${b.reviewedWeeks.has(w.week_no) ? "週回顧已產生" : "沒有週回顧"}）` : ""}`),
     "",
-    "## 今天到比賽日的逐日課表（每一堂；id 在每行中間；提案只能動今天（含）到比賽日前一天、還沒完成的課；已完成的只能更正目標距離與備註）",
+    `## 今天到比賽日的逐日課表（每一堂；id 在每行中間；提案只能動今天（含）到比賽日前一天、還沒完成的課${forWeekly ? "" : "；已完成的只能更正目標距離與備註"}）`,
     upcoming.length ? upcoming.map((s) => sessionLine(s, today, plan.race_date)).join("\n") : "（沒有了）",
     "",
-    "## 已過的課（本週與上週每一堂；更早只列漏跑的。補課只能用標「漏跑」「他說沒跑」的；更正只能用標「已完成」的；都用它的 id）",
+    `## 已過的課（本週與上週每一堂；更早只列漏跑的。補課只能用標「漏跑」「他說沒跑」的${forWeekly ? "，" : "；更正只能用標「已完成」的；都"}用它的 id）`,
     ...(past.length ? past : ["（沒有）"]),
     "",
     "## 過去每週（一週一行）",
