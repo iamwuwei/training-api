@@ -796,7 +796,10 @@ export async function applyProposal(p: ProposalRow, today: string): Promise<Appl
     // (409 completed, as on develop), and a card of more than CORRECTIONS_PER_CARD such sessions is refused.
     const correctionOf = new Set(ids.filter((id) => {
       const mine = p.items.filter((i) => i.session_id === id);
-      return mine.length > 0 && mine.every((i) => i.correction === true && (i.op ?? "change") === "change" && COMPLETED_FIELDS.has(i.field as string));
+      // A distance must be a whole number of metres above 0 (what validateCard lets through): 6000.5 would 500 on the int column, 0 would
+      // blank the title. A row that is not that is not a correction: back to the old rule (409 completed).
+      return mine.length > 0 && mine.every((i) => i.correction === true && (i.op ?? "change") === "change" && COMPLETED_FIELDS.has(i.field as string)
+        && (i.field !== "target_distance_m" || (Number.isInteger(i.new) && (i.new as number) > 0)));
     }));
     if (correctionOf.size > CORRECTIONS_PER_CARD) return { ok: false, status: 400, error: `more than ${CORRECTIONS_PER_CARD} completed sessions corrected in one card` };
 
