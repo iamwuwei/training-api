@@ -5,6 +5,7 @@ import { hasHistorySource } from "./history-summary";
 import { isValidDate, shortDate } from "./labels";
 import { LONG_UP_M, NEAR_RACE_DAYS, NEAR_RACE_LONG_M, normalizeType, WEEK_UP_PCT } from "./proposals";
 import { WEEKDAY_ZH, weekdayOf } from "./constraints";
+import { oneLine } from "./text-clean";
 import type { AthleteProfile, ConstraintRow, DraftFlag, DraftSession, DraftWeek, PlanDraftRow, PlanGenJob, RawChunk, RawSkeleton } from "../types";
 import type { ApiAthleteProfile, ApiDraftSession, ApiPlanDraft, PlanIntake, SessionType } from "../../types/api";
 
@@ -51,22 +52,9 @@ export const daysBetween = (from: string, to: string) => Math.round((Date.parse(
 const mondayOf = (iso: string) => addDays(iso, -((weekdayOf(iso) + 6) % 7));
 export const mmss = (sec: number) => `${Math.floor(sec / 60)}:${String(Math.round(sec) % 60).padStart(2, "0")}`;
 
-/**
- * Characters that hide text, as ONE regex of escapes (the `u` flag is what makes \p{...} and \u{...} work; never paste the characters themselves):
- *  - every Unicode Default_Ignorable_Code_Point: soft hyphen \u00ad, combining grapheme joiner \u034f, Arabic letter mark \u061c, Hangul fillers
- *    \u115f \u1160 \u3164 \uffa0, Mongolian selectors \u180b-\u180f, zero-width and direction marks \u200b-\u200f, bidi overrides \u202a-\u202e,
- *    word joiner / invisible operators / the deprecated format controls \u2060-\u206f (bidi isolates \u2066-\u2069 are in there), variation selectors
- *    \ufe00-\ufe0f and \u{e0100}-\u{e01ef}, BOM \ufeff, the Unicode "tag" block \u{e0000}-\u{e007f} (invisible ASCII smuggling);
- *  - C0/C1 controls other than whitespace (\u0009-\u000d and \u0085 are handled as whitespace by oneLine);
- *  - the interlinear annotation marks \ufff9-\ufffb, which are not default-ignorable but hide text the same way.
- * Everything the athlete or the model writes goes through oneLine below.
- * Side effect, accepted: a ZWJ emoji sequence falls apart into its parts and an emoji loses its \ufe0f; CJK text and plain emoji are untouched.
- */
-const HIDDEN = /[\p{Default_Ignorable_Code_Point}\u0000-\u0008\u000e-\u001f\u007f-\u0084\u0086-\u009f\ufff9-\ufffb]/gu;
-/** One line of plain text from anything the athlete or the model wrote: no hiding characters, every kind of line break and run of whitespace one space. */
-export function oneLine(v: unknown): string {
-  return typeof v === "string" ? v.replace(HIDDEN, "").replace(/[\s\u0085]+/g, " ").trim() : "";
-}
+// oneLine (hiding characters out, one line) lives in text-clean.ts so proposals.ts and briefing.ts can use it without importing this file.
+// Re-exported here for the tests that import it from plan-gen; nothing in src/ does.
+export { oneLine };
 const MD = /[*`#><]/g;
 const URL_RE = /https?:\/\/\S+/gi;
 /** A model string as it may be stored and shown: one line, no markdown characters, no links. */

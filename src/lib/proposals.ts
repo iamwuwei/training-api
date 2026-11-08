@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { type PlanBriefing, activityWeekNo, catchUpSessions, changeableSessions } from "./briefing";
+import { type PlanBriefing, activityWeekNo, catchUpSessions, changeableSessions, completedSessions } from "./briefing";
 import { LIMITS } from "./card-schema";
 import { formatAdjustmentValue } from "./claude";
 import { postCoachMessage } from "./coach";
 import { fixedWeekdays, WEEKDAY_ZH, weekdayOf } from "./constraints";
 import { type Querier, query, withTransaction } from "./db";
-import { FIELD_NAMES, isRunSport, isValidDate, sessionLabel, shortDate, weekOf } from "./labels";
+import { EVENT_LABEL_MAX } from "./group-events";
+import { oneLine } from "./text-clean";
+import { FIELD_NAMES, isApproxDistance, isRunSport, isValidDate, sessionLabel, shortDate, weekOf } from "./labels";
 import type {
   CoachMessageRow, ConstraintRow, NewSession, PlanWeekRow, PlannedSessionRow, ProposalField, ProposalImpact, ProposalItem, ProposalOption, ProposalRow, ProposalWeek, RawCard, SessionType, WeeklyMessageMeta,
 } from "../types";
@@ -20,6 +22,13 @@ import type {
 // activities move along; a removed session is superseded without a successor.
 
 export const PROPOSAL_FIELDS = new Set<string>(["type", "target_distance_m", "target_pace_sec_km", "scheduled_date", "note", "skip"] satisfies ProposalField[]);
+/**
+ * coach-correct-plan: the only fields of a COMPLETED session a card may change. Both are estimates written at import time (the
+ * planned distance of a hill session, the note); everything else (date, type, pace, rest, removal) would move or rewrite a session
+ * an activity is bound to. A card may correct at most CORRECTIONS_PER_CARD completed sessions (one re-judge each on apply).
+ */
+export const COMPLETED_FIELDS = new Set<string>(["target_distance_m", "note"] satisfies ProposalField[]);
+export const CORRECTIONS_PER_CARD = 3;
 /** What a session may be turned into: never `race` (the race day is not Woo's to make or move). */
 const PROPOSAL_TYPES = new Set(["easy", "long", "tempo", "interval", "rest"]);
 
@@ -44,7 +53,8 @@ export function describeItem(i: ProposalItem): string {
   if (i.makeup && i.field === "scheduled_date" && typeof i.new === "string") {
     return `${i.date ? `${shortDate(i.date)} ` : ""}${i.label ?? ""} 補課 → ${shortDate(i.new)}${i.counts_in_week_no != null ? `（算第 ${i.counts_in_week_no} 週）` : ""}`.trim();
   }
-  return `${i.label ? `${i.label} ` : ""}${describeChange({ field: i.field ?? "note", old: i.old, new: i.new, date: i.date })}`.trim();
+  const line = `${i.label ? `${i.label} ` : ""}${describeChange({ field: i.field ?? "note", old: i.old, new: i.new, date: i.date })}`.trim();
+  return i.correction ? `更正 ${line}` : line; // so Woo knows, from the thread, that he opened a correction card
 }
 
 /** A whole card as one line: its rows joined, the first six. */
@@ -174,6 +184,15 @@ export async function applyChange(q: Querier, old: PlannedSessionRow, field: Pro
   // The moved row of a make-up points at the make-up's current version.
   else await q("update planned_sessions set moved_to_session_id = $2 where moved_to_session_id = $1", [old.id, next.id]);
   await q("update activities set session_id = $2 where session_id = $1", [old.id, next.id]);
+  // group-race 消息中心: the session_done event of a completed session follows the new version (and names the corrected session), so a
+  // re-judge does not write a second event. A session nobody finished has none (0 rows). Only the plan owner's own events move.
+  const newLabel = sessionLabel({ label: next.label as string | null, type: next.type as SessionType, target_distance_m: next.target_distance_m as number | null });
+  await q(
+    `update group_events e set session_id = $2, label = $3
+       from group_members gm join plans pl on pl.user_id = gm.user_id
+      where e.session_id = $1 and gm.id = e.member_id and pl.id = $4`,
+    [old.id, next.id, [...newLabel].slice(0, EVENT_LABEL_MAX).join(""), old.plan_id],
+  );
   return next.id as string;
 }
 
@@ -265,6 +284,7 @@ const text = (v: unknown): string => (isStr(v) ? v.replace(/\s+/g, " ").trim() :
 export function touchedWeekNos(weeks: PlanWeekRow[], items: ProposalItem[]): Set<number> {
   const out = new Set<number>();
   for (const i of items) {
+    if (i.correction) continue; // a correction does not move or add volume: it does not "touch" the (past) week, so its description stays
     const dates = [i.date, i.field === "scheduled_date" && isStr(i.new) ? i.new : null, i.new_session?.scheduled_date];
     for (const d of dates) {
       const w = d ? weekOf(weeks, d) : undefined;
@@ -282,9 +302,9 @@ export function touchedWeekNos(weeks: PlanWeekRow[], items: ProposalItem[]): Set
  * length limits. A pair with one bad card keeps the good one as a single card (no letter, no group); `dropped` says which
  * card went and why. `error` is set (and `drafts` empty) when nothing is left: the text of the reply is kept either way.
  */
-export function checkCards(b: PlanBriefing, raws: RawCard[], today: string, maxCards = 2): { drafts: CardDraft[]; dropped: string[]; error: string | null } {
+export function checkCards(b: PlanBriefing, raws: RawCard[], today: string, maxCards = 2, allowCorrections = true): { drafts: CardDraft[]; dropped: string[]; error: string | null } {
   if (!Array.isArray(raws) || raws.length < 1 || raws.length > maxCards) return { drafts: [], dropped: [], error: `expected 1 to ${maxCards} cards, got ${Array.isArray(raws) ? raws.length : "none"}` };
-  const checked = raws.map((raw, i) => ({ i, raw, d: validateCard(b, raw, today) }));
+  const checked = raws.map((raw, i) => ({ i, raw, d: validateCard(b, raw, today, allowCorrections) }));
   const bad = checked.filter((c): c is typeof c & { d: string } => typeof c.d === "string");
   const good = checked.filter((c): c is typeof c & { d: CardDraft } => typeof c.d !== "string");
   const dropped = bad.map((c) => `card ${c.i + 1}: ${c.d}`);
@@ -305,18 +325,24 @@ export function checkCards(b: PlanBriefing, raws: RawCard[], today: string, maxC
 }
 
 /** `checkCards` as the old shape: the cards, or a string saying why none is left. */
-export function validateCards(b: PlanBriefing, raws: RawCard[], today: string, maxCards = 2): CardDraft[] | string {
-  const r = checkCards(b, raws, today, maxCards);
+export function validateCards(b: PlanBriefing, raws: RawCard[], today: string, maxCards = 2, allowCorrections = true): CardDraft[] | string {
+  const r = checkCards(b, raws, today, maxCards, allowCorrections);
   return r.error ?? r.drafts;
 }
 
-function validateCard(b: PlanBriefing, raw: RawCard, today: string): CardDraft | string {
+/**
+ * `allowCorrections` false (the weekly review): a completed session is not a card target at all, the same sentence develop gives
+ * ("session X is completed"). The coach chat allows corrections of completed sessions (target_distance_m / note).
+ */
+function validateCard(b: PlanBriefing, raw: RawCard, today: string, allowCorrections = true): CardDraft | string {
   if (!raw || typeof raw !== "object") return "not an object";
   const race = b.plan.race_date;
   const lastDay = addDays(race, -1);
   const inRange = (d: string) => d >= today && d <= lastDay;
   const changeable = new Map(changeableSessions(b, today).map((s) => [s.id, s]));
   const past = new Map(catchUpSessions(b, today).map((s) => [s.id, s])); // not run, before today: may only be moved forward (補課)
+  const completed = new Map((allowCorrections ? completedSessions(b, today) : []).map((s) => [s.id, s])); // done, this week or last: only target_distance_m / note (更正)
+  const correctedIds = new Set<string>();
   const byId = new Map(b.sessions.map((s) => [s.id, s]));
   const fixed = fixedWeekdays(b.constraints);
 
@@ -356,7 +382,7 @@ function validateCard(b: PlanBriefing, raw: RawCard, today: string): CardDraft |
 
     const id = c.session_id;
     if (!isStr(id)) return `${op} without session_id`;
-    const s = changeable.get(id) ?? past.get(id);
+    const s = changeable.get(id) ?? past.get(id) ?? completed.get(id);
     if (!s) {
       const known = byId.get(id);
       if (known?.type === "race") return "the race day cannot be changed";
@@ -366,6 +392,33 @@ function validateCard(b: PlanBriefing, raw: RawCard, today: string): CardDraft |
     const isPast = s.scheduled_date < today;
     const seen = touched.get(id) ?? new Set<string>();
     if (seen.has("remove") || (op === "remove" && seen.size)) return `session ${id} is both removed and changed`;
+
+    if (s.done) {
+      // A completed session: only its estimated fields may be corrected; nothing that moves, retypes, rests or removes it.
+      if (op === "remove") return "a completed session cannot be removed";
+      const field = c.field;
+      if (!isStr(field) || !COMPLETED_FIELDS.has(field)) return `session ${id} is completed: only target_distance_m and note can be corrected`;
+      if (seen.has(field)) return `session ${id}: ${field} changed twice`;
+      // A note is the model's string that later lands in the verdict prompt: one line and no hiding characters (zero-width, bidi, tag).
+      // An empty note after that is "no note" (null): clearing a note is a valid correction, "nothing → nothing" is not.
+      const value = field === "note" ? (isStr(c.new) ? oneLine(c.new) || null : c.new ?? null) : c.new ?? null;
+      const bad = validateChangeValue(field, value);
+      if (bad) return bad;
+      // The distance of a completed session is a real, whole number of metres, never 0 (a 0 drops the km from the title); the
+      // plain change path of an unfinished session keeps its own, looser check.
+      if (field === "target_distance_m" && !(Number.isInteger(value) && (value as number) > 0)) return "target_distance_m of a completed session must be a whole number of metres above 0";
+      const current = s[field as "target_distance_m" | "note"] as string | number | null;
+      if ((field === "note" ? (isStr(current) ? oneLine(current) || null : null) : current) === value) return `${field} unchanged`;
+      correctedIds.add(id);
+      if (correctedIds.size > CORRECTIONS_PER_CARD) return `more than ${CORRECTIONS_PER_CARD} completed sessions corrected in one card`;
+      seen.add(field);
+      touched.set(id, seen);
+      // `old` is shown on the card and stored in the proposal_text of Woo's reply (replayed to the model every turn): the note as it is now,
+      // cleaned the same way as the new value (a note that was dirty before this feature is not replayed). Apply does not compare `old`.
+      const shownOld = field === "note" ? (isStr(current) ? oneLine(current) || null : null) : current;
+      items.push({ op, session_id: id, field: field as ProposalField, old: shownOld, new: value, label: sessionLabel(s), date: s.scheduled_date, reason: reason || null, flags: [], correction: true });
+      continue;
+    }
 
     if (op === "remove") {
       if (isPast) return "a past session cannot be removed (it can only be moved forward)";
@@ -537,6 +590,8 @@ export function computeFlags(
   const rows: string[][] = items.map(() => []);
   const card: string[] = [];
   const { before, after, owner } = simulate(b, items);
+  // A correction of a completed session books no volume and no long run: it hangs no flag (and a week it only corrects is not "touched").
+  for (const [key, idx] of owner) if (items[idx].correction) owner.delete(key);
 
   // A row is in the week it is booked in: a make-up row's counts, else the week of its date.
   const weekNoOf = (s: Sim) => (s.counts !== undefined ? s.counts : weekOf(b.weeks, s.date)?.week_no ?? null);
@@ -585,7 +640,7 @@ export function computeFlags(
   const touchedBy = new Map<string, { idx: number; lengthens: boolean; moves: boolean }>();
   items.forEach((it, idx) => {
     const op = it.op ?? "change";
-    if (op === "remove") return;
+    if (op === "remove" || it.correction) return;
     const key = op === "add" ? `new:${idx}` : (it.session_id as string);
     const prev = touchedBy.get(key);
     touchedBy.set(key, {
@@ -740,6 +795,18 @@ export async function applyProposal(p: ProposalRow, today: string): Promise<Appl
     if (hard) return { ok: false, status: 400, error: hard };
     if ((p.weeks ?? []).some((w) => !touchedWeekNos(weeks, p.items).has(w.week_no))) return { ok: false, status: 400, error: "a week description for a week this card does not touch" };
 
+    // The completed sessions this card corrects. The `correction` flag alone is not trusted (it is a jsonb key): a session counts only
+    // when EVERY row of it is a change of target_distance_m / note; anything else on a completed session is the old rule
+    // (409 completed, as on develop), and a card of more than CORRECTIONS_PER_CARD such sessions is refused.
+    const correctionOf = new Set(ids.filter((id) => {
+      const mine = p.items.filter((i) => i.session_id === id);
+      // A distance must be a whole number of metres above 0 (what validateCard lets through): 6000.5 would 500 on the int column, 0 would
+      // blank the title. A row that is not that is not a correction: back to the old rule (409 completed).
+      return mine.length > 0 && mine.every((i) => i.correction === true && (i.op ?? "change") === "change" && COMPLETED_FIELDS.has(i.field as string)
+        && (i.field !== "target_distance_m" || (Number.isInteger(i.new) && (i.new as number) > 0)));
+    }));
+    if (correctionOf.size > CORRECTIONS_PER_CARD) return { ok: false, status: 400, error: `more than ${CORRECTIONS_PER_CARD} completed sessions corrected in one card` };
+
     // Anything that moved under the card since it was written?
     const changed: (PlanChanged & { text: string })[] = [];
     for (const id of ids) {
@@ -747,10 +814,14 @@ export async function applyProposal(p: ProposalRow, today: string): Promise<Appl
       const row = rows.get(id);
       const day = `${item.date ? `${shortDate(item.date)} ` : ""}${item.label ?? ""}`;
       const to = dateItemOf(id)?.new;
+      // coach-correct-plan: a correction row is for a session that IS completed; it goes stale when that stopped being true (the
+      // activity was unbound). Cards written before this feature have no `correction` and keep the old rule (completed = stale).
+      const corr = correctionOf.has(id);
       let why: "changed" | "completed" | null = null, text = "";
       if (!row || row.superseded) { why = "changed"; text = `${day} 在這張卡之後被改過`; }
-      else if (row.done) { why = "completed"; text = `${day} 已完成`; }
-      else if (row.scheduled_date < today && !makeup.has(id)) { why = "changed"; text = `${day} 的日期已過`; }
+      else if (corr && !row.done) { why = "changed"; text = `${day} 已不是已完成的課`; }
+      else if (!corr && row.done) { why = "completed"; text = `${day} 已完成`; }
+      else if (row.scheduled_date < today && !makeup.has(id) && !corr) { why = "changed"; text = `${day} 的日期已過`; }
       else if (typeof to === "string" && to < today) { why = "changed"; text = `${day} 要移到的 ${shortDate(to)} 已經過了`; }
       if (why) changed.push({ session_id: id, label: item.label, date: row?.scheduled_date ?? item.date, why, text });
     }
@@ -846,7 +917,11 @@ export async function applyProposal(p: ProposalRow, today: string): Promise<Appl
 }
 
 /** Woo's few lines after the athlete applied a card (template; no model). */
-export async function postProposalApplied(userId: string, items: ProposalItem[], weeks: ProposalWeek[] = []): Promise<void> {
+export async function postProposalApplied(
+  userId: string, items: ProposalItem[], weeks: ProposalWeek[] = [],
+  /** coach-correct-plan: how many completed sessions the card corrected and for how many a re-judge was queued. */
+  extra?: { corrected: number; rejudged: number },
+): Promise<void> {
   const ids = items.map((i) => i.applied_session_id).filter((id): id is string => !!id);
   const rows = ids.length
     ? await query<PlannedSessionRow>(`select *, to_char(scheduled_date, 'YYYY-MM-DD') as scheduled_date from planned_sessions where id = any($1::uuid[])`, [ids])
@@ -856,6 +931,8 @@ export async function postProposalApplied(userId: string, items: ProposalItem[],
   const seen = new Set<string>();
   const parts: string[] = [];
   const makeups = new Map(items.filter((i) => i.makeup && i.session_id).map((i) => [i.session_id as string, i]));
+  const corrected = new Map<string, Set<string>>(); // session id -> the fields a correction row changed
+  for (const i of items) if (i.correction && i.session_id && i.field) corrected.set(i.session_id, (corrected.get(i.session_id) ?? new Set()).add(i.field));
   for (const i of [...items].reverse()) {
     const op = i.op ?? "change";
     const key = i.session_id ?? i.applied_session_id ?? "";
@@ -863,6 +940,18 @@ export async function postProposalApplied(userId: string, items: ProposalItem[],
     seen.add(key);
     if (op === "remove") { parts.unshift(`${i.date ? `${shortDate(i.date)} ` : ""}${i.label ?? ""} 拿掉了`); continue; }
     const s = i.applied_session_id ? byId.get(i.applied_session_id) : undefined;
+    if (i.correction && s) {
+      // A correction of a completed session: "11/04 的坡跑目標距離改成 6 km（估計值）" / "…備註更新了" (the name is the session's label, no distance).
+      const fields = corrected.get(i.session_id as string) ?? new Set<string>();
+      const name = s.label ?? s.type;
+      const gap = /^[A-Za-z0-9]/.test(name) ? " " : ""; // a Latin name sits between spaces: "10/30 的 Easy 目標距離…"
+      const bits = [
+        fields.has("target_distance_m") ? `目標距離改成 ${s.target_distance_m != null ? `${km(s.target_distance_m)} km${isApproxDistance(s) ? "（估計值）" : ""}` : "沒有填"}` : "",
+        fields.has("note") ? "備註更新了" : "",
+      ].filter(Boolean);
+      parts.unshift(`${shortDate(s.scheduled_date)} 的${gap}${name}${gap}${bits.join("、")}`);
+      continue;
+    }
     const made = i.session_id ? makeups.get(i.session_id) : undefined;
     if (made && s) {
       // A make-up: "10/27 的 Easy 5 km 補到 10/28，算在第 8 週" (the label is the session as it was proposed).
@@ -875,5 +964,9 @@ export async function postProposalApplied(userId: string, items: ProposalItem[],
   const more = parts.length > shown.length ? `，另外還有 ${parts.length - shown.length} 項` : "";
   const wk = weeks.length ? `第 ${weeks.map((w) => w.week_no).join("、")} 週的描述也更新了。` : "";
   const body = shown.length ? `改好了，課表上${shown.join("、")}${more}。` : "改好了。";
-  await postCoachMessage({ user_id: userId, role: "coach", kind: "chat", text: `${body}${wk}` });
+  // After a correction card: said once, in the card's own words; "各" when more than one session is re-judged.
+  const rejudge = !extra || extra.corrected === 0 ? ""
+    : extra.rejudged >= extra.corrected ? (extra.corrected === 1 ? "那堂的判定我重看一次，報告頁和這裡都會更新。" : "那幾堂的判定我各重看一次，報告頁和這裡都會更新。")
+    : "判定這次沒有排到重判（今天的次數用完或排程失敗），報告頁可以按「重新分析」。";
+  await postCoachMessage({ user_id: userId, role: "coach", kind: "chat", text: `${body}${rejudge}${wk}` });
 }

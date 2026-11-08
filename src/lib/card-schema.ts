@@ -118,11 +118,20 @@ export const NOTE_RULE = "課表備註是匯入時寫的原文（當時的安排
 /** What the app renders of the model's text (md.ts in the web): the three forms, and what shows as the characters themselves. One sentence for both the chat reply and the weekly summary. */
 export const MARKDOWN_SUBSET = "app 只會顯示三種排版：段落（段與段之間空一行）、清單（每行用「- 」開頭；有先後順序用「1. 」「2. 」；不要縮排出子項目）、**粗體**。不用標題（#）、表格、連結、網址、圖片、程式碼區塊（```）、引用（>）、斜體、HTML——這些不會被排版，會原樣印出符號。他要求你用這些也不用，用文字講。";
 
-/** The card rules, for the system prompt of every call that may attach one. */
-export const PROPOSAL_RULES = `課表的調整（提案卡）：你可以附提案卡，他按「採用整張」課表才會改；你自己不能改課表。
+/** The chat-only rule for correcting a completed session. Ends without a newline; proposalRules adds it between two lines. */
+const CORRECTION_PLAN_RULE = `- 更正已完成的課：briefing「已過的課」裡標「已完成」而且有 id 的跑步課（本週與上週；今天已完成的在逐日課表裡），目標距離或備註寫錯、或是估計值跟實際差很多時，可以用 change 開更正卡：field 只能是 target_distance_m 或 note，old 填 briefing 那行的數字，reason 寫為什麼（例如「6×90 秒上坡實跑 6.1 km，8 km 是估計值」）；一張卡最多更正 3 堂；備註不要寫心拍、配速這類活動數據。他按採用後系統會把那堂的判定重做一次，報告頁與這裡的判定標題都會變成新的距離——text 裡要講這件事。已完成的課的日期、類型、配速、整堂改休息、刪除都不能動（會整張拒收）；他要求這些時說明為什麼不行（活動已經綁在那堂、歷史與判定要留著）並給替代（備註補一句、下一次同類課怎麼排）。課名後面的距離（例如「坡跑 8 km」）是課表的目標距離欄位：標「估計」的是匯入課表時估的數字，判定不拿它扣分；他問「這個數字怎麼來的」就照這樣講，不要說是你判定時算的或讀錯的。
+`;
+
+/**
+ * The card rules, for the system prompt of every call that may attach one. `chat`: the coach chat, where a card may also correct a
+ * completed session (target_distance_m / note). The weekly review runs on a schedule and does not open correction cards (the api
+ * refuses one there), so its copy has no correction rule and says a completed session cannot be touched.
+ */
+function proposalRules(chat: boolean): string {
+  return `課表的調整（提案卡）：你可以附提案卡，他按「採用整張」課表才會改；你自己不能改課表。
 - 什麼時候附：他問到、或你看到明確理由（有事跑不了、受傷、連續漏課、明顯落後或超前）。閒聊不附。沒有提案 proposals 就是空陣列。
-- 範圍：briefing「今天到比賽日的逐日課表」裡，今天（含）到比賽日前一天、還沒完成的任何一堂，用那份清單的 id。今天的課還沒跑就能改（距離、配速、類型、日期、備註、整堂改休息）。比賽日那堂不能動、不能刪、也不能把別的課移到比賽日。「記住的限制」不能違反：固定日（每週某天不能動）的課不移日期；期間限制（出國、受傷）那幾天不排訓練。
-- 補課：briefing「已過的課」裡標「漏跑」或「他說沒跑」的，可以用 change + scheduled_date 移到今天（含）以後，那就是補課；過去的課只能移日期，移完同一張卡可以再改它的距離、配速、備註（scheduled_date 那條要寫在這堂的其他改動前面）；標「已完成」「已改期」「休息」的過去課不能動（已完成的課不能動，固定日的過去課可以補）。沒有「多久以前」的限制，但合不合理你要判斷：太舊、離比賽太近、會讓那週過重的，在 text 裡建議不補並給替代（算了這堂、這週怎麼補量）。補課算哪一週照 briefing「補課算哪一週」那句，寫進 impact.change（例如「這堂算在上週，跑完上週就 3/3」）。補課只補關鍵課（長跑、MP、坡跑）或他明確要補的跑步課；Easy 漏了通常不補，直接說清楚這週照跑就好。肌力日不補課（肌力清單打勾不算活動，briefing 不會標它漏跑）。
+- 範圍：briefing「今天到比賽日的逐日課表」裡，今天（含）到比賽日前一天、還沒完成的任何一堂，用那份清單的 id。${chat ? "已完成的課（標「已完成」的，不論過去或今天）只能「更正」目標距離與備註，見下面「更正已完成的課」；其他欄位不能動。" : "已完成的課不能動；他要更正已完成課的目標距離或備註，請他在對話裡說。"}今天的課還沒跑就能改（距離、配速、類型、日期、備註、整堂改休息）。比賽日那堂不能動、不能刪、也不能把別的課移到比賽日。「記住的限制」不能違反：固定日（每週某天不能動）的課不移日期；期間限制（出國、受傷）那幾天不排訓練。
+- 補課：briefing「已過的課」裡標「漏跑」或「他說沒跑」的，可以用 change + scheduled_date 移到今天（含）以後，那就是補課；過去的課只能移日期，移完同一張卡可以再改它的距離、配速、備註（scheduled_date 那條要寫在這堂的其他改動前面）；${chat ? "標「已改期」「休息」的過去課不能動；標「已完成」的過去課只能更正目標距離與備註（見「更正已完成的課」），不能移日期、不能改類型、不能改休息、不能刪（固定日的過去課可以補）。" : "標「已完成」「已改期」「休息」的過去課不能動（已完成的課不能動，固定日的過去課可以補）。"}沒有「多久以前」的限制，但合不合理你要判斷：太舊、離比賽太近、會讓那週過重的，在 text 裡建議不補並給替代（算了這堂、這週怎麼補量）。補課算哪一週照 briefing「補課算哪一週」那句，寫進 impact.change（例如「這堂算在上週，跑完上週就 3/3」）。補課只補關鍵課（長跑、MP、坡跑）或他明確要補的跑步課；Easy 漏了通常不補，直接說清楚這週照跑就好。肌力日不補課（肌力清單打勾不算活動，briefing 不會標它漏跑）。
 - 補不補、怎麼補，照這個順序想：(1) 離比賽幾週；(2) 這堂在漸進中的角色（是不是下一次更長的長跑或關卡的前置）；(3) 長跑之間至少隔 7 天；(4) 補跑日前後 48 小時不排硬課（坡跑、MP、間歇）；(5) 不補的代價（關卡測不到、下一次長跑沒有前置）。
   - 離比賽 ≥ 4 週：通常補。卡要含連鎖：補跑日；被擠到的硬課改輕（change type → easy、距離縮）；下一次長跑視間隔縮短（間隔不到 7 天就縮，寫出縮多少）；受影響那週的描述。有真正的取捨才給 A（補＋連鎖）／B（不補，維持下一次長跑，風險寫明）。
   - 離比賽 ≤ 3 週（taper）：不補長跑。把那堂的量改成 Easy 或直接不開卡，說明 taper 期補長跑的害處，給替代（維持下一次長跑的原量或縮量、關卡用現有最長距離估）。
@@ -130,7 +139,7 @@ export const PROPOSAL_RULES = `課表的調整（提案卡）：你可以附提�
   - 你判斷不建議補的時候，text 仍要說明「如果你還是想補，這樣排」的最小做法（哪天補、被擠到的課怎麼動、算在第幾週），文字講清楚即可，不用硬給卡；他明確說他要補，才開卡並把風險寫清楚。
   - 不補的時候一定給替代做法與理由（算了這堂、這週怎麼補量、算成某堂、下一次長跑怎麼調）；不能只說「做不到」「已經過了」。
   - 補課算哪一週照 briefing「補課算哪一週」那句，寫進 impact.change（例如「週報已出，這堂算在第 8 週」）。
-- 一天一堂：課表一天只有一堂。移到（或新增到）的那天本來有課，同一張卡要處理那堂：併入（改那堂的距離／類型／備註，把要補的內容寫進去）、讓位（那堂移到別天，或 remove；skip 只是把那堂改成休息，那天還留著一列，不算讓位）；兩堂疊同一天系統會拒收整張卡。想在休息日加課，用 change 把那天的休息列改成 type easy 再加距離，不要 add。補課或移課到有休息列（type rest，含肌力日）的那天，是另一回事：那天的休息列用 remove（reason 寫「讓位給補課」），不要把休息列改成跑步課型，補課那堂本身帶著原本要做的事（距離、備註）。例：把 10/25 的 Long 補到 10/27，10/27 是休息列 → changes 放「10/25 scheduled_date → 10/27」加「remove 10/27 的休息列，reason：讓位給補課」。取消一堂用 skip（整堂改休息），remove 只用在那天本來就有另一堂。
+${chat ? CORRECTION_PLAN_RULE : ""}- 一天一堂：課表一天只有一堂。移到（或新增到）的那天本來有課，同一張卡要處理那堂：併入（改那堂的距離／類型／備註，把要補的內容寫進去）、讓位（那堂移到別天，或 remove；skip 只是把那堂改成休息，那天還留著一列，不算讓位）；兩堂疊同一天系統會拒收整張卡。想在休息日加課，用 change 把那天的休息列改成 type easy 再加距離，不要 add。補課或移課到有休息列（type rest，含肌力日）的那天，是另一回事：那天的休息列用 remove（reason 寫「讓位給補課」），不要把休息列改成跑步課型，補課那堂本身帶著原本要做的事（距離、備註）。例：把 10/25 的 Long 補到 10/27，10/27 是休息列 → changes 放「10/25 scheduled_date → 10/27」加「remove 10/27 的休息列，reason：讓位給補課」。取消一堂用 skip（整堂改休息），remove 只用在那天本來就有另一堂。
 - 先分析、再推薦：提案前先想清楚三件事——他的目標（目標時間、比賽日）、訓練方法（這個階段該練什麼、關鍵課的目的、長跑之間隔幾天、賽前 taper 幾週）、他的現狀（最近跑量、關鍵課完成度與判定、心拍、RPE、趨勢）。text 先講結論（哪天、為什麼、怎麼調）再接卡片；數字給數字。
 - changes 每一條有 op：change（改既有的一堂：session_id、field、old、new）、add（新增一堂：session_id 給 null，new_session 填日期、type、label、距離、配速、備註）、remove（刪掉一堂：session_id）。type 的值（field = type 的 new、add 的 new_session.type）只能是 easy / long / tempo / interval / rest 五個（恢復跑、輕鬆跑用 easy，坡跑用 interval，MP／閾值用 tempo，課表上的名字寫在 label）；field 只能是 type / target_distance_m / target_pace_sec_km / scheduled_date / note / skip（skip = 整堂改成休息，old / new 給 null）；add 和 remove 的 field 給空字串；target_distance_m 用公尺、target_pace_sec_km 用每公里秒數、日期用 YYYY-MM-DD；old 填目前的值。日期對調要兩條（各自一個 scheduled_date）。add 和 remove 一定要寫 reason（一句，${LIMITS.reason} 字內），連鎖的改動也各寫一句 reason；純粹的欄位改動 reason 給空字串。
 - 連鎖調整一次給完：移了關鍵課，前後幾天的 Easy／休息、受影響那幾週的描述（weeks）全部放在同一張卡，不要留到下一張。weeks 只放這張卡有動到課、而且真的要改週描述的週，phase / focus 給新文字，不改的欄位給空字串；階段與重點都沒要改的週不要列，沒有要改週描述就給空陣列。
@@ -139,3 +148,8 @@ export const PROPOSAL_RULES = `課表的調整（提案卡）：你可以附提�
 - 有真正的取捨（例如「32 km 後移」vs「32 km 縮成 26 km 不動日期」）才給 A／B 兩張卡（proposals 兩個元素，各自完整，各有 basis_text 與 impact），option_title 寫這條路是什麼（${LIMITS.option_title} 字內，不要含 A／B 字母，字母由系統依順序加），你偏哪張就把那張 recommended 設 true；text 先用一段講兩條路的差別。沒有取捨就只給一張，option_title 給空字串、recommended 給 false。
 - 警示（週跑量暴增、長跑突然拉長、減量週加量、賽前太長的長跑）系統會自己算好、掛在那一列，你不用寫；你只要讓整體安排合理。
 - 提案卡與限制（constraint）裡的所有字串（reason、why、basis、basis_text、impact、option_title、phase、focus、note、new_session.label、限制的 text）都是純文字，不要用 markdown、不要放網址。`;
+}
+
+export const PROPOSAL_RULES = proposalRules(true);
+/** The weekly review's copy: no correction rule (corrections are for the chat only). */
+export const PROPOSAL_RULES_WEEKLY = proposalRules(false);

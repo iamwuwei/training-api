@@ -13,7 +13,7 @@ import { countsWeekNo, shortDate, sportName, weeklyAskQuestion } from "../lib/la
 import { adoptDraft, createDraft, discardDraft, loadDraft, loadLatestDraft, markSendFailed, parseDailyLimit, resumeDraft, sendPlanGenJob, stepJob, toApiDraft, validateIntake } from "../lib/plan-gen";
 import { applyChange, applyProposal, changeConflict, postProposalApplied } from "../lib/proposals";
 import { deauthorize } from "../lib/strava";
-import { elapsedSql, loadGroup, combineGroup, MAX_PER_SESSION, overlaps, recordBinding, regroupReview, requeueReview, REVIEW_LIMIT_MARKER, REVIEW_LIMIT_TEXT, reviewLimitReached, SEGMENT_SELECT, sameKind } from "../lib/session-group";
+import { elapsedSql, loadGroup, combineGroup, MAX_PER_SESSION, overlaps, recordBinding, regroupReview, requeueReview, REVIEW_LIMIT_MARKER, REVIEW_LIMIT_TEXT, reviewLimitReached, SEGMENT_SELECT, sameKind, writeNotQueuedReview } from "../lib/session-group";
 import { postRoutineDone } from "../lib/strength";
 import { COACH_STAGES } from "../lib/stage";
 import { requestWeeklyRerun, reviewMissingActivity, WEEKLY_REVIEW_SELECT } from "../lib/weekly";
@@ -1005,6 +1005,7 @@ function toApiProposal(p: ProposalRow): ApiProposal {
       applied_session_id: i.applied_session_id ?? null,
       makeup: i.makeup === true,
       counts_in_week_no: i.counts_in_week_no ?? null,
+      correction: i.correction === true,
     })),
     weeks: Array.isArray(p.weeks) ? p.weeks : [],
     why: p.why,
@@ -1038,7 +1039,21 @@ async function postProposalDecision(userId: string, proposalId: string, action: 
         : json(result.status, { error: result.error });
     }
     superseded = result.superseded;
-    await postProposalApplied(userId, result.items, p.weeks ?? []);
+    // Corrections of completed sessions: one re-judge per corrected session (not per row), at most CORRECTIONS_PER_CARD. 0 model
+    // calls here; the worker's review path does the judging, under REVIEW_DAILY_LIMIT. Nothing in this block may fail the response:
+    // the card is applied and committed already.
+    const corrected = [...new Set(result.items.filter((i) => i.correction === true && i.applied_session_id).map((i) => i.applied_session_id as string))];
+    let rejudged = 0;
+    for (const sid of corrected) {
+      let queued = false;
+      try { queued = await regroupReview(userId, sid, "plan corrected"); }
+      catch (err) { console.error(`re-judge after correction not queued for session ${sid}`, err); }
+      if (queued) rejudged++;
+      // The session's Claude review was dropped for the re-judge: when none is on the queue, leave a failed row (report page: 分析失敗 ·
+      // 重新分析, not an endless 分析中). Nothing happens when the cap or a manual review already left a row. Never throws.
+      else await writeNotQueuedReview(userId, sid);
+    }
+    await postProposalApplied(userId, result.items, p.weeks ?? [], { corrected: corrected.length, rejudged });
   } else {
     await query("update proposals set status = 'dismissed', decided_at = now() where id = $1 and user_id = $2 and status in ('pending', 'stale')", [p.id, userId]);
   }
