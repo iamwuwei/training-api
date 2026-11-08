@@ -52,7 +52,8 @@ export const daysBetween = (from: string, to: string) => Math.round((Date.parse(
 const mondayOf = (iso: string) => addDays(iso, -((weekdayOf(iso) + 6) % 7));
 export const mmss = (sec: number) => `${Math.floor(sec / 60)}:${String(Math.round(sec) % 60).padStart(2, "0")}`;
 
-// oneLine (hiding characters out, one line) lives in text-clean.ts: proposals.ts and briefing.ts use it too and plan-gen imports them.
+// oneLine (hiding characters out, one line) lives in text-clean.ts so proposals.ts and briefing.ts can use it without importing this file.
+// Re-exported here for the tests that import it from plan-gen; nothing in src/ does.
 export { oneLine };
 const MD = /[*`#><]/g;
 const URL_RE = /https?:\/\/\S+/gi;
