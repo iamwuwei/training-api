@@ -413,7 +413,10 @@ function validateCard(b: PlanBriefing, raw: RawCard, today: string, allowCorrect
       if (correctedIds.size > CORRECTIONS_PER_CARD) return `more than ${CORRECTIONS_PER_CARD} completed sessions corrected in one card`;
       seen.add(field);
       touched.set(id, seen);
-      items.push({ op, session_id: id, field: field as ProposalField, old: current, new: value, label: sessionLabel(s), date: s.scheduled_date, reason: reason || null, flags: [], correction: true });
+      // `old` is shown on the card and stored in the proposal_text of Woo's reply (replayed to the model every turn): the note as it is now,
+      // cleaned the same way as the new value (a note that was dirty before this feature is not replayed). Apply does not compare `old`.
+      const shownOld = field === "note" ? (isStr(current) ? oneLine(current) || null : null) : current;
+      items.push({ op, session_id: id, field: field as ProposalField, old: shownOld, new: value, label: sessionLabel(s), date: s.scheduled_date, reason: reason || null, flags: [], correction: true });
       continue;
     }
 
