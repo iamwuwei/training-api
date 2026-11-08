@@ -6,6 +6,7 @@ import { postCoachMessage } from "./coach";
 import { fixedWeekdays, WEEKDAY_ZH, weekdayOf } from "./constraints";
 import { type Querier, query, withTransaction } from "./db";
 import { EVENT_LABEL_MAX } from "./group-events";
+import { oneLine } from "./text-clean";
 import { FIELD_NAMES, isApproxDistance, isRunSport, isValidDate, sessionLabel, shortDate, weekOf } from "./labels";
 import type {
   CoachMessageRow, ConstraintRow, NewSession, PlanWeekRow, PlannedSessionRow, ProposalField, ProposalImpact, ProposalItem, ProposalOption, ProposalRow, ProposalWeek, RawCard, SessionType, WeeklyMessageMeta,
@@ -398,21 +399,24 @@ function validateCard(b: PlanBriefing, raw: RawCard, today: string, allowCorrect
       const field = c.field;
       if (!isStr(field) || !COMPLETED_FIELDS.has(field)) return `session ${id} is completed: only target_distance_m and note can be corrected`;
       if (seen.has(field)) return `session ${id}: ${field} changed twice`;
-      // A note is the model's string that later lands in the verdict prompt: one line, like every other string of a card.
+      // A note is the model's string that later lands in the verdict prompt: one line and no hiding characters (zero-width, bidi, tag).
       // An empty note after that is "no note" (null): clearing a note is a valid correction, "nothing → nothing" is not.
-      const value = field === "note" ? (isStr(c.new) ? text(c.new) || null : c.new ?? null) : c.new ?? null;
+      const value = field === "note" ? (isStr(c.new) ? oneLine(c.new) || null : c.new ?? null) : c.new ?? null;
       const bad = validateChangeValue(field, value);
       if (bad) return bad;
       // The distance of a completed session is a real, whole number of metres, never 0 (a 0 drops the km from the title); the
       // plain change path of an unfinished session keeps its own, looser check.
       if (field === "target_distance_m" && !(Number.isInteger(value) && (value as number) > 0)) return "target_distance_m of a completed session must be a whole number of metres above 0";
       const current = s[field as "target_distance_m" | "note"] as string | number | null;
-      if ((field === "note" ? (isStr(current) ? text(current) || null : null) : current) === value) return `${field} unchanged`;
+      if ((field === "note" ? (isStr(current) ? oneLine(current) || null : null) : current) === value) return `${field} unchanged`;
       correctedIds.add(id);
       if (correctedIds.size > CORRECTIONS_PER_CARD) return `more than ${CORRECTIONS_PER_CARD} completed sessions corrected in one card`;
       seen.add(field);
       touched.set(id, seen);
-      items.push({ op, session_id: id, field: field as ProposalField, old: current, new: value, label: sessionLabel(s), date: s.scheduled_date, reason: reason || null, flags: [], correction: true });
+      // `old` is shown on the card and stored in the proposal_text of Woo's reply (replayed to the model every turn): the note as it is now,
+      // cleaned the same way as the new value (a note that was dirty before this feature is not replayed). Apply does not compare `old`.
+      const shownOld = field === "note" ? (isStr(current) ? oneLine(current) || null : null) : current;
+      items.push({ op, session_id: id, field: field as ProposalField, old: shownOld, new: value, label: sessionLabel(s), date: s.scheduled_date, reason: reason || null, flags: [], correction: true });
       continue;
     }
 

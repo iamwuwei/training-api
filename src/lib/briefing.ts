@@ -1,6 +1,7 @@
 import { loadLiveConstraints, constraintLine, WEEKDAY_ZH, weekdayOf } from "./constraints";
 import { query } from "./db";
 import { countsWeekNo, isApproxDistance, isRunSport, isStrength, sessionLabel, shortDate, sportName, targetKmText, weekOf } from "./labels";
+import { oneLine } from "./text-clean";
 import { fullSplits, splitPace } from "./splits";
 import { trendLines, type TrendRun } from "./trend";
 import { loadPlanWeeks } from "./context";
@@ -179,6 +180,12 @@ export function completedSessions(b: Pick<PlanBriefing, "sessions">, today: stri
   return b.sessions.filter((s) => s.done && isRunSession(s) && s.scheduled_date >= recentFrom && s.scheduled_date <= today);
 }
 
+/** "備註：…" for a briefing line: the note on one line, hiding characters out; "" when there is nothing left. */
+const noteText = (note: string | null): string => {
+  const n = oneLine(note);
+  return n ? `備註：${n}` : "";
+};
+
 function sessionLine(s: SessionWithDone, today: string, raceDate: string): string {
   const marks = [
     s.type === "race" || s.scheduled_date === raceDate ? "比賽日，不能動" : "",
@@ -191,7 +198,7 @@ function sessionLine(s: SessionWithDone, today: string, raceDate: string): strin
     `${s.content ?? ""}`.trim(),
     targetKmText(s),
     s.target ? `配速／心拍 ${s.target}` : s.target_pace_sec_km ? `配速 ${pace(s.target_pace_sec_km)}` : "",
-    s.note ? `備註：${s.note.replace(/\s+/g, " ")}` : "",
+    noteText(s.note),
     `id=${s.id}`,
     marks.join("、"),
   ].filter(Boolean);
@@ -317,7 +324,7 @@ export function pastSessionLines(b: Pick<PlanBriefing, "weeks" | "sessions" | "a
     else if (s.skipped_at) state = `他說沒跑｜id=${s.id}`;
     else state = `漏跑（沒有紀錄）｜id=${s.id}`;
     // The note as it is now (the same form as the day-by-day list): a correction card may rewrite it, and Woo has to see the old words.
-    const note = isRunSession(s) && s.note ? `備註：${s.note.replace(/\s+/g, " ")}` : "";
+    const note = isRunSession(s) ? noteText(s.note) : "";
     rows.push({ date: s.scheduled_date, label: s.label ?? s.type, line: head(s.scheduled_date, s.label, s.type, [what, note, state].filter(Boolean).join("｜")) });
   }
   for (const m of b.moved) {
