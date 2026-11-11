@@ -2,15 +2,15 @@ import { loadLiveConstraints, constraintLine, WEEKDAY_ZH, weekdayOf } from "./co
 import { query } from "./db";
 import { countsWeekNo, isApproxDistance, isRunSport, isStrength, sessionLabel, shortDate, sportName, targetKmText, weekOf } from "./labels";
 import { oneLine } from "./text-clean";
-import { fullSplits, splitPace } from "./splits";
+import { ELEV_SHOW_M, UPHILL_M, elevationInfo, elevTag, fullSplits, splitPace, type ElevationInfo } from "./splits";
 import { trendLines, type TrendRun } from "./trend";
 import { loadPlanWeeks } from "./context";
-import { combineGroup, GROUP_ACTIVITY_SELECT, GROUP_DATE_JOIN, type GroupActivity, type SegmentInfo } from "./session-group";
+import { combineGroup, elevGainSql, GROUP_ACTIVITY_SELECT, GROUP_DATE_JOIN, type GroupActivity, type SegmentInfo } from "./session-group";
 import type { ConstraintRow, PlanRow, PlanWeekRow, PlannedSessionRow, StravaSplit, Verdict } from "../types";
 
 // The coach's briefing: the whole plan from today to the race day (every session
 // with its id), every activity of the plan so far one line each (per-km splits only
-// for the last 14 days), the weeks that are over one line each, the trend numbers,
+// for the last 14 days, with each km's net elevation change), the weeks that are over one line each, the trend numbers,
 // the athlete's goal and the constraints he told Woo about. The weekly review and
 // the chat get the same text, so Woo answers a question about any day from it.
 //
@@ -47,6 +47,8 @@ export interface BriefActivity {
   rpe: number | null;
   memo: string | null;
   splits: StravaSplit[] | null;
+  /** Strava's total_elevation_gain in metres, summed over the session's recordings that have one; null when none has. */
+  elev_gain_m: number | null;
   session: PlannedSessionRow | null;
   verdict: Verdict | null;
   reminders: string[];
@@ -78,7 +80,7 @@ export const SPLIT_DAYS = 14;
 
 const addDays = (iso: string, n: number) => new Date(Date.parse(`${iso}T00:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10);
 
-type ActivityRow = GroupActivity & { verdict: Verdict | null; reminders: string[] | null };
+type ActivityRow = GroupActivity & { verdict: Verdict | null; reminders: string[] | null; elev_gain_m: number | null };
 
 export async function loadPlanBriefing(plan: Plan, today: string): Promise<PlanBriefing> {
   const weeks = await loadPlanWeeks(plan.id);
@@ -107,7 +109,7 @@ export async function loadPlanBriefing(plan: Plan, today: string): Promise<PlanB
   const from = weeks[0]?.week_start ?? addDays(today, -120);
   // A session of several recordings is one line: dated by its first recording (a second one after midnight stays on that day and week).
   const rows = await query<ActivityRow>(
-    `select ${GROUP_ACTIVITY_SELECT}, r.verdict, r.reminders
+    `select ${GROUP_ACTIVITY_SELECT}, ${elevGainSql("a")} as elev_gain_m, r.verdict, r.reminders
        from activities a${GROUP_DATE_JOIN}
        left join reviews r on r.activity_id = a.id
       where a.user_id = $1 and a.match_status <> 'ignored'
@@ -131,10 +133,11 @@ export async function loadPlanBriefing(plan: Plan, today: string): Promise<PlanB
     const s = primary.session_id ? byId.get(primary.session_id) : undefined;
     const { done: _done, moved_from_date: _from, ...session } = s ?? ({} as SessionWithDone);
     const memos = group.map((g) => g.memo ?? g.description).filter((m): m is string => !!m);
+    const gains = group.map((g) => g.elev_gain_m).filter((v): v is number => v != null);
     return {
       id: primary.id, date: primary.date, sport_type: c.sport_type, distance_m: c.distance_m, moving_time_sec: c.moving_time_sec,
       avg_pace_sec_km: c.avg_pace_sec_km, avg_hr: c.avg_hr, max_hr: c.max_hr, rpe: c.rpe, memo: memos.length ? memos.join("／") : null,
-      splits: c.splits, session: s ? session : null, verdict: primary.verdict, reminders: primary.reminders ?? [],
+      splits: c.splits, elev_gain_m: gains.length ? gains.reduce((t, v) => t + v, 0) : null, session: s ? session : null, verdict: primary.verdict, reminders: primary.reminders ?? [],
       segments: c.segments,
     };
   });
@@ -220,18 +223,28 @@ function segmentsText(a: BriefActivity): string {
   return `（${a.segments.length} 段：${a.segments.map(one).join(" ＋ ")}${gaps.length ? `，隔 ${gaps.map((m) => `${m} 分`).join("、")}` : ""}）`;
 }
 
+/** How to read the elevation in the activity list; goes right under the list's heading (chat and weekly review alike). */
+const ELEV_LEGEND = `海拔的讀法：每趟跑步的「爬升 N m」是 Strava 給的整趟累計爬升（標「約」＝Strava 沒給，用每公里淨上升加總，會偏低）；「海拔無資料」＝這趟沒有海拔紀錄（跑步機、錶沒記到），不知道有沒有坡。每公里那行標題有「淨海拔差」時，配速(心拍) 後面的 +12m／-9m 是那一公里終點減起點的淨海拔差（公尺，上坡正、下坡負；不是配速、不是心拍、不是分鐘），沒有標的公里不到 ±${ELEV_SHOW_M}m；標題沒有「淨海拔差」的就是沒有每公里的海拔。「上坡 km」是系統用淨 +${UPHILL_M}m 以上算好的，不要另訂門檻。淨值會抵消：一公里內先上後下看起來接近 0，所以「爬升」比「每公里淨上升合計」大很多時，代表有起伏或折返坡，但看不出是哪一段。`;
+
+/** "爬升 96m" / "爬升約 12m" (no Strava total: the sum of the kms' net gains) / "海拔無資料". */
+const elevText = (e: ElevationInfo): string => (e.has ? `爬升${e.approx ? "約" : ""} ${e.gain_m}m` : "海拔無資料");
+
 function activityLine(a: BriefActivity, detail: boolean): string {
-  const what = isRunSport(a.sport_type)
-    ? `${(a.distance_m / 1000).toFixed(2)} km ${pace(a.avg_pace_sec_km)} 心拍 ${a.avg_hr ?? "-"}`
+  const elev = isRunSport(a.sport_type) ? elevationInfo(a.splits, a.elev_gain_m) : null;
+  const what = elev
+    ? `${(a.distance_m / 1000).toFixed(2)} km ${pace(a.avg_pace_sec_km)} 心拍 ${a.avg_hr ?? "-"} ${elevText(elev)}`
     : `${sportName(a.sport_type)} ${Math.round(a.moving_time_sec / 60)} 分 心拍 ${a.avg_hr ?? "-"}`;
   const to = a.session ? `${sessionLabel(a.session)}${isApproxDistance(a.session) ? "（估計）" : ""}${a.session.scheduled_date !== a.date ? `（${shortDate(a.session.scheduled_date)} 的課）` : ""}` : "未排課";
   const own = a.rpe || (detail && a.memo) ? `｜自述：${a.rpe ? `RPE ${a.rpe} ` : ""}${detail ? (a.memo ?? "").replace(/\s+/g, " ").slice(0, 80) : ""}`.trimEnd() : "";
   const line = `- ${a.date} 配 ${to}｜${what}${segmentsText(a)}｜${verdictText(a)}${own}`;
   if (!detail) return line;
   const sps = fullSplits(a.splits);
-  if (!sps.length || !isRunSport(a.sport_type)) return line;
-  const km = sps.map((sp) => `${pace(splitPace(sp)).replace("/km", "")}${sp.average_heartrate ? `(${Math.round(sp.average_heartrate)})` : ""}`).join(" ");
-  return `${line}\n    每公里 配速(心拍)：${km}`;
+  if (!sps.length || !elev) return line;
+  const tags = elev.net_up_m != null; // the splits carry elevation
+  const km = sps.map((sp) => `${pace(splitPace(sp)).replace("/km", "")}${sp.average_heartrate ? `(${Math.round(sp.average_heartrate)})` : ""}${tags ? elevTag(sp) : ""}`).join(" ");
+  const perKm = `${line}\n    每公里 配速(心拍)${tags ? "淨海拔差" : ""}：${km}`;
+  if (!tags) return perKm;
+  return `${perKm}\n    坡：每公里淨上升合計 ${elev.net_up_m}m；上坡 km（淨 +${UPHILL_M}m 以上）：${elev.uphill.length ? `第 ${elev.uphill.join("、")} km` : "無"}`;
 }
 
 const KEY_SESSION = /MP|坡/;
@@ -395,6 +408,7 @@ export function buildPlanBriefing(b: PlanBriefing, today: string, forWeekly = fa
     ...(trend.length ? trend : ["（資料還不夠）"]),
     "",
     `## 整期每一趟活動（從課表第 1 週到今天，一趟一行；最近 ${SPLIT_DAYS} 天附每公里分段，第 1 km 心拍不準）`,
+    ...(b.activities.length ? [ELEV_LEGEND] : []),
     b.activities.length ? b.activities.map((a) => activityLine(a, a.date >= since)).join("\n") : "（沒有紀錄）",
   ].join("\n");
 }

@@ -159,7 +159,9 @@ export function focusLabel(s: SessionLike): string {
 
 const HR_JUMP = 25;      // bpm over both neighbours
 const PACE_SAME = 15;    // sec/km: "the pace did not move"
-const UPHILL_M = 8;      // elevation gain per km that counts as an uphill km
+export const UPHILL_M = 8;      // elevation gain per km that counts as an uphill km
+/** A km's net elevation change is printed in the briefing from this many metres either way (truncated towards 0); under it the km is flat or noise. */
+export const ELEV_SHOW_M = 3;
 
 /**
  * Kilometres whose HR looks like a sensor jump: 25+ bpm above both neighbouring kms
@@ -183,6 +185,50 @@ export function hrSuspects(sps: StravaSplit[]): { split: number; hr: number }[] 
 
 export const isIndoor = (a: { sport_type?: string | null; memo?: string | null; description?: string | null }) =>
   a.sport_type === "VirtualRun" || /跑步機|室內|treadmill|健身房/i.test(`${a.memo ?? ""} ${a.description ?? ""}`);
+
+// ---- elevation (the briefing) ------------------------------------------------------------
+
+/** A split's net elevation change in metres; anything that is not a finite number (missing, null, a string) counts as 0. */
+const netDiff = (sp: Pick<StravaSplit, "elevation_difference">): number =>
+  typeof sp.elevation_difference === "number" && Number.isFinite(sp.elevation_difference) ? sp.elevation_difference : 0;
+
+/**
+ * "+12m" / "-9m" after a km's pace(HR) in the briefing: the net change truncated towards 0 (so a printed +8 is always
+ * >= UPHILL_M, like the uphill list), "" under ELEV_SHOW_M either way.
+ */
+export function elevTag(sp: Pick<StravaSplit, "elevation_difference">): string {
+  const d = Math.trunc(netDiff(sp));
+  return Math.abs(d) >= ELEV_SHOW_M ? `${d > 0 ? "+" : ""}${d}m` : "";
+}
+
+/** What one activity's elevation data says. Pure. */
+export interface ElevationInfo {
+  /** false = no elevation at all (treadmill, a watch that recorded none): no split has a non-zero net change and Strava's total is missing or 0. */
+  has: boolean;
+  /** Metres climbed over the whole activity: Strava's total when it is > 0, else the sum of the kms' net gains; null when !has. */
+  gain_m: number | null;
+  /** gain_m is the sum of net gains (an underestimate), not Strava's total. */
+  approx: boolean;
+  /** Sum of the kms' positive net changes, rounded; null when no split has a non-zero net change (no per-km elevation). */
+  net_up_m: number | null;
+  /** `split` numbers of the kms with a net gain of UPHILL_M or more (unrounded, the rule splitsSummary uses). */
+  uphill: number[];
+}
+
+export function elevationInfo(splits: StravaSplit[] | null, rawGainM: number | null | undefined): ElevationInfo {
+  const sps = fullSplits(splits);
+  const hasSplit = sps.some((sp) => netDiff(sp) !== 0);
+  const raw = typeof rawGainM === "number" && Number.isFinite(rawGainM) && Math.round(rawGainM) > 0 ? Math.round(rawGainM) : null;
+  const net_up_m = hasSplit ? Math.round(sps.reduce((t, sp) => t + Math.max(0, netDiff(sp)), 0)) : null;
+  const has = hasSplit || raw != null;
+  return {
+    has,
+    gain_m: has ? raw ?? net_up_m : null,
+    approx: has && raw == null,
+    net_up_m,
+    uphill: hasSplit ? sps.filter((sp) => netDiff(sp) >= UPHILL_M).map((sp) => sp.split) : [],
+  };
+}
 
 // ---- the text for the prompt ----------------------------------------------------------
 
