@@ -26,6 +26,14 @@ export const MAX_PER_SESSION = 5;
 export const elapsedSql = (alias: string) =>
   `(case when ${alias}.raw->>'elapsed_time' ~ '^[0-9]{1,9}(\\.[0-9]+)?$' then round((${alias}.raw->>'elapsed_time')::numeric)::int end)`;
 
+/**
+ * Strava's `total_elevation_gain` (metres climbed over the whole activity) out of the stored raw JSON, rounded; null when
+ * raw has none (or it is not a non-negative number). `alias` is the activities alias in the query. Not a column: `raw`
+ * already holds the whole Strava object. Same shape as elapsedSql.
+ */
+export const elevGainSql = (alias: string) =>
+  `(case when ${alias}.raw->>'total_elevation_gain' ~ '^[0-9]{1,5}(\\.[0-9]+)?$' then round((${alias}.raw->>'total_elevation_gain')::numeric)::int end)`;
+
 /** The members of a.session_id's group, in the same order loadGroup uses. `a` must be an activities alias. */
 const groupOf = (extra = "") =>
   `from activities g where g.session_id = a.session_id and g.user_id = a.user_id and g.match_status <> 'ignored'${extra}`;
