@@ -224,7 +224,7 @@ function segmentsText(a: BriefActivity): string {
 }
 
 /** How to read the elevation in the activity list; goes right under the list's heading (chat and weekly review alike). */
-const ELEV_LEGEND = `海拔的讀法：每趟跑步的「爬升 N m」是 Strava 給的整趟累計爬升（標「約」＝Strava 沒給，用每公里淨上升加總，會偏低）；「海拔無資料」＝這趟沒有海拔紀錄（跑步機、錶沒記到），不知道有沒有坡。每公里那行標題有「淨海拔差」時，配速(心拍) 後面的 +12m／-9m 是那一公里終點減起點的淨海拔差（公尺，上坡正、下坡負；不是配速、不是心拍、不是分鐘），沒有標的公里不到 ±${ELEV_SHOW_M}m；標題沒有「淨海拔差」的就是沒有每公里的海拔。「上坡 km」是系統用淨 +${UPHILL_M}m 以上算好的，不要另訂門檻。淨值會抵消：一公里內先上後下看起來接近 0，所以「爬升」比「每公里淨上升合計」大很多時，代表有起伏或折返坡，但看不出是哪一段。`;
+const ELEV_LEGEND = `海拔的讀法：每趟跑步的「爬升 N m」是 Strava 給的整趟累計爬升（標「約」＝Strava 沒給，用每公里淨上升加總，會偏低）；「海拔無資料」＝這趟沒有海拔紀錄（跑步機、錶沒記到），不知道有沒有坡。每公里那行標題有「淨海拔差」時，配速(心拍) 後面的 +12m／-9m 是那一公里終點減起點的淨海拔差（公尺，上坡正、下坡負；不是配速、不是心拍、不是分鐘），沒有標的公里不到 ±${ELEV_SHOW_M}m；數字是往 0 截斷的整數（12.6m 印 +12m），單趟評語是四捨五入，同一公里差 1m 不是錯；標題沒有「淨海拔差」的就是沒有每公里的海拔。「上坡 km」是系統用淨 +${UPHILL_M}m 以上算好的，不要另訂門檻。淨值會抵消：一公里內先上後下看起來接近 0，所以「爬升」比「每公里淨上升合計」大很多時，代表有起伏或折返坡，但看不出是哪一段。`;
 
 /** "爬升 96m" / "爬升約 12m" (no Strava total: the sum of the kms' net gains) / "海拔無資料". */
 const elevText = (e: ElevationInfo): string => (e.has ? `爬升${e.approx ? "約" : ""} ${e.gain_m}m` : "海拔無資料");
